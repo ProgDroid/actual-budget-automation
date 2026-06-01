@@ -97,6 +97,14 @@ impl State {
         resolved
     }
 
+    /// Clone the Monzo sub-state (for constructing the bank source).
+    pub fn monzo_clone(&self) -> MonzoState {
+        MonzoState {
+            refresh_token: self.monzo.refresh_token.clone(),
+            account_id: self.monzo.account_id.clone(),
+        }
+    }
+
     /// Add a pending review unless an identical (merchant, amount, date) entry
     /// already exists. Returns true if added.
     pub fn add_pending(&mut self, raw_merchant: &str, amount: i64, date: &str) -> bool {
