@@ -302,6 +302,85 @@ pub async fn run(
     Ok(())
 }
 
+/// One-time Monzo OAuth bootstrap. Run on a machine with a browser.
+pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
+    let redirect = url::Url::parse(&cfg.monzo_redirect_uri)
+        .context("MONZO_REDIRECT_URI is not a valid URL")?;
+    let port = redirect.port().unwrap_or(8080);
+    let state_param = format!("aba{}", Utc::now().timestamp());
+
+    let auth_url = format!(
+        "https://auth.monzo.com/?client_id={}&redirect_uri={}&response_type=code&state={}",
+        urlencoding(&cfg.monzo_client_id),
+        urlencoding(cfg.monzo_redirect_uri.as_str()),
+        urlencoding(&state_param),
+    );
+
+    println!("Opening Monzo authorisation in your browser...");
+    println!("If it doesn't open, visit:\n{auth_url}\n");
+    let _ = webbrowser::open(&auth_url);
+
+    // One-shot blocking listener for the redirect.
+    let server = tiny_http::Server::http(("127.0.0.1", port))
+        .map_err(|e| anyhow::anyhow!("failed to bind {port}: {e}"))?;
+    println!("Waiting for redirect on 127.0.0.1:{port} ...");
+
+    let request = server.recv().context("listener error")?;
+    let url = format!("http://localhost{}", request.url());
+    let parsed = url::Url::parse(&url).context("bad redirect URL")?;
+    let code = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .context("no `code` in redirect")?;
+    let _ = request.respond(tiny_http::Response::from_string(
+        "Monzo authorisation received. You can close this tab and return to the terminal.",
+    ));
+
+    // Exchange code for tokens.
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{}/oauth2/token", cfg.monzo_base_url))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", cfg.monzo_client_id.as_str()),
+            ("client_secret", cfg.monzo_client_secret.as_str()),
+            ("redirect_uri", cfg.monzo_redirect_uri.as_str()),
+            ("code", code.as_str()),
+        ])
+        .send()
+        .await?
+        .error_for_status()
+        .context("token exchange failed")?;
+
+    let token: serde_json::Value = resp.json().await?;
+    let refresh = token["refresh_token"]
+        .as_str()
+        .context("no refresh_token")?;
+
+    println!("\n=== Monzo authorised ===");
+    println!("IMPORTANT: open the Monzo app and approve access now (SCA),");
+    println!("or the API will only return the last 5 minutes of transactions.\n");
+    println!("Paste this into the server's state file under [monzo]:\n");
+    println!("refresh_token = \"{refresh}\"");
+    println!("\nAlso set [monzo].account_id to the Monzo account id you want to import.");
+    Ok(())
+}
+
+/// Minimal percent-encoding for query parameters.
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
