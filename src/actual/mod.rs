@@ -1,2 +1,135 @@
 //! Actual Budget client via Node shim.
+
 pub mod shim_protocol;
+
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use anyhow::{Context, anyhow};
+use serde::de::DeserializeOwned;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use shim_protocol::{ImportTxn, Payee, ScheduleRow, ShimRequest, ShimResponse};
+
+/// Spawns the Node shim once per operation, exchanging JSON over stdin/stdout.
+pub struct ActualClient {
+    /// Program to run (production: "node").
+    program: PathBuf,
+    /// Leading args (production: the shim's index.js path).
+    script_args: Vec<String>,
+    /// Working dir (also where node_modules lives in production).
+    cwd: PathBuf,
+    read_only: bool,
+}
+
+impl ActualClient {
+    /// Production constructor: runs `node <shim_dir>/index.js` with `cwd = shim_dir`.
+    pub fn new(shim_dir: PathBuf, read_only: bool) -> Self {
+        let index = shim_dir.join("index.js");
+        Self {
+            program: PathBuf::from("node"),
+            script_args: vec![index.to_string_lossy().into_owned()],
+            cwd: shim_dir,
+            read_only,
+        }
+    }
+
+    async fn call<T: DeserializeOwned>(&self, req: &ShimRequest) -> anyhow::Result<T> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.script_args)
+            .current_dir(&self.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if self.read_only {
+            cmd.arg("--read-only");
+        }
+        let mut child = cmd.spawn().context("failed to spawn shim")?;
+        {
+            let mut stdin = child.stdin.take().context("no stdin on shim")?;
+            let payload = serde_json::to_vec(req)?;
+            stdin.write_all(&payload).await?;
+            stdin.shutdown().await?;
+        }
+        let output = child.wait_with_output().await.context("shim wait failed")?;
+        let parsed: ShimResponse<T> =
+            serde_json::from_slice(&output.stdout).with_context(|| {
+                format!(
+                    "shim output not valid JSON: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            })?;
+        match parsed {
+            ShimResponse::Ok { data, .. } => Ok(data),
+            ShimResponse::Err { error, .. } => Err(anyhow!("shim error: {error}")),
+        }
+    }
+
+    /// # Errors
+    /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
+    pub async fn get_payees(&self) -> anyhow::Result<Vec<Payee>> {
+        self.call(&ShimRequest::GetPayees).await
+    }
+
+    /// # Errors
+    /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
+    pub async fn get_scheduled(&self) -> anyhow::Result<Vec<ScheduleRow>> {
+        self.call(&ShimRequest::GetScheduled).await
+    }
+
+    /// # Errors
+    /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
+    pub async fn import_transactions(
+        &self,
+        account_id: String,
+        transactions: Vec<ImportTxn>,
+    ) -> anyhow::Result<ImportSummary> {
+        self.call(&ShimRequest::ImportTransactions {
+            account_id,
+            transactions,
+        })
+        .await
+    }
+
+    /// # Errors
+    /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
+    pub async fn create_payee(&self, name: String) -> anyhow::Result<CreatedPayee> {
+        self.call(&ShimRequest::CreatePayee { name }).await
+    }
+}
+
+#[derive(Debug, serde::Deserialize, PartialEq)]
+pub struct ImportSummary {
+    pub added: usize,
+    pub updated: usize,
+}
+
+#[derive(Debug, serde::Deserialize, PartialEq)]
+pub struct CreatedPayee {
+    pub id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn get_payees_parses_data() {
+        let dir = tempdir().unwrap();
+        // Fake shim: ignore stdin content, print a canned ok envelope.
+        let fake = r#"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'}]}));});"#;
+        std::fs::write(dir.path().join("index.js"), fake).unwrap();
+
+        let client = ActualClient::new(dir.path().to_path_buf(), false);
+        let payees = client.get_payees().await.unwrap();
+        assert_eq!(
+            payees,
+            vec![Payee {
+                id: "p1".into(),
+                name: "Amazon".into()
+            }]
+        );
+    }
+}
