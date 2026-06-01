@@ -202,12 +202,21 @@ pub async fn run(
         }
     }
     // claude matches
+    let mut newly_cached: Vec<(String, String)> = Vec::new();
     for (ext_id, payee_name) in &outcome.matched {
         match (
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
         ) {
-            (Some(tx), Some(pid)) => push_row(&mut import_rows, tx, pid),
+            (Some(tx), Some(pid)) => {
+                push_row(&mut import_rows, tx, pid);
+                if !state.payee_cache.contains_key(&tx.raw_merchant) {
+                    state
+                        .payee_cache
+                        .insert(tx.raw_merchant.clone(), payee_name.clone());
+                    newly_cached.push((tx.raw_merchant.clone(), payee_name.clone()));
+                }
+            }
             (Some(_), None) => warn!(
                 "matched payee '{payee_name}' for tx {ext_id} not found in Actual payee list; skipping"
             ),
@@ -262,6 +271,12 @@ pub async fn run(
         for tx in &outcome.unmatched {
             println!("    ? hold {} {}", tx.raw_merchant, tx.amount_minor);
         }
+        if !newly_cached.is_empty() {
+            println!("  would cache  : {}", newly_cached.len());
+            for (raw, payee) in &newly_cached {
+                println!("    ~ {raw} -> {payee}");
+            }
+        }
         // Persist ONLY the rotated Monzo token; discard in-memory cache/pending/last_run
         // changes by re-loading the on-disk state and copying just the token onto it.
         let mut on_disk = State::load(&cfg.state_path)?;
@@ -292,16 +307,17 @@ pub async fn run(
     state.last_run = Some(Utc::now());
     state.save(&cfg.state_path)?;
 
-    notifier
-        .notify(
-            "Actual import complete",
-            &format!(
-                "Added {}, updated {}, held {} for review.",
-                summary.added, summary.updated, held
-            ),
-        )
-        .await
-        .ok();
+    let mut body = format!(
+        "Added {}, updated {}, held {} for review.",
+        summary.added, summary.updated, held
+    );
+    if !newly_cached.is_empty() {
+        body.push_str(&format!("\nNewly auto-matched ({}):", newly_cached.len()));
+        for (raw, payee) in &newly_cached {
+            body.push_str(&format!("\n  {raw} -> {payee}"));
+        }
+    }
+    notifier.notify("Actual import complete", &body).await.ok();
 
     Ok(())
 }
