@@ -253,9 +253,10 @@ mod tests {
         assert_eq!(req["tool_choice"]["name"], "report_matches");
         let user = req["messages"][0]["content"].as_str().unwrap();
         assert!(user.contains("TFL TRAVEL CH"));
-        let required = req["tools"][0]["input_schema"]["properties"]["matches"]["items"]["required"]
-            .as_array()
-            .unwrap();
+        let required =
+            req["tools"][0]["input_schema"]["properties"]["matches"]["items"]["required"]
+                .as_array()
+                .unwrap();
         assert!(required.iter().any(|v| v == "confidence"));
     }
 

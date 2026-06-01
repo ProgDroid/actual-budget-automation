@@ -385,9 +385,23 @@ mod tests {
     #[test]
     fn reply_mutators_apply() {
         let mut s = State::default();
-        s.add_pending_full("a", "AAA", -1, "2026-06-01", Some("Aldi".into()), Some("medium".into()));
+        s.add_pending_full(
+            "a",
+            "AAA",
+            -1,
+            "2026-06-01",
+            Some("Aldi".into()),
+            Some("medium".into()),
+        );
         s.add_pending_full("b", "BBB", -2, "2026-06-01", None, None);
-        s.add_pending_full("c", "CCC", -3, "2026-06-01", Some("Costa".into()), Some("low".into()));
+        s.add_pending_full(
+            "c",
+            "CCC",
+            -3,
+            "2026-06-01",
+            Some("Costa".into()),
+            Some("low".into()),
+        );
         s.add_pending_full("d", "DDD", -4, "2026-06-01", None, None);
         // dedicated no-suggestion entry: confirm must refuse to set resolve_to.
         s.add_pending_full("e", "EEE", -5, "2026-06-01", None, None);
@@ -403,10 +417,10 @@ mod tests {
                 .is_empty()
         );
 
-        assert!(s.confirm_pending("a"));            // resolve_to <- suggestion
-        assert!(s.remap_pending("b", "Boots"));     // resolve_to <- free text
-        assert!(s.create_pending("c"));             // create_new = true
-        assert!(s.skip_pending("d"));               // removed
+        assert!(s.confirm_pending("a")); // resolve_to <- suggestion
+        assert!(s.remap_pending("b", "Boots")); // resolve_to <- free text
+        assert!(s.create_pending("c")); // create_new = true
+        assert!(s.skip_pending("d")); // removed
         assert!(!s.confirm_pending("missing"));
         assert!(!s.skip_pending("does_not_exist")); // unknown id -> false
 
