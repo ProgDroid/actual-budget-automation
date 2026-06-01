@@ -1,1 +1,4 @@
 /target
+/actual-shim/node_modules
+*.state.toml
+.actual-data/
