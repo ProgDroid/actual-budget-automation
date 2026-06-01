@@ -4,10 +4,47 @@ use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl Confidence {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Confidence::High => "high",
+            Confidence::Medium => "medium",
+            Confidence::Low => "low",
+        }
+    }
+
+    /// Higher = more confident. Used for the auto-import cutoff comparison.
+    pub const fn rank(&self) -> u8 {
+        match self {
+            Confidence::High => 2,
+            Confidence::Medium => 1,
+            Confidence::Low => 0,
+        }
+    }
+
+    /// Parse the model's string; anything unrecognised is treated as Medium
+    /// (conservative — it gets held for confirmation rather than auto-imported).
+    pub fn parse(s: &str) -> Confidence {
+        match s {
+            "high" => Confidence::High,
+            "low" => Confidence::Low,
+            _ => Confidence::Medium,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PayeeMatch {
     pub raw: String,
     pub payee: Option<String>,
+    pub confidence: Confidence,
 }
 
 #[async_trait]
@@ -23,6 +60,10 @@ pub trait ClaudeMatcher {
 const SYSTEM_INSTRUCTIONS: &str = "You normalise bank merchant strings to a user's existing budget payees. \
 For each raw merchant name, choose the single best-matching payee from the provided list, \
 or null if none is a clear match. Be conservative: prefer null over a wrong guess. \
+Also rate your confidence in each choice as \"high\", \"medium\", or \"low\": \
+\"high\" = an obvious, unambiguous match a human would not second-guess; \
+\"medium\" = a plausible match with some doubt; \"low\" = a weak guess. \
+Use \"low\" when payee is null. \
 Call the report_matches tool with one entry per raw merchant, preserving the exact raw strings.";
 
 /// Build the Anthropic Messages API request body. The existing-payee list is a
@@ -51,9 +92,10 @@ pub fn build_request(model: &str, raw: &[String], existing_payees: &[String]) ->
                             "type": "object",
                             "properties": {
                                 "raw": { "type": "string" },
-                                "payee": { "type": ["string", "null"] }
+                                "payee": { "type": ["string", "null"] },
+                                "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
                             },
-                            "required": ["raw", "payee"]
+                            "required": ["raw", "payee", "confidence"]
                         }
                     }
                 },
@@ -88,7 +130,12 @@ pub fn parse_response(resp: &Value) -> anyhow::Result<Vec<PayeeMatch>> {
             Value::String(s) => Some(s.clone()),
             other => return Err(anyhow!("unexpected payee value: {other}")),
         };
-        out.push(PayeeMatch { raw, payee });
+        let confidence = Confidence::parse(m["confidence"].as_str().unwrap_or("medium"));
+        out.push(PayeeMatch {
+            raw,
+            payee,
+            confidence,
+        });
     }
     Ok(out)
 }
@@ -152,6 +199,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn confidence_parses_and_ranks() {
+        assert_eq!(Confidence::parse("high"), Confidence::High);
+        assert_eq!(Confidence::parse("medium"), Confidence::Medium);
+        assert_eq!(Confidence::parse("low"), Confidence::Low);
+        // Unknown / missing defaults to Medium (conservative: gets held).
+        assert_eq!(Confidence::parse("garbage"), Confidence::Medium);
+        assert!(Confidence::High.rank() > Confidence::Medium.rank());
+        assert!(Confidence::Medium.rank() > Confidence::Low.rank());
+        assert_eq!(Confidence::High.rank(), 2);
+        assert_eq!(Confidence::Medium.rank(), 1);
+        assert_eq!(Confidence::Low.rank(), 0);
+        assert_eq!(Confidence::High.as_str(), "high");
+    }
+
+    #[test]
+    fn parse_reads_confidence_field() {
+        let resp = serde_json::json!({
+            "content": [
+                { "type": "tool_use", "name": "report_matches", "input": {
+                    "matches": [
+                        { "raw": "TFL TRAVEL CH", "payee": "Transport for London", "confidence": "high" },
+                        { "raw": "SQ *CAFE", "payee": "Local Cafe", "confidence": "low" },
+                        { "raw": "WUT", "payee": null, "confidence": "high" }
+                    ]
+                }}
+            ]
+        });
+        let out = parse_response(&resp).unwrap();
+        assert_eq!(out[0].confidence, Confidence::High);
+        assert_eq!(out[1].confidence, Confidence::Low);
+        assert_eq!(out[2].payee, None);
+        assert_eq!(out[2].confidence, Confidence::High);
+    }
+
+    #[test]
     fn request_has_cached_payee_block_and_tool_choice() {
         let req = build_request(
             "claude-sonnet-4-6",
@@ -171,6 +253,10 @@ mod tests {
         assert_eq!(req["tool_choice"]["name"], "report_matches");
         let user = req["messages"][0]["content"].as_str().unwrap();
         assert!(user.contains("TFL TRAVEL CH"));
+        let required = req["tools"][0]["input_schema"]["properties"]["matches"]["items"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.iter().any(|v| v == "confidence"));
     }
 
     #[test]
@@ -180,8 +266,8 @@ mod tests {
                 { "type": "text", "text": "ok" },
                 { "type": "tool_use", "name": "report_matches", "input": {
                     "matches": [
-                        { "raw": "TFL TRAVEL CH", "payee": "Transport for London" },
-                        { "raw": "AMZNMKTPLACE", "payee": null }
+                        { "raw": "TFL TRAVEL CH", "payee": "Transport for London", "confidence": "high" },
+                        { "raw": "AMZNMKTPLACE", "payee": null, "confidence": "low" }
                     ]
                 }}
             ]
@@ -192,11 +278,13 @@ mod tests {
             vec![
                 PayeeMatch {
                     raw: "TFL TRAVEL CH".into(),
-                    payee: Some("Transport for London".into())
+                    payee: Some("Transport for London".into()),
+                    confidence: Confidence::High,
                 },
                 PayeeMatch {
                     raw: "AMZNMKTPLACE".into(),
-                    payee: None
+                    payee: None,
+                    confidence: Confidence::Low,
                 },
             ]
         );
@@ -210,7 +298,7 @@ mod tests {
         let server = MockServer::start().await;
         let body = serde_json::json!({
             "content": [{ "type": "tool_use", "name": "report_matches", "input": {
-                "matches": [{ "raw": "TFL TRAVEL CH", "payee": "Transport for London" }]
+                "matches": [{ "raw": "TFL TRAVEL CH", "payee": "Transport for London", "confidence": "high" }]
             }}]
         });
         Mock::given(method("POST"))

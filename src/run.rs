@@ -445,10 +445,12 @@ mod tests {
             PayeeMatch {
                 raw: "AMZNMKTPLACE".into(),
                 payee: Some("Amazon".into()),
+                confidence: crate::claude::Confidence::High,
             },
             PayeeMatch {
                 raw: "WEIRD XYZ".into(),
                 payee: None,
+                confidence: crate::claude::Confidence::Low,
             },
         ];
         let outcome = apply_matches(&txs, &matches);
