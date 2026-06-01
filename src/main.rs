@@ -2,6 +2,7 @@ mod actual;
 mod banks;
 mod claude;
 mod config;
+mod lock;
 mod matching;
 mod notify;
 mod run;
