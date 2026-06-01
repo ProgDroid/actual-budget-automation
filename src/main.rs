@@ -6,6 +6,7 @@ mod matching;
 mod notify;
 mod run;
 mod state;
+mod telegram;
 
 use anyhow::Result;
 use clap::Parser;
