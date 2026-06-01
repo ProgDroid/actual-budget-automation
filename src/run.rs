@@ -136,6 +136,7 @@ pub async fn run(
         BankError::AuthExpired(m) => anyhow::anyhow!("auth expired mid-fetch: {m}"),
     })?;
     info!("fetched {} transactions since {since}", fetched.len());
+    let fetched_count = fetched.len();
 
     // 3. Read Actual payees + schedules.
     let payees = actual.get_payees().await.context("get_payees")?;
@@ -189,20 +190,28 @@ pub async fn run(
 
     // cached hits
     for (ext_id, payee_name) in &plan.cached {
-        if let (Some(tx), Some(pid)) = (
+        match (
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
         ) {
-            push_row(&mut import_rows, tx, pid);
+            (Some(tx), Some(pid)) => push_row(&mut import_rows, tx, pid),
+            (Some(_), None) => warn!(
+                "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; skipping (re-resolve it)"
+            ),
+            _ => {}
         }
     }
     // claude matches
     for (ext_id, payee_name) in &outcome.matched {
-        if let (Some(tx), Some(pid)) = (
+        match (
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
         ) {
-            push_row(&mut import_rows, tx, pid);
+            (Some(tx), Some(pid)) => push_row(&mut import_rows, tx, pid),
+            (Some(_), None) => warn!(
+                "matched payee '{payee_name}' for tx {ext_id} not found in Actual payee list; skipping"
+            ),
+            _ => {}
         }
     }
     // resolved pending reviews (may need create_new)
@@ -240,9 +249,7 @@ pub async fn run(
         println!("  would import : {}", import_rows.len());
         println!(
             "  would skip   : {} (matched a schedule)",
-            candidates
-                .len()
-                .saturating_sub(import_rows.len() + outcome.unmatched.len())
+            fetched_count.saturating_sub(candidates.len())
         );
         println!("  would hold   : {}", outcome.unmatched.len());
         for r in &import_rows {
