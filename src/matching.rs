@@ -13,6 +13,17 @@ pub fn payee_similarity(a: &str, b: &str) -> f64 {
     strsim::jaro_winkler(&normalise(a), &normalise(b))
 }
 
+/// Return the existing payee most similar to `text`, if any clears `threshold`.
+/// Used to resolve a free-text Telegram remap reply to a real payee.
+pub fn best_payee_match(text: &str, payees: &[String], threshold: f64) -> Option<String> {
+    payees
+        .iter()
+        .map(|p| (p, payee_similarity(text, p)))
+        .filter(|(_, sim)| *sim >= threshold)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(p, _)| p.clone())
+}
+
 use chrono::NaiveDate;
 
 use crate::banks::RawTransaction;
@@ -115,5 +126,26 @@ mod tests {
         }];
         let t = tx(-1500, d(2026, 6, 1), "AMAZON PRIME");
         assert!(!matches_scheduled(&t, &schedules, 3, 0.85));
+    }
+
+    #[test]
+    fn best_payee_match_picks_closest_above_threshold() {
+        let payees = vec![
+            "Transport for London".to_string(),
+            "Tesco".to_string(),
+            "Amazon".to_string(),
+        ];
+        // exact (case/space-insensitive via normalise) wins
+        assert_eq!(
+            best_payee_match("tesco", &payees, 0.85).as_deref(),
+            Some("Tesco")
+        );
+        // close typo resolves to nearest
+        assert_eq!(
+            best_payee_match("Tescos", &payees, 0.85).as_deref(),
+            Some("Tesco")
+        );
+        // nothing close enough -> None (caller re-holds)
+        assert_eq!(best_payee_match("Sainsbury's", &payees, 0.85), None);
     }
 }
