@@ -28,6 +28,8 @@ pub struct MonzoState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingReview {
+    #[serde(default)]
+    pub external_id: String,
     pub raw_merchant: String,
     pub amount: i64,
     pub date: String,
@@ -86,6 +88,7 @@ impl State {
             self.payee_cache
                 .insert(pr.raw_merchant.clone(), payee_name.clone());
             resolved.push(ResolvedReview {
+                external_id: pr.external_id,
                 raw_merchant: pr.raw_merchant,
                 amount: pr.amount,
                 date: pr.date,
@@ -105,17 +108,24 @@ impl State {
         }
     }
 
-    /// Add a pending review unless an identical (merchant, amount, date) entry
-    /// already exists. Returns true if added.
-    pub fn add_pending(&mut self, raw_merchant: &str, amount: i64, date: &str) -> bool {
+    /// Add a pending review unless an entry with the same `external_id` already
+    /// exists. Returns true if added.
+    pub fn add_pending(
+        &mut self,
+        external_id: &str,
+        raw_merchant: &str,
+        amount: i64,
+        date: &str,
+    ) -> bool {
         let exists = self
             .pending_reviews
             .iter()
-            .any(|p| p.raw_merchant == raw_merchant && p.amount == amount && p.date == date);
+            .any(|p| p.external_id == external_id);
         if exists {
             return false;
         }
         self.pending_reviews.push(PendingReview {
+            external_id: external_id.to_string(),
             raw_merchant: raw_merchant.to_string(),
             amount,
             date: date.to_string(),
@@ -129,6 +139,7 @@ impl State {
 /// A pending review the user has resolved, ready to import.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedReview {
+    pub external_id: String,
     pub raw_merchant: String,
     pub amount: i64,
     pub date: String,
@@ -161,6 +172,7 @@ mod tests {
         s.payee_cache
             .insert("TFL TRAVEL CH".into(), "Transport for London".into());
         s.pending_reviews.push(PendingReview {
+            external_id: "tx_cafe_save".into(),
             raw_merchant: "SQ *SOME CAFE".into(),
             amount: -450,
             date: "2026-05-30".into(),
@@ -177,6 +189,7 @@ mod tests {
         let mut s = State::default();
         // resolved to existing payee
         s.pending_reviews.push(PendingReview {
+            external_id: "tx_tfl".into(),
             raw_merchant: "TFL TRAVEL CH".into(),
             amount: -275,
             date: "2026-05-30".into(),
@@ -185,6 +198,7 @@ mod tests {
         });
         // create new under explicit name
         s.pending_reviews.push(PendingReview {
+            external_id: "tx_cafe".into(),
             raw_merchant: "SQ *SOME CAFE".into(),
             amount: -450,
             date: "2026-05-30".into(),
@@ -193,6 +207,7 @@ mod tests {
         });
         // unresolved -> stays
         s.pending_reviews.push(PendingReview {
+            external_id: "tx_amzn".into(),
             raw_merchant: "AMZNMKTPLACE".into(),
             amount: -1999,
             date: "2026-05-31".into(),
@@ -222,8 +237,8 @@ mod tests {
     #[test]
     fn add_pending_dedupes_on_identity() {
         let mut s = State::default();
-        let added1 = s.add_pending("AMZNMKTPLACE", -1999, "2026-05-31");
-        let added2 = s.add_pending("AMZNMKTPLACE", -1999, "2026-05-31");
+        let added1 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31");
+        let added2 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31");
         assert!(added1);
         assert!(!added2);
         assert_eq!(s.pending_reviews.len(), 1);

@@ -73,7 +73,7 @@ fn schedules_from_rows(rows: Vec<ScheduleRow>, payees: &[Payee]) -> Vec<Schedule
         .collect();
     rows.into_iter()
         .filter_map(|r| {
-            let date = NaiveDate::parse_from_str(r.date.as_str(), "%Y-%m-%d").ok()?;
+            let date = NaiveDate::parse_from_str(r.date.as_deref()?, "%Y-%m-%d").ok()?;
             let payee = r
                 .payee_id
                 .as_deref()
@@ -231,14 +231,18 @@ pub async fn run(
             date: r.date.clone(),
             amount: r.amount,
             payee: pid,
-            imported_id: format!("{}:{}", r.raw_merchant, r.date),
+            imported_id: if r.external_id.is_empty() {
+                format!("{}:{}", r.raw_merchant, r.date)
+            } else {
+                r.external_id.clone()
+            },
         });
     }
 
     // unmatched -> hold for review
     for tx in &outcome.unmatched {
         let date = tx.date.format("%Y-%m-%d").to_string();
-        if state.add_pending(&tx.raw_merchant, tx.amount_minor, &date) {
+        if state.add_pending(&tx.external_id, &tx.raw_merchant, tx.amount_minor, &date) {
             held += 1;
         }
     }

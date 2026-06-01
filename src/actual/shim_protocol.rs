@@ -34,7 +34,7 @@ pub struct Payee {
 /// Raw schedule row from the shim (`_payee` is an id resolved to a name later).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ScheduleRow {
-    pub date: String,
+    pub date: Option<String>,
     pub amount: i64,
     pub payee_id: Option<String>,
 }
@@ -64,6 +64,15 @@ mod tests {
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["op"], "import_transactions");
         assert_eq!(v["transactions"][0]["payee"], "payee_id_1");
+    }
+
+    #[test]
+    fn schedule_row_accepts_null_date() {
+        let row: ScheduleRow = serde_json::from_value(serde_json::json!({
+            "date": null, "amount": 0, "payee_id": null
+        }))
+        .unwrap();
+        assert_eq!(row.date, None);
     }
 
     #[test]
