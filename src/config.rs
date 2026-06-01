@@ -1,1 +1,115 @@
 //! Configuration from environment and CLI.
+
+use std::path::PathBuf;
+
+use anyhow::{Result, anyhow};
+use clap::{Parser, Subcommand};
+
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
+pub const DATE_TOLERANCE_DAYS: i64 = 3;
+pub const PAYEE_THRESHOLD: f64 = 0.85;
+
+#[derive(Debug, Parser)]
+#[command(name = "aba", about = "Automated Actual Budget transaction import")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Fetch, match, and import transactions.
+    Run {
+        /// Do everything except write to Actual; print what would happen.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// One-time interactive Monzo OAuth bootstrap (run on a machine with a browser).
+    Auth {
+        #[command(subcommand)]
+        which: AuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Authorise Monzo and print the refresh token to paste into the server state.
+    Monzo,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub anthropic_api_key: String,
+    pub claude_model: String,
+    pub monzo_client_id: String,
+    pub monzo_client_secret: String,
+    pub monzo_redirect_uri: String,
+    pub apprise_url: String,
+    pub actual_server_url: String,
+    pub actual_password: String,
+    pub actual_sync_id: String,
+    pub state_path: PathBuf,
+    pub shim_dir: PathBuf,
+    pub monzo_base_url: String,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Config> {
+        Self::from_getter(|k| std::env::var(k).ok())
+    }
+
+    /// Build from any getter (used by tests).
+    pub fn from_getter(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
+        let req = |k: &str| get(k).ok_or_else(|| anyhow!("missing env var {k}"));
+        Ok(Config {
+            anthropic_api_key: req("ANTHROPIC_API_KEY")?,
+            claude_model: get("CLAUDE_MODEL").unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string()),
+            monzo_client_id: req("MONZO_CLIENT_ID")?,
+            monzo_client_secret: req("MONZO_CLIENT_SECRET")?,
+            monzo_redirect_uri: req("MONZO_REDIRECT_URI")?,
+            apprise_url: req("APPRISE_URL")?,
+            actual_server_url: req("ACTUAL_SERVER_URL")?,
+            actual_password: req("ACTUAL_PASSWORD")?,
+            actual_sync_id: req("ACTUAL_SYNC_ID")?,
+            state_path: PathBuf::from(req("ABA_STATE_PATH")?),
+            shim_dir: PathBuf::from(
+                get("ABA_SHIM_DIR").unwrap_or_else(|| "/app/actual-shim".to_string()),
+            ),
+            monzo_base_url: get("MONZO_BASE_URL")
+                .unwrap_or_else(|| "https://api.monzo.com".to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_reads_from_map() {
+        let get = |k: &str| -> Option<String> {
+            match k {
+                "ANTHROPIC_API_KEY" => Some("ak".into()),
+                "MONZO_CLIENT_ID" => Some("cid".into()),
+                "MONZO_CLIENT_SECRET" => Some("csec".into()),
+                "MONZO_REDIRECT_URI" => Some("http://localhost:8080/callback".into()),
+                "APPRISE_URL" => Some("http://apprise/notify".into()),
+                "ACTUAL_SERVER_URL" => Some("http://actual:5006".into()),
+                "ACTUAL_PASSWORD" => Some("pw".into()),
+                "ACTUAL_SYNC_ID" => Some("sync".into()),
+                "ABA_STATE_PATH" => Some("/data/aba.state.toml".into()),
+                _ => None,
+            }
+        };
+        let c = Config::from_getter(get).unwrap();
+        assert_eq!(c.claude_model, "claude-sonnet-4-6");
+        assert_eq!(c.actual_server_url, "http://actual:5006");
+        assert_eq!(c.state_path.to_string_lossy(), "/data/aba.state.toml");
+    }
+
+    #[test]
+    fn missing_required_is_error() {
+        let get = |_: &str| -> Option<String> { None };
+        assert!(Config::from_getter(get).is_err());
+    }
+}
