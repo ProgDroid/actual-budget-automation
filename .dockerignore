@@ -1,0 +1,6 @@
+target
+actual-shim/node_modules
+.git
+docs
+*.state.toml
+.actual-data
