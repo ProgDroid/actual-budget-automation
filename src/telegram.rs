@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -158,6 +159,98 @@ pub fn build_send_request(prompt: &Prompt, chat_id: i64) -> Value {
     })
 }
 
+pub struct HttpTelegram {
+    http: reqwest::Client,
+    token: String,
+    chat_id: i64,
+    base_url: String,
+}
+
+impl HttpTelegram {
+    pub fn new(token: String, chat_id: i64) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            token,
+            chat_id,
+            base_url: "https://api.telegram.org".to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    fn url(&self, method: &str) -> String {
+        format!("{}/bot{}/{}", self.base_url, self.token, method)
+    }
+}
+
+#[async_trait]
+impl ConfirmChannel for HttpTelegram {
+    async fn poll_replies(
+        &self,
+        since: i64,
+        msg_map: &BTreeMap<i64, String>,
+    ) -> anyhow::Result<(Vec<Reply>, i64)> {
+        let resp = self
+            .http
+            .get(self.url("getUpdates"))
+            .query(&[("offset", since.to_string()), ("timeout", "0".to_string())])
+            .send()
+            .await
+            .context("telegram getUpdates failed")?;
+        let status = resp.status();
+        let value: Value = resp.json().await.context("getUpdates response not JSON")?;
+        if !status.is_success() {
+            return Err(anyhow!("telegram error {status}: {value}"));
+        }
+        let parsed = parse_get_updates(&value["result"], self.chat_id, msg_map);
+
+        for id in &parsed.ack_callback_ids {
+            // Best-effort; failing to clear the spinner must not abort the drain.
+            let _ = self
+                .http
+                .post(self.url("answerCallbackQuery"))
+                .json(&json!({ "callback_query_id": id }))
+                .send()
+                .await;
+        }
+
+        // Empty batch -> keep the caller's offset (parse returns 0 for empty).
+        let new_offset = if value["result"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+        {
+            since
+        } else {
+            parsed.new_offset
+        };
+        Ok((parsed.replies, new_offset))
+    }
+
+    async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64> {
+        let body = build_send_request(prompt, self.chat_id);
+        let resp = self
+            .http
+            .post(self.url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .context("telegram sendMessage failed")?;
+        let status = resp.status();
+        let value: Value = resp.json().await.context("sendMessage response not JSON")?;
+        if !status.is_success() {
+            return Err(anyhow!("telegram error {status}: {value}"));
+        }
+        value["result"]["message_id"]
+            .as_i64()
+            .context("sendMessage response missing message_id")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +367,84 @@ mod tests {
         let parsed = parse_get_updates(&result, 99, &BTreeMap::new());
         assert!(parsed.replies.is_empty());
         assert_eq!(parsed.new_offset, 9);
+    }
+
+    use wiremock::matchers::{body_json, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn http_poll_replies_parses_and_acks() {
+        let server = MockServer::start().await;
+        let updates = serde_json::json!({
+            "ok": true,
+            "result": [
+                { "update_id": 7, "callback_query": {
+                    "id": "cb9", "from": { "id": 42 },
+                    "message": { "chat": { "id": 42 } }, "data": "sk:tx_z"
+                }}
+            ]
+        });
+        Mock::given(method("GET"))
+            .and(path("/bottok/getUpdates"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(updates))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/answerCallbackQuery"))
+            .and(body_json(serde_json::json!({ "callback_query_id": "cb9" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tg = HttpTelegram::new("tok".into(), 42).with_base_url(server.uri());
+        let (replies, offset) = tg
+            .poll_replies(0, &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(offset, 8);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].entry_key, "tx_z");
+        assert!(matches!(replies[0].action, ReplyAction::Skip));
+    }
+
+    #[tokio::test]
+    async fn http_poll_replies_empty_keeps_offset() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottok/getUpdates"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": []})),
+            )
+            .mount(&server)
+            .await;
+        let tg = HttpTelegram::new("tok".into(), 42).with_base_url(server.uri());
+        let (replies, offset) = tg
+            .poll_replies(5, &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+        assert_eq!(offset, 5); // unchanged when nothing arrives
+    }
+
+    #[tokio::test]
+    async fn http_send_prompt_returns_message_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "ok": true, "result": { "message_id": 12345 } }),
+            ))
+            .mount(&server)
+            .await;
+        let tg = HttpTelegram::new("tok".into(), 42).with_base_url(server.uri());
+        let prompt = Prompt {
+            chat_text: "hi".into(),
+            buttons: vec![],
+        };
+        let id = tg.send_prompt(&prompt).await.unwrap();
+        assert_eq!(id, 12345);
     }
 }
