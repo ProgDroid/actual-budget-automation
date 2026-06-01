@@ -63,6 +63,71 @@ impl State {
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+
+    /// Remove resolved pending reviews, fold their raw->payee mapping into the
+    /// cache, and return them for import. Unresolved entries are retained.
+    pub fn take_resolved(&mut self) -> Vec<ResolvedReview> {
+        let mut resolved = Vec::new();
+        let mut remaining = Vec::new();
+        for pr in std::mem::take(&mut self.pending_reviews) {
+            let (payee_name, create_new) = if pr.create_new {
+                let name = if pr.resolve_to.is_empty() {
+                    pr.raw_merchant.clone()
+                } else {
+                    pr.resolve_to.clone()
+                };
+                (name, true)
+            } else if !pr.resolve_to.is_empty() {
+                (pr.resolve_to.clone(), false)
+            } else {
+                remaining.push(pr);
+                continue;
+            };
+            self.payee_cache
+                .insert(pr.raw_merchant.clone(), payee_name.clone());
+            resolved.push(ResolvedReview {
+                raw_merchant: pr.raw_merchant,
+                amount: pr.amount,
+                date: pr.date,
+                payee_name,
+                create_new,
+            });
+        }
+        self.pending_reviews = remaining;
+        resolved
+    }
+
+    /// Add a pending review unless an identical (merchant, amount, date) entry
+    /// already exists. Returns true if added.
+    pub fn add_pending(&mut self, raw_merchant: &str, amount: i64, date: &str) -> bool {
+        let exists = self
+            .pending_reviews
+            .iter()
+            .any(|p| p.raw_merchant == raw_merchant && p.amount == amount && p.date == date);
+        if exists {
+            return false;
+        }
+        self.pending_reviews.push(PendingReview {
+            raw_merchant: raw_merchant.to_string(),
+            amount,
+            date: date.to_string(),
+            resolve_to: String::new(),
+            create_new: false,
+        });
+        true
+    }
+}
+
+/// A pending review the user has resolved, ready to import.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedReview {
+    pub raw_merchant: String,
+    pub amount: i64,
+    pub date: String,
+    /// Final payee name to use.
+    pub payee_name: String,
+    /// True if the payee must be created in Actual first.
+    pub create_new: bool,
 }
 
 #[cfg(test)]
@@ -97,5 +162,62 @@ mod tests {
         s.save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
         assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn take_resolved_maps_existing_and_creates_and_keeps_unresolved() {
+        let mut s = State::default();
+        // resolved to existing payee
+        s.pending_reviews.push(PendingReview {
+            raw_merchant: "TFL TRAVEL CH".into(),
+            amount: -275,
+            date: "2026-05-30".into(),
+            resolve_to: "Transport for London".into(),
+            create_new: false,
+        });
+        // create new under explicit name
+        s.pending_reviews.push(PendingReview {
+            raw_merchant: "SQ *SOME CAFE".into(),
+            amount: -450,
+            date: "2026-05-30".into(),
+            resolve_to: "Some Cafe".into(),
+            create_new: true,
+        });
+        // unresolved -> stays
+        s.pending_reviews.push(PendingReview {
+            raw_merchant: "AMZNMKTPLACE".into(),
+            amount: -1999,
+            date: "2026-05-31".into(),
+            resolve_to: String::new(),
+            create_new: false,
+        });
+
+        let resolved = s.take_resolved();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(s.pending_reviews.len(), 1);
+        assert_eq!(s.pending_reviews[0].raw_merchant, "AMZNMKTPLACE");
+        // cache updated for the two resolved
+        assert_eq!(
+            s.payee_cache.get("TFL TRAVEL CH").unwrap(),
+            "Transport for London"
+        );
+        assert_eq!(s.payee_cache.get("SQ *SOME CAFE").unwrap(), "Some Cafe");
+        let cafe = resolved
+            .iter()
+            .find(|r| r.raw_merchant == "SQ *SOME CAFE")
+            .unwrap();
+        assert!(cafe.create_new);
+        assert_eq!(cafe.payee_name, "Some Cafe");
+    }
+
+    #[test]
+    fn add_pending_dedupes_on_identity() {
+        let mut s = State::default();
+        let added1 = s.add_pending("AMZNMKTPLACE", -1999, "2026-05-31");
+        let added2 = s.add_pending("AMZNMKTPLACE", -1999, "2026-05-31");
+        assert!(added1);
+        assert!(!added2);
+        assert_eq!(s.pending_reviews.len(), 1);
     }
 }
