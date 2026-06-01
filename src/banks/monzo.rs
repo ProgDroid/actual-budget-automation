@@ -49,7 +49,12 @@ struct Merchant {
 }
 
 impl Monzo {
-    pub fn new(client_id: String, client_secret: String, base_url: String, monzo: MonzoState) -> Self {
+    pub fn new(
+        client_id: String,
+        client_secret: String,
+        base_url: String,
+        monzo: MonzoState,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             client_id,
@@ -81,7 +86,9 @@ impl BankSource for Monzo {
     /// non-success statuses, or a response body that fails to deserialize.
     async fn ensure_auth(&mut self, state: &mut State) -> Result<(), BankError> {
         if self.monzo.refresh_token.is_empty() {
-            return Err(BankError::AuthExpired("no Monzo refresh token in state".into()));
+            return Err(BankError::AuthExpired(
+                "no Monzo refresh token in state".into(),
+            ));
         }
         let resp = self
             .http
@@ -158,12 +165,16 @@ impl BankSource for Monzo {
         }
         if !resp.status().is_success() {
             let s = resp.status();
-            return Err(BankError::Other(anyhow::anyhow!("Monzo transactions error {s}")));
+            return Err(BankError::Other(anyhow::anyhow!(
+                "Monzo transactions error {s}"
+            )));
         }
 
         let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
         if list.transactions.len() == 100 {
-            warn!("Monzo returned 100 transactions (page limit); pagination not implemented — some transactions may be missed this run");
+            warn!(
+                "Monzo returned 100 transactions (page limit); pagination not implemented — some transactions may be missed this run"
+            );
         }
         let out = list
             .transactions
@@ -195,20 +206,27 @@ mod tests {
 
     fn client(base: String) -> Monzo {
         Monzo::new(
-            "cid".into(), "csecret".into(), base,
-            crate::state::MonzoState { refresh_token: "old_rt".into(), account_id: "acc_1".into() },
+            "cid".into(),
+            "csecret".into(),
+            base,
+            crate::state::MonzoState {
+                refresh_token: "old_rt".into(),
+                account_id: "acc_1".into(),
+            },
         )
     }
 
     #[tokio::test]
     async fn refresh_rotates_and_persists_token() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/oauth2/token"))
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "at_new", "refresh_token": "rt_new",
                 "token_type": "Bearer", "expires_in": 21600
             })))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         let mut m = client(server.uri());
         let mut state = State::default();
@@ -219,11 +237,13 @@ mod tests {
     #[tokio::test]
     async fn refresh_failure_is_auth_expired() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/oauth2/token"))
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
                 "code": "unauthorized.bad_refresh_token"
             })))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         let mut m = client(server.uri());
         let mut state = State::default();
@@ -236,7 +256,8 @@ mod tests {
     #[tokio::test]
     async fn fetch_maps_merchant_with_description_fallback_and_skips_declined() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/transactions"))
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "transactions": [
                     {
@@ -256,7 +277,8 @@ mod tests {
                     }
                 ]
             })))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         let mut m = client(server.uri());
         m.set_access_token_for_test("at_x".into());
@@ -276,7 +298,10 @@ mod tests {
             "cid".into(),
             "csecret".into(),
             "http://unused".into(),
-            crate::state::MonzoState { refresh_token: "rt".into(), account_id: String::new() },
+            crate::state::MonzoState {
+                refresh_token: "rt".into(),
+                account_id: String::new(),
+            },
         );
         m.set_access_token_for_test("at_x".into());
         let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
@@ -287,11 +312,13 @@ mod tests {
     #[tokio::test]
     async fn fetch_403_is_auth_expired() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/transactions"))
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
                 "code": "forbidden.insufficient_permissions"
             })))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         let mut m = client(server.uri());
         m.set_access_token_for_test("at_x".into());

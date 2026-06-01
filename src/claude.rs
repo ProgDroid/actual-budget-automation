@@ -1,8 +1,8 @@
 //! Claude payee matching.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PayeeMatch {
@@ -70,7 +70,9 @@ pub fn build_request(model: &str, raw: &[String], existing_payees: &[String]) ->
 
 /// Extract `PayeeMatch`es from the Messages API response.
 pub fn parse_response(resp: &Value) -> anyhow::Result<Vec<PayeeMatch>> {
-    let content = resp["content"].as_array().context("response missing content array")?;
+    let content = resp["content"]
+        .as_array()
+        .context("response missing content array")?;
     let tool_use = content
         .iter()
         .find(|b| b["type"] == "tool_use" && b["name"] == "report_matches")
@@ -159,10 +161,12 @@ mod tests {
         let sys = req["system"].as_array().unwrap();
         assert_eq!(sys.len(), 2);
         assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
-        assert!(sys[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Transport for London"));
+        assert!(
+            sys[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Transport for London")
+        );
         assert_eq!(req["tool_choice"]["name"], "report_matches");
         let user = req["messages"][0]["content"].as_str().unwrap();
         assert!(user.contains("TFL TRAVEL CH"));
