@@ -42,8 +42,8 @@ pub struct ScheduleRow {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ShimResponse<T> {
-    Ok { ok: bool, data: T },
-    Err { ok: bool, error: String },
+    Ok { data: T },
+    Err { error: String },
 }
 
 #[cfg(test)]

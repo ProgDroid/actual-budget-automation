@@ -21,17 +21,29 @@ pub struct ActualClient {
     /// Working dir (also where node_modules lives in production).
     cwd: PathBuf,
     read_only: bool,
+    server_url: String,
+    password: String,
+    sync_id: String,
 }
 
 impl ActualClient {
     /// Production constructor: runs `node <shim_dir>/index.js` with `cwd = shim_dir`.
-    pub fn new(shim_dir: PathBuf, read_only: bool) -> Self {
+    pub fn new(
+        shim_dir: PathBuf,
+        read_only: bool,
+        server_url: String,
+        password: String,
+        sync_id: String,
+    ) -> Self {
         let index = shim_dir.join("index.js");
         Self {
             program: PathBuf::from("node"),
             script_args: vec![index.to_string_lossy().into_owned()],
             cwd: shim_dir,
             read_only,
+            server_url,
+            password,
+            sync_id,
         }
     }
 
@@ -42,6 +54,9 @@ impl ActualClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        cmd.env("ACTUAL_SERVER_URL", &self.server_url)
+            .env("ACTUAL_PASSWORD", &self.password)
+            .env("ACTUAL_SYNC_ID", &self.sync_id);
         if self.read_only {
             cmd.arg("--read-only");
         }
@@ -61,8 +76,8 @@ impl ActualClient {
                 )
             })?;
         match parsed {
-            ShimResponse::Ok { data, .. } => Ok(data),
-            ShimResponse::Err { error, .. } => Err(anyhow!("shim error: {error}")),
+            ShimResponse::Ok { data } => Ok(data),
+            ShimResponse::Err { error } => Err(anyhow!("shim error: {error}")),
         }
     }
 
@@ -122,7 +137,13 @@ mod tests {
         let fake = r#"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'}]}));});"#;
         std::fs::write(dir.path().join("index.js"), fake).unwrap();
 
-        let client = ActualClient::new(dir.path().to_path_buf(), false);
+        let client = ActualClient::new(
+            dir.path().to_path_buf(),
+            false,
+            "http://test".into(),
+            "pw".into(),
+            "sync".into(),
+        );
         let payees = client.get_payees().await.unwrap();
         assert_eq!(
             payees,

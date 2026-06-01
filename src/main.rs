@@ -40,7 +40,13 @@ async fn main() -> Result<()> {
                 cfg.monzo_base_url.clone(),
                 state.monzo_clone(),
             );
-            let actual = ActualClient::new(cfg.shim_dir.clone(), dry_run);
+            let actual = ActualClient::new(
+                cfg.shim_dir.clone(),
+                dry_run,
+                cfg.actual_server_url.clone(),
+                cfg.actual_password.clone(),
+                cfg.actual_sync_id.clone(),
+            );
             let claude = HttpClaude::new(cfg.anthropic_api_key.clone(), cfg.claude_model.clone());
             let notifier = HttpApprise::new(cfg.apprise_url.clone());
 

@@ -53,10 +53,10 @@ impl State {
     /// Atomic write: write to a temp sibling then rename.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let body = toml::to_string_pretty(self)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, body)?;
