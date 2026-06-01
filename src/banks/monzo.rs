@@ -22,6 +22,30 @@ struct TokenResponse {
     refresh_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TxList {
+    transactions: Vec<MonzoTx>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MonzoTx {
+    id: String,
+    created: DateTime<Utc>,
+    amount: i64,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    decline_reason: Option<String>,
+    #[serde(default)]
+    merchant: Option<Merchant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Merchant {
+    #[serde(default)]
+    name: String,
+}
+
 impl Monzo {
     pub fn new(client_id: String, client_secret: String, base_url: String, monzo: MonzoState) -> Self {
         Self {
@@ -32,6 +56,13 @@ impl Monzo {
             monzo,
             access_token: None,
         }
+    }
+}
+
+impl Monzo {
+    #[cfg(test)]
+    pub fn set_access_token_for_test(&mut self, token: String) {
+        self.access_token = Some(token);
     }
 }
 
@@ -82,9 +113,51 @@ impl BankSource for Monzo {
         Ok(())
     }
 
-    async fn fetch_since(&self, _since: DateTime<Utc>) -> Result<Vec<RawTransaction>, BankError> {
-        // Implemented in Task 10.
-        unimplemented!("fetch_since lands in Task 10")
+    async fn fetch_since(&self, since: DateTime<Utc>) -> Result<Vec<RawTransaction>, BankError> {
+        let token = self
+            .access_token
+            .as_ref()
+            .ok_or_else(|| BankError::Other(anyhow::anyhow!("ensure_auth not called")))?;
+        let resp = self
+            .http
+            .get(format!("{}/transactions", self.base_url))
+            .bearer_auth(token)
+            .query(&[
+                ("account_id", self.monzo.account_id.as_str()),
+                ("since", &since.to_rfc3339()),
+                ("expand[]", "merchant"),
+            ])
+            .send()
+            .await
+            .map_err(|e| BankError::Other(e.into()))?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(BankError::AuthExpired("Monzo access token rejected".into()));
+        }
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(BankError::Other(anyhow::anyhow!("Monzo transactions error {s}")));
+        }
+
+        let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
+        let out = list
+            .transactions
+            .into_iter()
+            .filter(|t| t.decline_reason.is_none())
+            .map(|t| {
+                let raw_merchant = match &t.merchant {
+                    Some(m) if !m.name.is_empty() => m.name.clone(),
+                    _ => t.description.clone(),
+                };
+                RawTransaction {
+                    external_id: t.id,
+                    date: t.created.date_naive(),
+                    amount_minor: t.amount,
+                    raw_merchant,
+                }
+            })
+            .collect();
+        Ok(out)
     }
 }
 
@@ -131,5 +204,44 @@ mod tests {
         let mut state = State::default();
         let err = m.ensure_auth(&mut state).await.unwrap_err();
         assert!(matches!(err, BankError::AuthExpired(_)));
+    }
+
+    use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn fetch_maps_merchant_with_description_fallback_and_skips_declined() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": [
+                    {
+                        "id": "tx_1", "created": "2026-05-30T08:15:00Z", "amount": -450,
+                        "description": "SQ *SOME CAFE", "decline_reason": null,
+                        "merchant": { "name": "Some Cafe" }
+                    },
+                    {
+                        "id": "tx_2", "created": "2026-05-31T09:00:00Z", "amount": -1999,
+                        "description": "AMZNMKTPLACE", "decline_reason": null,
+                        "merchant": null
+                    },
+                    {
+                        "id": "tx_3", "created": "2026-05-31T10:00:00Z", "amount": -100,
+                        "description": "DECLINED THING", "decline_reason": "INSUFFICIENT_FUNDS",
+                        "merchant": null
+                    }
+                ]
+            })))
+            .mount(&server).await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+        let txs = m.fetch_since(since).await.unwrap();
+
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[0].external_id, "tx_1");
+        assert_eq!(txs[0].raw_merchant, "Some Cafe");
+        assert_eq!(txs[1].raw_merchant, "AMZNMKTPLACE");
+        assert_eq!(txs[1].amount_minor, -1999);
     }
 }
