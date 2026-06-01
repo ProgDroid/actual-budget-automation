@@ -91,6 +91,59 @@ pub fn parse_response(resp: &Value) -> anyhow::Result<Vec<PayeeMatch>> {
     Ok(out)
 }
 
+pub struct HttpClaude {
+    http: reqwest::Client,
+    api_key: String,
+    model: String,
+    base_url: String,
+}
+
+impl HttpClaude {
+    pub fn new(api_key: String, model: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            api_key,
+            model,
+            base_url: "https://api.anthropic.com".to_string(),
+        }
+    }
+
+    /// Override the base URL (used in tests).
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
+    }
+}
+
+#[async_trait]
+impl ClaudeMatcher for HttpClaude {
+    async fn match_payees(
+        &self,
+        raw: &[String],
+        existing_payees: &[String],
+    ) -> anyhow::Result<Vec<PayeeMatch>> {
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = build_request(&self.model, raw, existing_payees);
+        let resp = self
+            .http
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&req)
+            .send()
+            .await
+            .context("anthropic request failed")?;
+        let status = resp.status();
+        let value: Value = resp.json().await.context("anthropic response not JSON")?;
+        if !status.is_success() {
+            return Err(anyhow!("anthropic error {status}: {value}"));
+        }
+        parse_response(&value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +195,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn http_claude_posts_and_parses() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "content": [{ "type": "tool_use", "name": "report_matches", "input": {
+                "matches": [{ "raw": "TFL TRAVEL CH", "payee": "Transport for London" }]
+            }}]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-key"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client = HttpClaude::new("test-key".into(), "claude-sonnet-4-6".into())
+            .with_base_url(server.uri());
+        let out = client
+            .match_payees(&["TFL TRAVEL CH".into()], &["Transport for London".into()])
+            .await
+            .unwrap();
+        assert_eq!(out[0].payee.as_deref(), Some("Transport for London"));
     }
 }
