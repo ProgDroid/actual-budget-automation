@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use tracing::warn;
+
 use crate::banks::{BankError, BankSource, RawTransaction};
 use crate::state::{MonzoState, State};
 
@@ -72,6 +74,11 @@ impl BankSource for Monzo {
         "monzo"
     }
 
+    /// # Errors
+    /// Returns [`BankError::AuthExpired`] when there is no refresh token in
+    /// state or Monzo rejects the refresh with 401/403 (a 90-day human re-auth
+    /// is required). Returns [`BankError::Other`] for transport failures, other
+    /// non-success statuses, or a response body that fails to deserialize.
     async fn ensure_auth(&mut self, state: &mut State) -> Result<(), BankError> {
         if self.monzo.refresh_token.is_empty() {
             return Err(BankError::AuthExpired("no Monzo refresh token in state".into()));
@@ -113,11 +120,23 @@ impl BankSource for Monzo {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns [`BankError::AuthExpired`] when Monzo rejects the access token
+    /// with 401/403 (refresh/re-auth required). Returns [`BankError::Other`]
+    /// when `ensure_auth` has not been called, the account id is unconfigured,
+    /// the transport fails, the status is otherwise non-success, or the body
+    /// fails to deserialize.
     async fn fetch_since(&self, since: DateTime<Utc>) -> Result<Vec<RawTransaction>, BankError> {
         let token = self
             .access_token
             .as_ref()
             .ok_or_else(|| BankError::Other(anyhow::anyhow!("ensure_auth not called")))?;
+        if self.monzo.account_id.is_empty() {
+            return Err(BankError::Other(anyhow::anyhow!(
+                "Monzo account_id not configured; set [monzo].account_id in the state file"
+            )));
+        }
+        // TODO(phase2): paginate via `before` cursor when 100 are returned.
         let resp = self
             .http
             .get(format!("{}/transactions", self.base_url))
@@ -126,12 +145,15 @@ impl BankSource for Monzo {
                 ("account_id", self.monzo.account_id.as_str()),
                 ("since", &since.to_rfc3339()),
                 ("expand[]", "merchant"),
+                ("limit", "100"),
             ])
             .send()
             .await
             .map_err(|e| BankError::Other(e.into()))?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
             return Err(BankError::AuthExpired("Monzo access token rejected".into()));
         }
         if !resp.status().is_success() {
@@ -140,6 +162,9 @@ impl BankSource for Monzo {
         }
 
         let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
+        if list.transactions.len() == 100 {
+            warn!("Monzo returned 100 transactions (page limit); pagination not implemented — some transactions may be missed this run");
+        }
         let out = list
             .transactions
             .into_iter()
@@ -243,5 +268,35 @@ mod tests {
         assert_eq!(txs[0].raw_merchant, "Some Cafe");
         assert_eq!(txs[1].raw_merchant, "AMZNMKTPLACE");
         assert_eq!(txs[1].amount_minor, -1999);
+    }
+
+    #[tokio::test]
+    async fn fetch_with_empty_account_id_errors() {
+        let mut m = Monzo::new(
+            "cid".into(),
+            "csecret".into(),
+            "http://unused".into(),
+            crate::state::MonzoState { refresh_token: "rt".into(), account_id: String::new() },
+        );
+        m.set_access_token_for_test("at_x".into());
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+        let err = m.fetch_since(since).await.unwrap_err();
+        assert!(matches!(err, BankError::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_403_is_auth_expired() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/transactions"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "code": "forbidden.insufficient_permissions"
+            })))
+            .mount(&server).await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+        let err = m.fetch_since(since).await.unwrap_err();
+        assert!(matches!(err, BankError::AuthExpired(_)));
     }
 }
