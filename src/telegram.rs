@@ -146,17 +146,20 @@ pub fn parse_get_updates(
 }
 
 pub fn build_send_request(prompt: &Prompt, chat_id: i64) -> Value {
-    let row: Vec<Value> = prompt
-        .buttons
-        .iter()
-        .map(|(label, data)| json!({ "text": label, "callback_data": data }))
-        .collect();
-    json!({
+    let mut body = json!({
         "chat_id": chat_id,
         "text": prompt.chat_text,
         "parse_mode": "Markdown",
-        "reply_markup": { "inline_keyboard": [row] }
-    })
+    });
+    if !prompt.buttons.is_empty() {
+        let row: Vec<Value> = prompt
+            .buttons
+            .iter()
+            .map(|(label, data)| json!({ "text": label, "callback_data": data }))
+            .collect();
+        body["reply_markup"] = json!({ "inline_keyboard": [row] });
+    }
+    body
 }
 
 pub struct HttpTelegram {
@@ -336,6 +339,20 @@ mod tests {
             ReplyAction::Remap(t) => assert_eq!(t, "Sainsbury's"),
             _ => panic!("expected remap"),
         }
+    }
+
+    #[test]
+    fn build_send_request_omits_reply_markup_when_no_buttons() {
+        let prompt = Prompt {
+            chat_text: "no buttons".into(),
+            buttons: vec![],
+        };
+        let body = build_send_request(&prompt, 99);
+        assert_eq!(body["text"], "no buttons");
+        assert!(
+            body.get("reply_markup").is_none(),
+            "empty buttons must not emit reply_markup, got: {body}"
+        );
     }
 
     #[test]
