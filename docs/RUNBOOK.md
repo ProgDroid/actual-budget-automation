@@ -10,6 +10,7 @@
    and set `[monzo].account_id`.
 
 ## Daily run (server, one-shot container)
+
 The container runs as the non-root `node` user (uid 1000, set by `USER node` in
 the `Dockerfile`). The host bind-mount directory (`/srv/aba` → `/data`) holds
 both the state file and the Actual cache (`ACTUAL_DATA_DIR=/data/actual-cache`),

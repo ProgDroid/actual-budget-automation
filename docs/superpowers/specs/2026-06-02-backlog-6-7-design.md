@@ -127,9 +127,12 @@ Edit (not delete) the stale message: `editMessageText` has no 48-hour limit
   async fn edit_message_text(&self, message_id: i64, text: &str) -> anyhow::Result<()>;
   ```
   Implemented for `HttpTelegram` via a POST to `editMessageText` with
-  `{ chat_id, message_id, text, parse_mode: "Markdown" }` and **no**
-  `reply_markup` (which clears the old keyboard). Errors are redacted via the
-  existing `redact` helper, consistent with `send_prompt` / `poll_replies`.
+  `{ chat_id, message_id, text }` and **no** `reply_markup` (which clears the old
+  keyboard). Sent as **plain text** (no `parse_mode`): the breadcrumb interpolates
+  the user's free-text remap, and legacy Markdown can't reliably escape it, so a
+  stray `*`/`_`/`` ` `` would 400 the edit and silently leave the stale buttons
+  live — defeating the cleanup. Errors are redacted via the existing `redact`
+  helper, consistent with `send_prompt` / `poll_replies`.
 
 - **`run.rs` remap-normalisation `None` arm**: before clearing
   `telegram_message_id`, if a `channel` is present and an old `message_id`
@@ -148,8 +151,10 @@ Edit (not delete) the stale message: `editMessageText` has no 48-hour limit
 ### Tests
 
 - A `run()` test: a re-held remap with an existing `telegram_message_id` fires
-  one `edit_message_text` against that id, and `telegram_message_id` ends up
-  `None`.
+  one `edit_message_text` against that **old** id. (The end-of-run prompt loop
+  then re-sends a fresh prompt for the re-held entry, so `telegram_message_id`
+  ends up `Some(new id)` and one prompt is recorded as sent — assert on the edit
+  call and the fresh send, not on a `None`.)
 - A failing `edit_message_text` does not abort the re-hold (entry is still
   re-held; run completes `Ok`).
 - `HttpTelegram::edit_message_text` against a `wiremock` mock posts to
