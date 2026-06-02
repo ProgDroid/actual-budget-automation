@@ -55,7 +55,15 @@ async fn main() -> Result<()> {
             let notifier = HttpApprise::new(cfg.apprise_url.clone());
 
             run::run(
-                &cfg, dry_run, &mut state, &mut bank, &actual, &claude, &notifier,
+                &cfg,
+                dry_run,
+                &mut state,
+                &mut bank,
+                &actual,
+                &claude,
+                &notifier,
+                None,
+                crate::claude::Confidence::parse(&cfg.autoimport_confidence),
             )
             .await
         }

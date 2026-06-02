@@ -9,11 +9,12 @@ use tracing::{info, warn};
 use crate::actual::ActualClient;
 use crate::actual::shim_protocol::{ImportTxn, Payee, ScheduleRow};
 use crate::banks::{BankError, BankSource, RawTransaction};
-use crate::claude::{ClaudeMatcher, PayeeMatch};
+use crate::claude::{ClaudeMatcher, Confidence, PayeeMatch};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
-use crate::matching::{Schedule, matches_scheduled};
+use crate::matching::{Schedule, best_payee_match, matches_scheduled};
 use crate::notify::Notifier;
-use crate::state::State;
+use crate::state::{PendingReview, State};
+use crate::telegram::{ConfirmChannel, Prompt};
 
 /// Result of splitting fetched transactions against the payee cache.
 #[derive(Debug, PartialEq)]
@@ -40,29 +41,43 @@ pub fn plan_resolution(txs: &[RawTransaction], cache: &BTreeMap<String, String>)
     }
 }
 
-/// Result of applying Claude matches to the transactions that needed lookup.
+/// Result of applying Claude matches, split by the auto-import cutoff.
 #[derive(Debug, PartialEq)]
 pub struct MatchOutcome {
-    /// (external_id, payee_name) successfully matched.
+    /// (external_id, payee_name) confident enough to import + cache now.
     pub matched: Vec<(String, String)>,
-    /// Transactions with no match — to be held for review.
+    /// (tx, suggested_payee, confidence) held for Telegram confirmation.
+    pub proposed: Vec<(RawTransaction, String, Confidence)>,
+    /// No usable match — held with no suggestion.
     pub unmatched: Vec<RawTransaction>,
 }
 
-pub fn apply_matches(txs: &[RawTransaction], matches: &[PayeeMatch]) -> MatchOutcome {
-    let lookup: BTreeMap<&str, Option<&String>> = matches
-        .iter()
-        .map(|m| (m.raw.as_str(), m.payee.as_ref()))
-        .collect();
+pub fn apply_matches(
+    txs: &[RawTransaction],
+    matches: &[PayeeMatch],
+    autoimport: Confidence,
+) -> MatchOutcome {
+    let lookup: BTreeMap<&str, &PayeeMatch> = matches.iter().map(|m| (m.raw.as_str(), m)).collect();
     let mut matched = Vec::new();
+    let mut proposed = Vec::new();
     let mut unmatched = Vec::new();
     for tx in txs {
         match lookup.get(tx.raw_merchant.as_str()) {
-            Some(Some(payee)) => matched.push((tx.external_id.clone(), (*payee).clone())),
-            _ => unmatched.push(tx.clone()),
+            Some(m) => match &m.payee {
+                Some(payee) if m.confidence.rank() >= autoimport.rank() => {
+                    matched.push((tx.external_id.clone(), payee.clone()))
+                }
+                Some(payee) => proposed.push((tx.clone(), payee.clone(), m.confidence)),
+                None => unmatched.push(tx.clone()),
+            },
+            None => unmatched.push(tx.clone()),
         }
     }
-    MatchOutcome { matched, unmatched }
+    MatchOutcome {
+        matched,
+        proposed,
+        unmatched,
+    }
 }
 
 /// Build `Schedule`s for matching by resolving each row's payee id to a name.
@@ -97,6 +112,52 @@ fn payee_id_for<'a>(payees: &'a [Payee], name: &str) -> Option<&'a str> {
         .map(|p| p.id.as_str())
 }
 
+/// Build the Telegram prompt for a held entry. Flavor is chosen by whether a
+/// suggestion exists and whether it is a real payee:
+/// - suggestion in payee list  -> "raw → suggestion?"  [Confirm][Create new][Skip]
+/// - suggestion NOT in payees   -> "No payee 'x'. Create it?" [Create][Skip]
+/// - no suggestion              -> "New merchant raw — which payee?" [Create new][Skip]
+fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
+    use crate::telegram::encode_callback;
+    let key = &entry.external_id;
+    match &entry.suggestion {
+        Some(s) if payee_names.iter().any(|p| p == s) => {
+            let conf = entry.confidence.as_deref().unwrap_or("medium");
+            Prompt {
+                chat_text: format!(
+                    "`{}` → *{}*?  _({} confidence)_\nReply with a different payee to remap.",
+                    entry.raw_merchant, s, conf
+                ),
+                buttons: vec![
+                    ("✅ Confirm".into(), encode_callback("cf", key)),
+                    ("🆕 Create new".into(), encode_callback("nw", key)),
+                    ("❌ Skip".into(), encode_callback("sk", key)),
+                ],
+            }
+        }
+        Some(s) => Prompt {
+            chat_text: format!(
+                "No existing payee *{}*. Create it?\nOr reply with a payee name.",
+                s
+            ),
+            buttons: vec![
+                ("🆕 Create".into(), encode_callback("nw", key)),
+                ("❌ Skip".into(), encode_callback("sk", key)),
+            ],
+        },
+        None => Prompt {
+            chat_text: format!(
+                "New merchant `{}` — which payee?\nReply with a payee name, or:",
+                entry.raw_merchant
+            ),
+            buttons: vec![
+                ("🆕 Create new".into(), encode_callback("nw", key)),
+                ("❌ Skip".into(), encode_callback("sk", key)),
+            ],
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: &Config,
@@ -106,6 +167,8 @@ pub async fn run(
     actual: &ActualClient,
     claude: &dyn ClaudeMatcher,
     notifier: &dyn Notifier,
+    channel: Option<&dyn ConfirmChannel>,
+    autoimport: Confidence,
 ) -> anyhow::Result<()> {
     // 1. Auth (rotated token persisted into state even in dry-run).
     match bank.ensure_auth(state).await {
@@ -149,6 +212,25 @@ pub async fn run(
         .filter(|tx| !matches_scheduled(tx, &schedules, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD))
         .collect();
 
+    // Build payee name list once (reused for remap normalisation and Claude call).
+    let payee_names: Vec<String> = payees.iter().map(|p| p.name.clone()).collect();
+
+    // Normalise any free-text remap replies against the live payee list, so
+    // `take_resolved` only ever folds a real existing payee into the cache.
+    // A remap that doesn't match becomes a "create it?" hold (suggestion set,
+    // resolve_to cleared, prompt re-sent next run).
+    for pr in &mut state.pending_reviews {
+        if !pr.create_new && !pr.resolve_to.is_empty() {
+            match best_payee_match(&pr.resolve_to, &payee_names, PAYEE_THRESHOLD) {
+                Some(canon) => pr.resolve_to = canon,
+                None => {
+                    pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
+                    pr.telegram_message_id = None;
+                }
+            }
+        }
+    }
+
     // 5a. Apply already-resolved pending reviews from previous runs.
     let resolved = state.take_resolved();
 
@@ -157,7 +239,6 @@ pub async fn run(
     let claude_matches: Vec<PayeeMatch> = if plan.needs_claude.is_empty() {
         Vec::new()
     } else {
-        let payee_names: Vec<String> = payees.iter().map(|p| p.name.clone()).collect();
         claude
             .match_payees(&plan.needs_claude, &payee_names)
             .await
@@ -168,7 +249,7 @@ pub async fn run(
         .filter(|tx| !state.payee_cache.contains_key(&tx.raw_merchant))
         .cloned()
         .collect();
-    let outcome = apply_matches(&unknown_txs, &claude_matches);
+    let outcome = apply_matches(&unknown_txs, &claude_matches, autoimport);
 
     // 6. Assemble import rows (payee NAME -> id; never auto-create on the matched path).
     let mut import_rows: Vec<ImportTxn> = Vec::new();
@@ -248,7 +329,21 @@ pub async fn run(
         });
     }
 
-    // unmatched -> hold for review
+    // proposed (medium/low) -> held WITH suggestion + confidence, NOT imported
+    for (tx, sugg, conf) in &outcome.proposed {
+        let date = tx.date.format("%Y-%m-%d").to_string();
+        if state.add_pending_full(
+            &tx.external_id,
+            &tx.raw_merchant,
+            tx.amount_minor,
+            &date,
+            Some(sugg.clone()),
+            Some(conf.as_str().to_string()),
+        ) {
+            held += 1;
+        }
+    }
+    // unmatched -> held with no suggestion
     for tx in &outcome.unmatched {
         let date = tx.date.format("%Y-%m-%d").to_string();
         if state.add_pending(&tx.external_id, &tx.raw_merchant, tx.amount_minor, &date) {
@@ -264,9 +359,18 @@ pub async fn run(
             "  would skip   : {} (matched a schedule)",
             fetched_count.saturating_sub(candidates.len())
         );
-        println!("  would hold   : {}", outcome.unmatched.len());
+        println!(
+            "  would hold   : {}",
+            outcome.proposed.len() + outcome.unmatched.len()
+        );
         for r in &import_rows {
             println!("    + {} {} -> payee {}", r.date, r.amount, r.payee);
+        }
+        for (tx, sugg, _) in &outcome.proposed {
+            println!(
+                "    ? hold {} {} (suggest {})",
+                tx.raw_merchant, tx.amount_minor, sugg
+            );
         }
         for tx in &outcome.unmatched {
             println!("    ? hold {} {}", tx.raw_merchant, tx.amount_minor);
@@ -305,8 +409,29 @@ pub async fn run(
     );
 
     state.last_run = Some(Utc::now());
+
+    // Send a prompt for every held entry that hasn't been prompted yet.
+    if let Some(ch) = channel {
+        // collect indices to avoid borrow conflicts while sending
+        let to_prompt: Vec<usize> = state
+            .pending_reviews
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.telegram_message_id.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        for i in to_prompt {
+            let prompt = build_prompt(&state.pending_reviews[i], &payee_names);
+            match ch.send_prompt(&prompt).await {
+                Ok(message_id) => state.pending_reviews[i].telegram_message_id = Some(message_id),
+                Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
+            }
+        }
+    }
+
     state.save(&cfg.state_path)?;
 
+    let awaiting = state.pending_reviews.len();
     let mut body = format!(
         "Added {}, updated {}, held {} for review.",
         summary.added, summary.updated, held
@@ -316,6 +441,9 @@ pub async fn run(
         for (raw, payee) in &newly_cached {
             body.push_str(&format!("\n  {raw} -> {payee}"));
         }
+    }
+    if awaiting > 0 {
+        body.push_str(&format!("\n{awaiting} item(s) awaiting your confirmation."));
     }
     notifier.notify("Actual import complete", &body).await.ok();
 
@@ -402,19 +530,60 @@ fn urlencoding(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::banks::RawTransaction;
-    use crate::claude::PayeeMatch;
+    use crate::claude::{Confidence, PayeeMatch};
+    use crate::state::PendingReview;
+    use crate::telegram::{ConfirmChannel, Prompt, Reply};
+    use async_trait::async_trait;
     use chrono::NaiveDate;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
-    fn tx(id: &str, merchant: &str, amount: i64) -> RawTransaction {
+    pub fn tx(id: &str, merchant: &str, amount: i64) -> RawTransaction {
         RawTransaction {
             external_id: id.into(),
             date: NaiveDate::from_ymd_opt(2026, 5, 30).unwrap(),
             amount_minor: amount,
             raw_merchant: merchant.into(),
+        }
+    }
+
+    /// Test double: returns scripted replies once, records sent prompts.
+    pub struct FakeChannel {
+        pub scripted: Mutex<Vec<Reply>>,
+        pub offset: i64,
+        pub sent: Mutex<Vec<Prompt>>,
+        pub next_id: Mutex<i64>,
+    }
+    impl FakeChannel {
+        pub fn new(scripted: Vec<Reply>, offset: i64) -> Self {
+            Self {
+                scripted: Mutex::new(scripted),
+                offset,
+                sent: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1000),
+            }
+        }
+    }
+    #[async_trait]
+    impl ConfirmChannel for FakeChannel {
+        async fn poll_replies(
+            &self,
+            _since: i64,
+            _msg_map: &BTreeMap<i64, String>,
+        ) -> anyhow::Result<(Vec<Reply>, i64)> {
+            Ok((
+                std::mem::take(&mut *self.scripted.lock().unwrap()),
+                self.offset,
+            ))
+        }
+        async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64> {
+            self.sent.lock().unwrap().push(prompt.clone());
+            let mut id = self.next_id.lock().unwrap();
+            *id += 1;
+            Ok(*id)
         }
     }
 
@@ -439,26 +608,95 @@ mod tests {
     }
 
     #[test]
-    fn applies_claude_matches_and_flags_unmatched() {
-        let txs = vec![tx("2", "AMZNMKTPLACE", -1999), tx("3", "WEIRD XYZ", -100)];
+    fn apply_matches_partitions_by_confidence() {
+        let txs = vec![
+            tx("1", "TESCO", -500),     // high -> auto import
+            tx("2", "SQ *CAFE", -450),  // medium -> proposed/held
+            tx("3", "WEIRD XYZ", -100), // none -> unmatched/held
+        ];
         let matches = vec![
             PayeeMatch {
-                raw: "AMZNMKTPLACE".into(),
-                payee: Some("Amazon".into()),
-                confidence: crate::claude::Confidence::High,
+                raw: "TESCO".into(),
+                payee: Some("Tesco".into()),
+                confidence: Confidence::High,
+            },
+            PayeeMatch {
+                raw: "SQ *CAFE".into(),
+                payee: Some("Local Cafe".into()),
+                confidence: Confidence::Medium,
             },
             PayeeMatch {
                 raw: "WEIRD XYZ".into(),
                 payee: None,
-                confidence: crate::claude::Confidence::Low,
+                confidence: Confidence::Low,
             },
         ];
-        let outcome = apply_matches(&txs, &matches);
+        let outcome = apply_matches(&txs, &matches, Confidence::High);
         assert_eq!(
             outcome.matched,
-            vec![("2".to_string(), "Amazon".to_string())]
+            vec![("1".to_string(), "Tesco".to_string())]
         );
+        assert_eq!(outcome.proposed.len(), 1);
+        assert_eq!(outcome.proposed[0].0.external_id, "2");
+        assert_eq!(outcome.proposed[0].1, "Local Cafe");
+        assert_eq!(outcome.proposed[0].2, Confidence::Medium);
         assert_eq!(outcome.unmatched.len(), 1);
         assert_eq!(outcome.unmatched[0].external_id, "3");
+    }
+
+    #[test]
+    fn build_prompt_picks_flavor_by_payee_membership() {
+        let payees = vec!["Tesco".to_string(), "Local Cafe".to_string()];
+
+        // proposed, suggestion exists -> confirm/create/skip
+        let proposed = PendingReview {
+            external_id: "tx1".into(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some("Local Cafe".into()),
+            confidence: Some("medium".into()),
+            telegram_message_id: None,
+        };
+        let p = build_prompt(&proposed, &payees);
+        assert!(p.chat_text.contains("Local Cafe"));
+        assert_eq!(p.buttons.len(), 3);
+        assert_eq!(p.buttons[0].1, "cf:tx1");
+
+        // no-match -> create/skip only
+        let unmatched = PendingReview {
+            external_id: "tx2".into(),
+            raw_merchant: "MYSTERY".into(),
+            amount: -10,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            telegram_message_id: None,
+        };
+        let p2 = build_prompt(&unmatched, &payees);
+        assert_eq!(p2.buttons.len(), 2);
+        assert_eq!(p2.buttons[0].1, "nw:tx2");
+
+        // failed remap: suggestion set but NOT in payees -> "create it?" flavor
+        let failed = PendingReview {
+            external_id: "tx3".into(),
+            raw_merchant: "X".into(),
+            amount: -10,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some("Sainsbury's".into()),
+            confidence: None,
+            telegram_message_id: None,
+        };
+        let p3 = build_prompt(&failed, &payees);
+        assert!(p3.chat_text.contains("Sainsbury's"));
+        assert_eq!(p3.buttons.len(), 2);
+        assert_eq!(p3.buttons[0].1, "nw:tx3"); // create
+        assert_eq!(p3.buttons[1].1, "sk:tx3"); // skip
     }
 }
