@@ -10,6 +10,17 @@
    and set `[monzo].account_id`.
 
 ## Daily run (server, one-shot container)
+The container runs as the non-root `node` user (uid 1000, set by `USER node` in
+the `Dockerfile`). The host bind-mount directory (`/srv/aba` → `/data`) holds
+both the state file and the Actual cache (`ACTUAL_DATA_DIR=/data/actual-cache`),
+so it must be writable by uid 1000 or the run cannot persist state. One-time
+setup on the host:
+
+```sh
+sudo mkdir -p /srv/aba
+sudo chown -R 1000:1000 /srv/aba
+```
+
 `docker run --rm --network <actual-net> \
   -e ANTHROPIC_API_KEY -e MONZO_CLIENT_ID -e MONZO_CLIENT_SECRET \
   -e MONZO_REDIRECT_URI -e APPRISE_URL \
@@ -75,6 +86,13 @@ file as usual. Edit `[[pending_review]]` entries directly:
 - Set `create_new = true`.
 
 The next `aba run` imports them. Nothing breaks if Telegram is unreachable.
+
+## Operational notes
+
+- **Prompt caching gives no benefit at the nightly cadence.** Anthropic prompt
+  caching uses an ~5-minute ephemeral TTL that expires between once-daily runs,
+  so it only pays off for runs <5 minutes apart (retries / local testing) or a
+  higher-frequency schedule. Revisit if the schedule changes.
 
 ## Required environment variables
 ANTHROPIC_API_KEY, CLAUDE_MODEL (optional, default claude-sonnet-4-6),
