@@ -160,7 +160,7 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
             let conf = entry.confidence.as_deref().unwrap_or("medium");
             Prompt {
                 chat_text: format!(
-                    "`{}` → *{}*?  _({} confidence)_\nReply with a different payee to remap.",
+                    "'{}' -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
                     entry.raw_merchant, s, conf
                 ),
                 buttons: buttons(&[
@@ -172,14 +172,14 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
         }
         Some(s) => Prompt {
             chat_text: format!(
-                "No existing payee *{}*. Create it?\nOr reply with a payee name.",
+                "No existing payee '{}'. Create it?\nOr reply with a payee name.",
                 s
             ),
             buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
         },
         None => Prompt {
             chat_text: format!(
-                "New merchant `{}` — which payee?\nReply with a payee name, or:",
+                "New merchant '{}' — which payee?\nReply with a payee name, or:",
                 entry.raw_merchant
             ),
             buttons: buttons(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")]),
@@ -781,7 +781,8 @@ pub(crate) mod tests {
             telegram_message_id: None,
         };
         let p = build_prompt(&proposed, &payees);
-        assert!(p.chat_text.contains("Local Cafe"));
+        assert!(p.chat_text.contains("'Local Cafe'"), "expected plain-text quoting: {}", p.chat_text);
+        assert!(!p.chat_text.contains("*Local Cafe*"), "must not use Markdown bold for payee: {}", p.chat_text);
         assert_eq!(p.buttons.len(), 3);
         assert_eq!(p.buttons[0].1, "cf:tx1");
 
