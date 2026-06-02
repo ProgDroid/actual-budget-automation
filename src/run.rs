@@ -532,14 +532,17 @@ fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::banks::RawTransaction;
-    use crate::claude::{Confidence, PayeeMatch};
+    use crate::actual::ActualClient;
+    use crate::banks::{BankError, BankSource, RawTransaction};
+    use crate::claude::{ClaudeMatcher, Confidence, PayeeMatch};
+    use crate::notify::Notifier;
     use crate::state::PendingReview;
     use crate::telegram::{ConfirmChannel, Prompt, Reply};
     use async_trait::async_trait;
-    use chrono::NaiveDate;
+    use chrono::{DateTime, NaiveDate, Utc};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     pub fn tx(id: &str, merchant: &str, amount: i64) -> RawTransaction {
         RawTransaction {
@@ -698,5 +701,293 @@ pub(crate) mod tests {
         assert_eq!(p3.buttons.len(), 2);
         assert_eq!(p3.buttons[0].1, "nw:tx3"); // create
         assert_eq!(p3.buttons[1].1, "sk:tx3"); // skip
+    }
+
+    // ---- Task 10: in-process doubles ----
+
+    struct FakeBank {
+        txs: Vec<RawTransaction>,
+    }
+    #[async_trait]
+    impl BankSource for FakeBank {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        async fn ensure_auth(&mut self, _s: &mut State) -> Result<(), BankError> {
+            Ok(())
+        }
+        async fn fetch_since(
+            &self,
+            _since: DateTime<Utc>,
+        ) -> Result<Vec<RawTransaction>, BankError> {
+            Ok(self.txs.clone())
+        }
+    }
+
+    struct FakeClaude {
+        out: Vec<PayeeMatch>,
+    }
+    #[async_trait]
+    impl ClaudeMatcher for FakeClaude {
+        async fn match_payees(
+            &self,
+            _raw: &[String],
+            _p: &[String],
+        ) -> anyhow::Result<Vec<PayeeMatch>> {
+            Ok(self.out.clone())
+        }
+    }
+
+    struct NullNotifier;
+    #[async_trait]
+    impl Notifier for NullNotifier {
+        async fn notify(&self, _t: &str, _b: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build an `ActualClient` backed by a fake node shim in `dir`.
+    /// `get_payees` returns `[{p_cafe, Local Cafe}]`, `get_scheduled` is empty,
+    /// `create_payee` returns `{id: p_new}`, and `import_transactions` appends
+    /// the imported rows to `<dir>/imports.log` (one JSON array per call).
+    fn fake_actual(dir: &TempDir) -> ActualClient {
+        let script = r#"
+let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
+  const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
+  const fs=require('fs'), path=require('path');
+  if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'}]}); }
+  else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
+  else if(req.op==='create_payee'){ out({ok:true,data:{id:'p_new'}}); }
+  else if(req.op==='import_transactions'){
+    fs.appendFileSync(path.join(__dirname,'imports.log'), JSON.stringify(req.transactions)+'\n');
+    out({ok:true,data:{added:req.transactions.length,updated:0}});
+  } else { out({ok:false,error:'unknown op'}); }
+});
+"#;
+        std::fs::write(dir.path().join("index.js"), script).unwrap();
+        ActualClient::new(
+            dir.path().to_path_buf(),
+            false,
+            "http://t".into(),
+            "pw".into(),
+            "sync".into(),
+        )
+    }
+
+    fn cfg_at(state_path: &std::path::Path) -> Config {
+        Config::from_getter(|k| match k {
+            "ANTHROPIC_API_KEY" => Some("ak".into()),
+            "MONZO_CLIENT_ID" => Some("c".into()),
+            "MONZO_CLIENT_SECRET" => Some("s".into()),
+            "MONZO_REDIRECT_URI" => Some("http://localhost/cb".into()),
+            "APPRISE_URL" => Some("http://a/notify".into()),
+            "ACTUAL_SERVER_URL" => Some("http://actual".into()),
+            "ACTUAL_PASSWORD" => Some("pw".into()),
+            "ACTUAL_SYNC_ID" => Some("sync".into()),
+            "ABA_STATE_PATH" => Some(state_path.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    // ---- Task 10: integration tests ----
+
+    #[tokio::test]
+    async fn medium_match_held_prompted_then_imported_after_confirm() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        // ---- Run #1: one medium-confidence match -> held + prompted, NOT imported.
+        let mut state = State::default();
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
+        };
+        let claude = FakeClaude {
+            out: vec![PayeeMatch {
+                raw: "SQ *CAFE".into(),
+                payee: Some("Local Cafe".into()),
+                confidence: Confidence::Medium,
+            }],
+        };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert!(!imports_log.exists(), "nothing should be imported yet");
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert_eq!(
+            state.pending_reviews[0].suggestion.as_deref(),
+            Some("Local Cafe")
+        );
+        assert!(state.pending_reviews[0].telegram_message_id.is_some());
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+        // ---- User confirms (what `poll` would do).
+        assert!(state.confirm_pending("tx_cafe"));
+
+        // ---- Run #2: no new txs -> the held tx is now imported, prompt NOT re-sent.
+        let mut bank2 = FakeBank { txs: vec![] };
+        let claude2 = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank2,
+            &actual,
+            &claude2,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&imports_log).unwrap();
+        assert!(
+            logged.contains("tx_cafe"),
+            "held tx imported under imported_id"
+        );
+        assert!(
+            logged.contains("p_cafe"),
+            "imported under the Local Cafe payee id"
+        );
+        assert!(state.pending_reviews.is_empty(), "resolved entry removed");
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "no re-prompt (idempotent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_sends_no_prompts_and_no_writes() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
+        };
+        let claude = FakeClaude {
+            out: vec![PayeeMatch {
+                raw: "SQ *CAFE".into(),
+                payee: Some("Local Cafe".into()),
+                confidence: Confidence::Medium,
+            }],
+        };
+        run(
+            &cfg,
+            true,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            channel.sent.lock().unwrap().is_empty(),
+            "dry-run sends no prompts"
+        );
+        assert!(!imports_log.exists(), "dry-run writes nothing to Actual");
+        let on_disk = State::load(&state_path).unwrap();
+        assert!(
+            on_disk.pending_reviews.is_empty(),
+            "dry-run does not persist holds"
+        );
+        assert_eq!(on_disk.last_run, None, "dry-run does not advance last_run");
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_hold_is_not_reprompted() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        // ---- Run #1: one medium-confidence match -> held + prompted.
+        let mut state = State::default();
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
+        };
+        let claude = FakeClaude {
+            out: vec![PayeeMatch {
+                raw: "SQ *CAFE".into(),
+                payee: Some("Local Cafe".into()),
+                confidence: Confidence::Medium,
+            }],
+        };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert!(state.pending_reviews[0].telegram_message_id.is_some());
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+        // ---- User does NOT confirm — the hold stays pending/unconfirmed.
+
+        // ---- Run #2: no new txs -> the already-prompted hold is NOT re-prompted.
+        let mut bank2 = FakeBank { txs: vec![] };
+        let claude2 = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank2,
+            &actual,
+            &claude2,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.pending_reviews.len(), 1, "still held (not confirmed)");
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "telegram_message_id.is_none() filter skipped the already-prompted entry"
+        );
     }
 }
