@@ -240,7 +240,7 @@ pub async fn run(
                     // tapped (best-effort; failure must not abort the run).
                     if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id) {
                         let text = format!(
-                            "↪️ Couldn't match *{}* — re-asking below.",
+                            "↪️ Couldn't match '{}' — re-asking below.",
                             pr.resolve_to
                         );
                         if let Err(e) = ch.edit_message_text(old_id, &text).await {

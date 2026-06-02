@@ -281,8 +281,7 @@ impl ConfirmChannel for HttpTelegram {
         let body = json!({
             "chat_id": self.chat_id,
             "message_id": message_id,
-            "text": text,
-            "parse_mode": "Markdown"
+            "text": text
         });
         let resp = self
             .http
@@ -542,8 +541,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "chat_id": 42,
                 "message_id": 500,
-                "text": "superseded",
-                "parse_mode": "Markdown"
+                "text": "superseded"
             })))
             .respond_with(
                 ResponseTemplate::new(200)
