@@ -184,6 +184,11 @@ impl HttpTelegram {
     fn url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.base_url, self.token, method)
     }
+
+    /// Replace any occurrence of the bot token in `s` with `***`.
+    fn redact(&self, s: String) -> String {
+        s.replace(&self.token, "***")
+    }
 }
 
 #[async_trait]
@@ -199,9 +204,14 @@ impl ConfirmChannel for HttpTelegram {
             .query(&[("offset", since.to_string()), ("timeout", "0".to_string())])
             .send()
             .await
-            .context("telegram getUpdates failed")?;
+            .map_err(|e| anyhow!("telegram getUpdates failed: {}", self.redact(e.to_string())))?;
         let status = resp.status();
-        let value: Value = resp.json().await.context("getUpdates response not JSON")?;
+        let value: Value = resp.json().await.map_err(|e| {
+            anyhow!(
+                "getUpdates response not JSON: {}",
+                self.redact(e.to_string())
+            )
+        })?;
         if !status.is_success() {
             return Err(anyhow!("telegram error {status}: {value}"));
         }
@@ -238,9 +248,19 @@ impl ConfirmChannel for HttpTelegram {
             .json(&body)
             .send()
             .await
-            .context("telegram sendMessage failed")?;
+            .map_err(|e| {
+                anyhow!(
+                    "telegram sendMessage failed: {}",
+                    self.redact(e.to_string())
+                )
+            })?;
         let status = resp.status();
-        let value: Value = resp.json().await.context("sendMessage response not JSON")?;
+        let value: Value = resp.json().await.map_err(|e| {
+            anyhow!(
+                "sendMessage response not JSON: {}",
+                self.redact(e.to_string())
+            )
+        })?;
         if !status.is_success() {
             return Err(anyhow!("telegram error {status}: {value}"));
         }
@@ -445,5 +465,57 @@ mod tests {
         };
         let id = tg.send_prompt(&prompt).await.unwrap();
         assert_eq!(id, 12345);
+    }
+
+    // --- Token-redaction tests ---
+
+    #[test]
+    fn redact_helper_removes_token() {
+        let tg = HttpTelegram::new("SUPERSECRETTOKEN".into(), 42);
+        let url = "http://127.0.0.1:1/botSUPERSECRETTOKEN/getUpdates";
+        let redacted = tg.redact(url.to_string());
+        assert!(
+            !redacted.contains("SUPERSECRETTOKEN"),
+            "token must not appear after redact: {redacted}"
+        );
+        assert!(
+            redacted.contains("***"),
+            "placeholder must appear: {redacted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_replies_transport_error_does_not_leak_token() {
+        // Port 1 is almost certainly connection-refused on any host.
+        let tg = HttpTelegram::new("SUPERSECRETTOKEN".into(), 42)
+            .with_base_url("http://127.0.0.1:1".into());
+        let err = tg
+            .poll_replies(0, &BTreeMap::new())
+            .await
+            .expect_err("connection to port 1 should fail");
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains("SUPERSECRETTOKEN"),
+            "token leaked in poll_replies error chain: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_transport_error_does_not_leak_token() {
+        let tg = HttpTelegram::new("SUPERSECRETTOKEN".into(), 42)
+            .with_base_url("http://127.0.0.1:1".into());
+        let prompt = Prompt {
+            chat_text: "test".into(),
+            buttons: vec![],
+        };
+        let err = tg
+            .send_prompt(&prompt)
+            .await
+            .expect_err("connection to port 1 should fail");
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains("SUPERSECRETTOKEN"),
+            "token leaked in send_prompt error chain: {chain}"
+        );
     }
 }
