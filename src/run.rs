@@ -382,7 +382,7 @@ pub async fn run(
             "  would skip   : {} (matched a schedule)",
             fetched_count.saturating_sub(candidates.len())
         );
-        println!("  would hold   : {}", would_hold_count(&outcome, &state));
+        println!("  would hold   : {}", would_hold_count(&outcome, state));
         for r in &import_rows {
             println!("    + {} {} -> payee {}", r.date, r.amount, r.payee);
         }
