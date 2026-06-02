@@ -95,17 +95,29 @@ fn schedules_from_rows(rows: Vec<ScheduleRow>, payees: &[Payee]) -> Vec<Schedule
         .collect();
     rows.into_iter()
         .filter_map(|r| {
-            let date = NaiveDate::parse_from_str(r.date.as_deref()?, "%Y-%m-%d").ok()?;
-            let payee = r
+            let Some(date_str) = r.date.as_deref() else {
+                warn!("schedule dropped: missing date (payee_id={:?})", r.payee_id);
+                return None;
+            };
+            let date = match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("schedule dropped: unparseable date '{date_str}': {e}");
+                    return None;
+                }
+            };
+            let Some(payee) = r
                 .payee_id
                 .as_deref()
                 .and_then(|id| by_id.get(id).copied())
-                .unwrap_or("")
-                .to_string();
+            else {
+                warn!("schedule dropped: payee_id {:?} not in payee list", r.payee_id);
+                return None;
+            };
             Some(Schedule {
                 amount: r.amount,
                 date,
-                payee,
+                payee: payee.to_string(),
             })
         })
         .collect()
@@ -211,6 +223,10 @@ pub async fn run(
     let since = state
         .last_run
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
+    // Cursor for a successful run: stamp BEFORE fetching so a transaction that
+    // arrives mid-run is re-fetched next time (dedup covers the overlap) rather
+    // than falling into a gap and being lost (M1).
+    let fetch_start = Utc::now();
     let fetched = bank.fetch_since(since).await.map_err(|e| match e {
         BankError::Other(e) => e,
         BankError::AuthExpired(m) => anyhow::anyhow!("auth expired mid-fetch: {m}"),
@@ -456,7 +472,7 @@ pub async fn run(
         summary.added, summary.updated
     );
 
-    state.last_run = Some(Utc::now());
+    state.last_run = Some(fetch_start);
 
     // Send a prompt for every held entry that hasn't been prompted yet.
     if let Some(ch) = channel {
@@ -471,7 +487,13 @@ pub async fn run(
         for i in to_prompt {
             let prompt = build_prompt(&state.pending_reviews[i], &payee_names);
             match ch.send_prompt(&prompt).await {
-                Ok(message_id) => state.pending_reviews[i].telegram_message_id = Some(message_id),
+                Ok(message_id) => {
+                    state.pending_reviews[i].telegram_message_id = Some(message_id);
+                    // Persist now so a later failure can't strand this id (M6).
+                    if let Err(e) = state.save(&cfg.state_path) {
+                        warn!("failed to persist telegram_message_id (may re-prompt next run): {e}");
+                    }
+                }
                 Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
             }
         }
@@ -1500,6 +1522,24 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         );
         // ...and last_run still advanced (the tx is safely held, not lost).
         assert!(state.last_run.is_some());
+    }
+
+    #[test]
+    fn schedules_from_rows_drops_bad_date_and_missing_payee_loudly() {
+        let payees = vec![Payee { id: "p1".into(), name: "Rent Co".into() }];
+        let rows = vec![
+            // good
+            ScheduleRow { date: Some("2026-06-01".into()), amount: Some(-1000), payee_id: Some("p1".into()) },
+            // bad date -> dropped
+            ScheduleRow { date: Some("not-a-date".into()), amount: Some(-1000), payee_id: Some("p1".into()) },
+            // missing date -> dropped
+            ScheduleRow { date: None, amount: Some(-1000), payee_id: Some("p1".into()) },
+            // payee not in list -> dropped
+            ScheduleRow { date: Some("2026-06-02".into()), amount: Some(-1000), payee_id: Some("nope".into()) },
+        ];
+        let schedules = super::schedules_from_rows(rows, &payees);
+        assert_eq!(schedules.len(), 1, "only the fully-valid row survives");
+        assert_eq!(schedules[0].payee, "Rent Co");
     }
 
     #[test]
