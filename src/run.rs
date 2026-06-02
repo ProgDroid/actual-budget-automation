@@ -1,6 +1,6 @@
 //! Run pipeline and auth bootstrap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use chrono::{NaiveDate, Utc};
@@ -56,6 +56,7 @@ pub fn apply_matches(
     txs: &[RawTransaction],
     matches: &[PayeeMatch],
     autoimport: Confidence,
+    existing: &BTreeSet<&str>,
 ) -> MatchOutcome {
     let lookup: BTreeMap<&str, &PayeeMatch> = matches.iter().map(|m| (m.raw.as_str(), m)).collect();
     let mut matched = Vec::new();
@@ -64,7 +65,13 @@ pub fn apply_matches(
     for tx in txs {
         match lookup.get(tx.raw_merchant.as_str()) {
             Some(m) => match &m.payee {
-                Some(payee) if m.confidence.rank() >= autoimport.rank() => {
+                // Auto-import only a confident match to a payee that ACTUALLY
+                // exists in Actual — otherwise it would be silently dropped at
+                // import (no payee id), so hold it for review instead.
+                Some(payee)
+                    if m.confidence.rank() >= autoimport.rank()
+                        && existing.contains(payee.as_str()) =>
+                {
                     matched.push((tx.external_id.clone(), payee.clone()))
                 }
                 Some(payee) => proposed.push((tx.clone(), payee.clone(), m.confidence)),
@@ -272,7 +279,8 @@ pub async fn run(
         .filter(|tx| !state.payee_cache.contains_key(&tx.raw_merchant))
         .cloned()
         .collect();
-    let outcome = apply_matches(&unknown_txs, &claude_matches, autoimport);
+    let existing: BTreeSet<&str> = payee_names.iter().map(String::as_str).collect();
+    let outcome = apply_matches(&unknown_txs, &claude_matches, autoimport, &existing);
 
     // 6. Assemble import rows (payee NAME -> id; never auto-create on the matched path).
     let mut import_rows: Vec<ImportTxn> = Vec::new();
@@ -299,9 +307,18 @@ pub async fn run(
             payee_id_for(&payees, payee_name),
         ) {
             (Some(tx), Some(pid)) => push_row(&mut import_rows, tx, pid),
-            (Some(_), None) => warn!(
-                "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; skipping (re-resolve it)"
-            ),
+            (Some(tx), None) => {
+                warn!(
+                    "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; holding for review"
+                );
+                let date = tx.date.format("%Y-%m-%d").to_string();
+                if state.add_pending_full(
+                    &tx.external_id, &tx.raw_merchant, tx.amount_minor, &date,
+                    Some(payee_name.clone()), None,
+                ) {
+                    held += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -321,9 +338,20 @@ pub async fn run(
                     newly_cached.push((tx.raw_merchant.clone(), payee_name.clone()));
                 }
             }
-            (Some(_), None) => warn!(
-                "matched payee '{payee_name}' for tx {ext_id} not found in Actual payee list; skipping"
-            ),
+            (Some(tx), None) => {
+                // Defensive: apply_matches guarantees matched payees exist. If
+                // this ever fires, hold for review rather than dropping (fail-loud).
+                warn!(
+                    "matched payee '{payee_name}' for tx {ext_id} unexpectedly missing; holding for review"
+                );
+                let date = tx.date.format("%Y-%m-%d").to_string();
+                if state.add_pending_full(
+                    &tx.external_id, &tx.raw_merchant, tx.amount_minor, &date,
+                    Some(payee_name.clone()), None,
+                ) {
+                    held += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -588,7 +616,7 @@ pub(crate) mod tests {
     use crate::telegram::{ConfirmChannel, Prompt, Reply};
     use async_trait::async_trait;
     use chrono::{DateTime, NaiveDate, Utc};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -700,7 +728,8 @@ pub(crate) mod tests {
                 confidence: Confidence::Low,
             },
         ];
-        let outcome = apply_matches(&txs, &matches, Confidence::High);
+        let existing: BTreeSet<&str> = ["Tesco", "Local Cafe"].iter().copied().collect();
+        let outcome = apply_matches(&txs, &matches, Confidence::High, &existing);
         assert_eq!(
             outcome.matched,
             vec![("1".to_string(), "Tesco".to_string())]
@@ -1428,6 +1457,49 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             state.pending_reviews[0].suggestion.as_deref(),
             Some("Nonexistent Payee")
         );
+    }
+
+    #[tokio::test]
+    async fn high_confidence_match_to_nonexistent_payee_is_held_not_dropped() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim); // get_payees -> [Local Cafe]
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_ghost", "SQ *GHOST", -999)],
+        };
+        // Claude returns a HIGH-confidence payee that does NOT exist in Actual.
+        let claude = FakeClaude {
+            out: vec![PayeeMatch {
+                raw: "SQ *GHOST".into(),
+                payee: Some("Ghost Payee".into()),
+                confidence: Confidence::High,
+            }],
+        };
+        run(
+            &cfg, false, &mut state, &mut bank, &actual, &claude, &notifier,
+            Some(&channel as &dyn ConfirmChannel), Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Not imported...
+        assert!(!imports_log.exists(), "non-existent payee must NOT be imported");
+        // ...held for review with the proposed name as the suggestion...
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert_eq!(state.pending_reviews[0].external_id, "tx_ghost");
+        assert_eq!(
+            state.pending_reviews[0].suggestion.as_deref(),
+            Some("Ghost Payee")
+        );
+        // ...and last_run still advanced (the tx is safely held, not lost).
+        assert!(state.last_run.is_some());
     }
 
     #[test]
