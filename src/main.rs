@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
         Command::Auth {
             which: AuthCommand::Monzo,
         } => run::auth_monzo(&cfg).await,
+        // Temporary stub — real dispatch wired in Task 11.
+        Command::Poll => unimplemented!("poll wired in Task 11"),
         Command::Run { dry_run } => {
             let mut state = State::load(&cfg.state_path)?;
             let mut bank = Monzo::new(
