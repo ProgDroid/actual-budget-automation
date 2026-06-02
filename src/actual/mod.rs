@@ -54,7 +54,7 @@ impl ActualClient {
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         cmd.env("ACTUAL_SERVER_URL", &self.server_url)
             .env("ACTUAL_PASSWORD", &self.password)
             .env("ACTUAL_SYNC_ID", &self.sync_id);
@@ -78,6 +78,17 @@ impl ActualClient {
             // Future dropped here -> child dropped -> killed via kill_on_drop.
             Err(_) => return Err(anyhow!("shim timed out after 120s")),
         };
+        if !output.stderr.is_empty() {
+            let mut err_text = String::from_utf8_lossy(&output.stderr).into_owned();
+            if !self.password.is_empty() {
+                err_text = err_text.replace(&self.password, "***");
+            }
+            if output.status.success() {
+                tracing::debug!("shim stderr: {err_text}");
+            } else {
+                tracing::error!("shim exited with {:?}: {err_text}", output.status.code());
+            }
+        }
         let parsed: ShimResponse<T> =
             serde_json::from_slice(&output.stdout).with_context(|| {
                 format!(
@@ -87,7 +98,14 @@ impl ActualClient {
             })?;
         match parsed {
             ShimResponse::Ok { data } => Ok(data),
-            ShimResponse::Err { error } => Err(anyhow!("shim error: {error}")),
+            ShimResponse::Err { error } => {
+                let safe = if self.password.is_empty() {
+                    error
+                } else {
+                    error.replace(&self.password, "***")
+                };
+                Err(anyhow!("shim error: {safe}"))
+            }
         }
     }
 
