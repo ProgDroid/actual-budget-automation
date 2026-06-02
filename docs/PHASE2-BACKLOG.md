@@ -66,8 +66,8 @@ paths to cover before adding more write paths:
 - **Dry-run state-splice correctness**: assert that after a dry run, `payee_cache`,
   `pending_reviews`, and `last_run` are unchanged on disk and only the rotated
   Monzo token is persisted.
-- **`AuthExpired` early-return**: notification fires only when `!dry_run`; `save`
-  is always attempted.
+- **`AuthExpired` early-return**: notification **and** `save` both fire only when
+  `!dry_run`; the run then early-returns `Ok` without fetching or importing.
 
 Requires test doubles for `BankSource`, `ClaudeMatcher`, `Notifier`, and a fake
 `node` shim (as used in `actual::tests`).
