@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
             let claude = HttpClaude::new(cfg.anthropic_api_key.clone(), cfg.claude_model.clone());
             let notifier = HttpApprise::new(cfg.apprise_url.clone());
             let channel = build_channel(&cfg);
-            let autoimport = Confidence::parse(&cfg.autoimport_confidence);
+            let autoimport = Confidence::from_env_str(&cfg.autoimport_confidence)?;
 
             match tokio::time::timeout(std::time::Duration::from_secs(600), run::run(
                 &cfg,

@@ -38,6 +38,21 @@ impl Confidence {
             _ => Confidence::Medium,
         }
     }
+
+    /// Strict parse for the operator-set env var. Unlike `parse` (which leniently
+    /// defaults unknown Claude API output to Medium), a bad value here is a hard
+    /// config error — a typo like "High"/"MEDIUM" must not silently widen
+    /// auto-import.
+    pub fn from_env_str(s: &str) -> anyhow::Result<Confidence> {
+        match s {
+            "high" => Ok(Confidence::High),
+            "medium" => Ok(Confidence::Medium),
+            "low" => Ok(Confidence::Low),
+            other => Err(anyhow::anyhow!(
+                "ABA_AUTOIMPORT_CONFIDENCE must be high|medium|low, got '{other}'"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -197,6 +212,15 @@ impl ClaudeMatcher for HttpClaude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_env_str_is_strict() {
+        assert_eq!(Confidence::from_env_str("high").unwrap(), Confidence::High);
+        assert_eq!(Confidence::from_env_str("medium").unwrap(), Confidence::Medium);
+        assert_eq!(Confidence::from_env_str("low").unwrap(), Confidence::Low);
+        assert!(Confidence::from_env_str("High").is_err(), "case-typo must error");
+        assert!(Confidence::from_env_str("bogus").is_err());
+    }
 
     #[test]
     fn confidence_parses_and_ranks() {
