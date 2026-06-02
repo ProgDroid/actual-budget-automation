@@ -234,6 +234,19 @@ pub async fn run(
             match best_payee_match(&pr.resolve_to, &payee_names, PAYEE_THRESHOLD) {
                 Some(canon) => pr.resolve_to = canon,
                 None => {
+                    // Free-text remap didn't match a real payee: re-hold as a
+                    // "create it?" suggestion and re-prompt next. Edit the stale
+                    // inline-keyboard message first so its old buttons can't be
+                    // tapped (best-effort; failure must not abort the run).
+                    if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id) {
+                        let text = format!(
+                            "↪️ Couldn't match *{}* — re-asking below.",
+                            pr.resolve_to
+                        );
+                        if let Err(e) = ch.edit_message_text(old_id, &text).await {
+                            warn!("telegram edit_message_text failed (stale prompt left in chat): {e}");
+                        }
+                    }
                     pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
                     pr.telegram_message_id = None;
                 }
@@ -1311,6 +1324,110 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             "resolved review still on disk -> retry is clean (state not saved on failure)"
         );
         assert_eq!(on_disk.pending_reviews[0].external_id, "tx_x");
+    }
+
+    #[tokio::test]
+    async fn failed_remap_edits_stale_prompt_then_reprompts() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim); // get_payees -> [Local Cafe]
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        // A held entry whose free-text remap ("Nonexistent Payee") will NOT match
+        // the live payee list, with an existing prompt message_id (500).
+        let mut state = State::default();
+        state.add_pending_full(
+            "tx1",
+            "SQ *CAFE",
+            -450,
+            "2026-06-01",
+            Some("Local Cafe".into()),
+            Some("medium".into()),
+        );
+        state.pending_reviews[0].telegram_message_id = Some(500);
+        assert!(state.remap_pending("tx1", "Nonexistent Payee"));
+
+        let mut bank = FakeBank { txs: vec![] };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Stale prompt (id 500) was edited exactly once.
+        let edited = channel.edited.lock().unwrap();
+        assert_eq!(edited.len(), 1);
+        assert_eq!(edited[0].0, 500);
+
+        // Entry re-held as a "create it?" suggestion, resolve_to cleared, and a
+        // fresh prompt was sent (new message_id, recorded in `sent`).
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert_eq!(
+            state.pending_reviews[0].suggestion.as_deref(),
+            Some("Nonexistent Payee")
+        );
+        assert!(state.pending_reviews[0].resolve_to.is_empty());
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+        assert_eq!(state.pending_reviews[0].telegram_message_id, Some(1001));
+    }
+
+    #[tokio::test]
+    async fn failed_remap_edit_failure_does_not_abort_run() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0).with_failing_edit();
+
+        let mut state = State::default();
+        state.add_pending_full(
+            "tx1",
+            "SQ *CAFE",
+            -450,
+            "2026-06-01",
+            Some("Local Cafe".into()),
+            Some("medium".into()),
+        );
+        state.pending_reviews[0].telegram_message_id = Some(500);
+        assert!(state.remap_pending("tx1", "Nonexistent Payee"));
+
+        let mut bank = FakeBank { txs: vec![] };
+        let claude = FakeClaude { out: vec![] };
+        // Must complete Ok despite the edit error.
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Edit was attempted, and the entry was still re-held + re-prompted.
+        assert_eq!(channel.edited.lock().unwrap().len(), 1);
+        assert_eq!(
+            state.pending_reviews[0].suggestion.as_deref(),
+            Some("Nonexistent Payee")
+        );
     }
 
     #[test]
