@@ -4,8 +4,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use tracing::warn;
-
 use crate::banks::{BankError, BankSource, RawTransaction};
 use crate::state::{MonzoState, State};
 
@@ -16,6 +14,7 @@ pub struct Monzo {
     base_url: String,
     monzo: MonzoState,
     access_token: Option<String>,
+    max_pages: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +47,11 @@ struct Merchant {
     name: String,
 }
 
+/// Runaway guard for `fetch_since` pagination. At `limit=100` per page this is
+/// ~10,000 transactions — far above any realistic personal-account window. If a
+/// fetch would exceed it we abort loudly rather than silently truncate.
+const MAX_PAGES: usize = 100;
+
 impl Monzo {
     pub fn new(
         client_id: String,
@@ -62,6 +66,7 @@ impl Monzo {
             base_url,
             monzo,
             access_token: None,
+            max_pages: MAX_PAGES,
         }
     }
 }
@@ -70,6 +75,11 @@ impl Monzo {
     #[cfg(test)]
     pub fn set_access_token_for_test(&mut self, token: String) {
         self.access_token = Some(token);
+    }
+
+    #[cfg(test)]
+    pub fn set_max_pages_for_test(&mut self, max_pages: usize) {
+        self.max_pages = max_pages;
     }
 }
 
@@ -143,41 +153,62 @@ impl BankSource for Monzo {
                 "Monzo account_id not configured; set [monzo].account_id in the state file"
             )));
         }
-        // TODO(phase2): paginate via `before` cursor when 100 are returned.
-        let resp = self
-            .http
-            .get(format!("{}/transactions", self.base_url))
-            .bearer_auth(token)
-            .query(&[
-                ("account_id", self.monzo.account_id.as_str()),
-                ("since", &since.to_rfc3339()),
-                ("expand[]", "merchant"),
-                ("limit", "100"),
-            ])
-            .send()
-            .await
-            .map_err(|e| BankError::Other(e.into()))?;
+        // Walk every page via Monzo's cursor: the first page uses the window-start
+        // timestamp; each later page uses the previous page's last raw id. The
+        // page-size check and the cursor both use the RAW count/id (before decline
+        // filtering) so filtered-out declines can never falsely end the walk.
+        let mut all: Vec<MonzoTx> = Vec::new();
+        let mut cursor = since.to_rfc3339();
+        for page in 0.. {
+            if page >= self.max_pages {
+                return Err(BankError::Other(anyhow::anyhow!(
+                    "Monzo pagination exceeded {} pages (~{} transactions); aborting to avoid silently truncating — last_run is not advanced, the next run will retry",
+                    self.max_pages,
+                    self.max_pages * 100
+                )));
+            }
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(BankError::AuthExpired("Monzo access token rejected".into()));
-        }
-        if !resp.status().is_success() {
-            let s = resp.status();
-            return Err(BankError::Other(anyhow::anyhow!(
-                "Monzo transactions error {s}"
-            )));
+            let resp = self
+                .http
+                .get(format!("{}/transactions", self.base_url))
+                .bearer_auth(token)
+                .query(&[
+                    ("account_id", self.monzo.account_id.as_str()),
+                    ("since", cursor.as_str()),
+                    ("expand[]", "merchant"),
+                    ("limit", "100"),
+                ])
+                .send()
+                .await
+                .map_err(|e| BankError::Other(e.into()))?;
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(BankError::AuthExpired("Monzo access token rejected".into()));
+            }
+            if !resp.status().is_success() {
+                let s = resp.status();
+                return Err(BankError::Other(anyhow::anyhow!(
+                    "Monzo transactions error {s}"
+                )));
+            }
+
+            let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
+            let raw_len = list.transactions.len();
+            let last_id = list.transactions.last().map(|t| t.id.clone());
+            all.extend(list.transactions);
+
+            if raw_len < 100 {
+                break; // final, partial page
+            }
+            match last_id {
+                Some(id) => cursor = id,
+                None => break, // unreachable: raw_len == 100 implies a last row
+            }
         }
 
-        let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
-        if list.transactions.len() == 100 {
-            warn!(
-                "Monzo returned 100 transactions (page limit); pagination not implemented — some transactions may be missed this run"
-            );
-        }
-        let out = list
-            .transactions
+        let out = all
             .into_iter()
             .filter(|t| t.decline_reason.is_none())
             .map(|t| {
@@ -252,6 +283,7 @@ mod tests {
     }
 
     use chrono::TimeZone;
+    use wiremock::matchers::query_param;
 
     #[tokio::test]
     async fn fetch_maps_merchant_with_description_fallback_and_skips_declined() {
@@ -325,5 +357,56 @@ mod tests {
         let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
         let err = m.fetch_since(since).await.unwrap_err();
         assert!(matches!(err, BankError::AuthExpired(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_paginates_via_last_id_cursor() {
+        let server = MockServer::start().await;
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+
+        // Page 1: 100 rows, last id = tx_99. Matched by the timestamp cursor.
+        let mut page1 = Vec::new();
+        for i in 0..100 {
+            page1.push(serde_json::json!({
+                "id": format!("tx_{i}"),
+                "created": "2026-05-30T08:15:00Z",
+                "amount": -100,
+                "description": "X",
+                "decline_reason": null,
+                "merchant": null
+            }));
+        }
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", since.to_rfc3339()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+            )
+            .mount(&server)
+            .await;
+
+        // Page 2: cursor advanced to the last id of page 1. Short page ends the walk.
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", "tx_99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": [
+                    { "id": "tx_100", "created": "2026-05-31T09:00:00Z", "amount": -200,
+                      "description": "Y", "decline_reason": null, "merchant": null },
+                    { "id": "tx_101", "created": "2026-05-31T10:00:00Z", "amount": -300,
+                      "description": "Z", "decline_reason": null, "merchant": null }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let txs = m.fetch_since(since).await.unwrap();
+
+        assert_eq!(txs.len(), 102, "both pages should be fetched and concatenated");
+        assert_eq!(txs[0].external_id, "tx_0");
+        assert_eq!(txs[101].external_id, "tx_101");
+        assert_eq!(txs[101].amount_minor, -300);
     }
 }
