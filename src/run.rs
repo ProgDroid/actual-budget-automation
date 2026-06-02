@@ -450,12 +450,30 @@ pub async fn run(
     Ok(())
 }
 
+/// Generate an unguessable 128-bit OAuth `state` nonce, hex-encoded (32 chars).
+fn random_state() -> anyhow::Result<String> {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("RNG failure generating state: {e}"))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Verify the OAuth `state` echoed back on the redirect matches what we sent.
+/// # Errors
+/// Errors if `returned` is absent or does not equal `expected` (possible CSRF).
+fn verify_state(expected: &str, returned: Option<&str>) -> anyhow::Result<()> {
+    match returned {
+        Some(s) if s == expected => Ok(()),
+        Some(_) => anyhow::bail!("OAuth state mismatch — possible CSRF; aborting auth"),
+        None => anyhow::bail!("no `state` in Monzo redirect — aborting auth"),
+    }
+}
+
 /// One-time Monzo OAuth bootstrap. Run on a machine with a browser.
 pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     let redirect = url::Url::parse(&cfg.monzo_redirect_uri)
         .context("MONZO_REDIRECT_URI is not a valid URL")?;
     let port = redirect.port().unwrap_or(8080);
-    let state_param = format!("aba{}", Utc::now().timestamp());
+    let state_param = random_state()?;
 
     let auth_url = format!(
         "https://auth.monzo.com/?client_id={}&redirect_uri={}&response_type=code&state={}",
@@ -481,6 +499,16 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.into_owned())
         .context("no `code` in redirect")?;
+    let returned_state = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned());
+    if let Err(e) = verify_state(&state_param, returned_state.as_deref()) {
+        let _ = request.respond(tiny_http::Response::from_string(
+            "Authorisation rejected: state mismatch. Return to the terminal.",
+        ));
+        return Err(e);
+    }
     let _ = request.respond(tiny_http::Response::from_string(
         "Monzo authorisation received. You can close this tab and return to the terminal.",
     ));
@@ -989,5 +1017,29 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             1,
             "telegram_message_id.is_none() filter skipped the already-prompted entry"
         );
+    }
+
+    #[test]
+    fn verify_state_accepts_exact_match() {
+        assert!(super::verify_state("abc123", Some("abc123")).is_ok());
+    }
+
+    #[test]
+    fn verify_state_rejects_mismatch() {
+        assert!(super::verify_state("abc123", Some("nope")).is_err());
+    }
+
+    #[test]
+    fn verify_state_rejects_missing() {
+        assert!(super::verify_state("abc123", None).is_err());
+    }
+
+    #[test]
+    fn random_state_is_32_hex_chars_and_varies() {
+        let a = super::random_state().unwrap();
+        let b = super::random_state().unwrap();
+        assert_eq!(a.len(), 32, "128 bits => 32 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two nonces must differ");
     }
 }
