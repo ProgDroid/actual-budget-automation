@@ -802,7 +802,7 @@ pub(crate) mod tests {
             &self,
             _since: DateTime<Utc>,
         ) -> Result<Vec<RawTransaction>, BankError> {
-            Ok(vec![]) // never reached
+            panic!("fetch_since must not be called after AuthExpired");
         }
     }
 
@@ -1157,22 +1157,23 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let actual = fake_actual(&shim);
         let notifier = NullNotifier;
 
-        // On-disk baseline: cache + a pending review + last_run + old token.
-        // Built as a struct literal (not default-then-reassign) to avoid the
-        // clippy::field_reassign_with_default lint, which is in the CI gate.
+        // Baseline on disk: a retained cache entry, a RESOLVED pending review, last_run, old token.
+        // The review is resolved (resolve_to an existing payee) so the run mutates the IN-MEMORY
+        // state (take_resolved removes the review + adds a cache entry). A broken splice that
+        // persisted the whole in-memory state instead of just the token would then be caught.
         let baseline = State {
             last_run: Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap()),
             monzo: crate::state::MonzoState {
                 refresh_token: "old".into(),
                 account_id: "acc".into(),
             },
-            payee_cache: BTreeMap::from([("RAW".to_string(), "Payee".to_string())]),
+            payee_cache: BTreeMap::from([("KEPT".to_string(), "Kept Payee".to_string())]),
             pending_reviews: vec![PendingReview {
                 external_id: "p1".into(),
-                raw_merchant: "RAW".into(),
+                raw_merchant: "RESOLVE_ME".into(),
                 amount: -100,
                 date: "2026-06-01".into(),
-                resolve_to: String::new(),
+                resolve_to: "Local Cafe".into(), // existing payee in fake_actual
                 create_new: false,
                 suggestion: None,
                 confidence: None,
@@ -1191,11 +1192,17 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         .await
         .unwrap();
 
+        // Sanity: the in-memory state DID diverge (review resolved away) -> assertions are non-vacuous.
+        assert!(
+            state.pending_reviews.is_empty(),
+            "in-memory review was resolved; test is non-vacuous"
+        );
+
         let on_disk = State::load(&state_path).unwrap();
-        assert_eq!(on_disk.payee_cache, baseline.payee_cache, "cache unchanged");
-        assert_eq!(on_disk.pending_reviews, baseline.pending_reviews, "pending unchanged");
+        assert_eq!(on_disk.payee_cache, baseline.payee_cache, "cache unchanged on disk");
+        assert_eq!(on_disk.pending_reviews, baseline.pending_reviews, "pending unchanged on disk");
         assert_eq!(on_disk.last_run, baseline.last_run, "last_run not advanced");
-        assert_eq!(on_disk.monzo.refresh_token, "new", "rotated token persisted");
+        assert_eq!(on_disk.monzo.refresh_token, "new", "only the rotated token persisted");
     }
 
     #[tokio::test]
@@ -1237,7 +1244,11 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         )
         .await;
 
-        assert!(result.is_err(), "import failure surfaces as Err (loud, not silent)");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("import_transactions"),
+            "error must originate from the import step, got: {err:#}"
+        );
         assert!(payees_log.exists(), "create_payee was attempted (transient orphan)");
         let on_disk = State::load(&state_path).unwrap();
         assert_eq!(
