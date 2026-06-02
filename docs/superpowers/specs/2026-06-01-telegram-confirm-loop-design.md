@@ -144,15 +144,28 @@ New module `src/telegram.rs` behind a trait (mirrors `Notifier` /
 ```rust
 pub enum ReplyAction { Confirm, CreateNew, Skip, Remap(String) }
 pub struct Reply { pub entry_key: String, pub action: ReplyAction }
+pub struct Prompt { pub chat_text: String, pub buttons: Vec<(String, String)> }
 
 #[async_trait]
 pub trait ConfirmChannel: Send + Sync {
-    /// Drain updates newer than `since`. Returns applied replies and the new offset.
-    async fn poll_replies(&self, since: i64) -> anyhow::Result<(Vec<Reply>, i64)>;
-    /// Post an interactive prompt for a held entry; returns the message_id.
-    async fn send_prompt(&self, entry: &PendingReview) -> anyhow::Result<i64>;
+    /// Drain updates newer than `since`. `msg_map` maps a prompt's message_id to
+    /// the entry it was sent for, so free-text replies can be correlated.
+    /// Returns (applied replies, new offset to persist).
+    async fn poll_replies(
+        &self,
+        since: i64,
+        msg_map: &BTreeMap<i64, String>,
+    ) -> anyhow::Result<(Vec<Reply>, i64)>;
+    /// Send a prepared prompt; returns the Telegram message_id.
+    async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64>;
 }
 ```
+
+**Implementation note:** `send_prompt` takes a prepared `Prompt` (built by `run`,
+which has access to the payee list), not a raw `&PendingReview`. The channel is
+transport-only. Similarly, `poll_replies` takes an explicit `msg_map`
+(`message_id → external_id`) for free-text reply correlation, because the HTTP
+transport must correlate `reply_to_message.message_id` against sent prompts.
 
 The HTTP impl (`HttpTelegram`) hides whether a reply arrived as a `callback_query`
 (button) or a `message` (free text), so the command logic stays
@@ -194,8 +207,14 @@ which already loads the payee list (`run.rs:142`) — fuzzy-matches it (reusing
 `matching.rs` similarity):
 
 - Strong match → import under that payee + cache.
-- No good match → re-hold with a fresh prompt next cycle:
-  > No payee named 'Sainsbury's'. Create it? `🆕 Create` · `✏️ Try again`
+- No good match → re-held with `suggestion = <typed text>` and `telegram_message_id`
+  cleared; on the next run a fresh prompt is sent in a **"create it?" flavor**:
+  > No existing payee **Sainsbury's**. Create it? `🆕 Create` · `❌ Skip`
+
+  This flavor is driven by `build_prompt` in `run.rs`, which keys on whether the
+  `suggestion` value is present in the live payee list. A suggestion that is not a
+  known payee produces the two-button Create/Skip prompt instead of the
+  three-button Confirm/Create/Skip prompt.
 
 `Confirm` needs no fuzzy-match: `suggestion` was chosen by Claude *from* the
 existing payee list, so `resolve_to` is already an exact name (the run validates
@@ -324,3 +343,8 @@ TOML fire exit) and skips prompt-sending; `poll` exits as a no-op.
 - **Skip semantics:** `Skip` drops the pending entry and does not cache the
   merchant, so the same merchant can be re-evaluated (and re-prompted) if it
   recurs. Intended: skip means "not this transaction," not "ignore forever."
+- **Stale Telegram prompt:** when a failed free-text remap clears
+  `telegram_message_id` to re-prompt, the previous inline-keyboard message
+  remains in the chat with stale buttons (still carrying the same `external_id`
+  callback). Harmless in the single-user flow but could confuse; a future cleanup
+  could `editMessageText`/`deleteMessage` the old prompt. Deferred.
