@@ -51,15 +51,20 @@ pub trait ConfirmChannel: Send + Sync {
 
     /// Send a prepared prompt; returns the Telegram message_id.
     async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64>;
+
+    /// Edit a previously-sent prompt's text and drop its inline keyboard
+    /// (no `reply_markup` is sent). Best-effort: callers must not abort on error.
+    async fn edit_message_text(&self, message_id: i64, text: &str) -> anyhow::Result<()>;
 }
 
-pub fn encode_callback(action: &str, entry_key: &str) -> String {
+#[must_use]
+pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
     let s = format!("{action}:{entry_key}");
-    debug_assert!(
-        s.len() <= 64,
-        "callback_data exceeds Telegram's 64-byte limit"
-    );
-    s
+    // Telegram caps callback_data at 64 bytes; `str::len` is the byte length.
+    if s.len() > 64 {
+        return None;
+    }
+    Some(s)
 }
 
 pub fn parse_callback(data: &str) -> Option<(String, String)> {
@@ -146,17 +151,20 @@ pub fn parse_get_updates(
 }
 
 pub fn build_send_request(prompt: &Prompt, chat_id: i64) -> Value {
-    let row: Vec<Value> = prompt
-        .buttons
-        .iter()
-        .map(|(label, data)| json!({ "text": label, "callback_data": data }))
-        .collect();
-    json!({
+    let mut body = json!({
         "chat_id": chat_id,
         "text": prompt.chat_text,
         "parse_mode": "Markdown",
-        "reply_markup": { "inline_keyboard": [row] }
-    })
+    });
+    if !prompt.buttons.is_empty() {
+        let row: Vec<Value> = prompt
+            .buttons
+            .iter()
+            .map(|(label, data)| json!({ "text": label, "callback_data": data }))
+            .collect();
+        body["reply_markup"] = json!({ "inline_keyboard": [row] });
+    }
+    body
 }
 
 pub struct HttpTelegram {
@@ -268,6 +276,37 @@ impl ConfirmChannel for HttpTelegram {
             .as_i64()
             .context("sendMessage response missing message_id")
     }
+
+    async fn edit_message_text(&self, message_id: i64, text: &str) -> anyhow::Result<()> {
+        let body = json!({
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "text": text
+        });
+        let resp = self
+            .http
+            .post(self.url("editMessageText"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "telegram editMessageText failed: {}",
+                    self.redact(e.to_string())
+                )
+            })?;
+        let status = resp.status();
+        let value: Value = resp.json().await.map_err(|e| {
+            anyhow!(
+                "editMessageText response not JSON: {}",
+                self.redact(e.to_string())
+            )
+        })?;
+        if !status.is_success() {
+            return Err(anyhow!("telegram error {status}: {value}"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -278,7 +317,7 @@ mod tests {
     #[test]
     fn callback_roundtrips() {
         let data = encode_callback("cf", "tx_0001");
-        assert_eq!(data, "cf:tx_0001");
+        assert_eq!(data, Some("cf:tx_0001".to_string()));
         assert_eq!(
             parse_callback("cf:tx_0001"),
             Some(("cf".into(), "tx_0001".into()))
@@ -287,6 +326,19 @@ mod tests {
         // empty action or empty key are both rejected
         assert_eq!(parse_callback(":key"), None);
         assert_eq!(parse_callback("code:"), None);
+    }
+
+    #[test]
+    fn encode_callback_rejects_over_64_bytes() {
+        // 62-char key + "cf:" (3) = 65 bytes > 64 -> None.
+        let long_key = "x".repeat(62);
+        assert_eq!(encode_callback("cf", &long_key), None);
+        // 61-char key + "cf:" = 64 bytes exactly -> Some.
+        let max_key = "x".repeat(61);
+        assert_eq!(
+            encode_callback("cf", &max_key),
+            Some(format!("cf:{max_key}"))
+        );
     }
 
     #[test]
@@ -323,6 +375,20 @@ mod tests {
             ReplyAction::Remap(t) => assert_eq!(t, "Sainsbury's"),
             _ => panic!("expected remap"),
         }
+    }
+
+    #[test]
+    fn build_send_request_omits_reply_markup_when_no_buttons() {
+        let prompt = Prompt {
+            chat_text: "no buttons".into(),
+            buttons: vec![],
+        };
+        let body = build_send_request(&prompt, 99);
+        assert_eq!(body["text"], "no buttons");
+        assert!(
+            body.get("reply_markup").is_none(),
+            "empty buttons must not emit reply_markup, got: {body}"
+        );
     }
 
     #[test]
@@ -465,6 +531,27 @@ mod tests {
         };
         let id = tg.send_prompt(&prompt).await.unwrap();
         assert_eq!(id, 12345);
+    }
+
+    #[tokio::test]
+    async fn http_edit_message_text_posts_without_reply_markup() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/editMessageText"))
+            .and(body_json(serde_json::json!({
+                "chat_id": 42,
+                "message_id": 500,
+                "text": "superseded"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tg = HttpTelegram::new("tok".into(), 42).with_base_url(server.uri());
+        tg.edit_message_text(500, "superseded").await.unwrap();
     }
 
     // --- Token-redaction tests ---
