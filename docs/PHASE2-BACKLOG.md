@@ -72,18 +72,23 @@ paths to cover before adding more write paths:
 Requires test doubles for `BankSource`, `ClaudeMatcher`, `Notifier`, and a fake
 `node` shim (as used in `actual::tests`).
 
-## 5. Minor hardening (from Phase 1 review)
+## 5. Minor hardening (from Phase 1 review) — DONE (2026-06-02)
 
-- **OAuth `state` not verified** (`auth_monzo`): the `state` param is generated but
-  not checked against the redirect. Low risk (localhost, single-use, developer
-  only) but worth verifying before any multi-user/hosted deployment.
-- **Variable-amount schedules degrade to `0`** (`actual-shim/index.js`): when a
-  schedule's `_amount` is a recurrence object without `num1`, the row carries
-  `amount: 0`, which never matches a real transaction (false negative → the
-  scheduled txn is imported instead of skipped). Handle ranged/variable schedule
-  amounts explicitly.
-- **Dry-run "would hold" count** can overstate vs. the live `held` count when
-  pending entries already exist (cosmetic).
+**Implemented** on `main` (spec/plan at
+`docs/superpowers/specs|plans/2026-06-02-phase2-hardening-*.md`). All three:
+
+- **OAuth `state` verified** (`auth_monzo`): now a random 128-bit `getrandom`
+  nonce (hex), verified against the redirect via a pure `verify_state` helper
+  before the token exchange; mismatch/missing aborts with a browser failure msg.
+- **Variable-amount schedules fixed**: shim emits `amount: null` for non-numeric
+  `_amount`; `ScheduleRow.amount`/`Schedule.amount` are `Option<i64>`;
+  `matches_scheduled` skips a `None`-amount schedule by **date + payee only**
+  (so its manifestation is correctly skipped, not imported).
+- **Dry-run "would hold" count fixed**: the dry-run block now prints the existing
+  `held` counter (which already counts only newly-held, deduped entries) instead
+  of a redundant helper. (A first attempt added a `would_hold_count` helper that
+  read post-mutation state and always printed `0`; review caught it, fix reuses
+  `held`.)
 
 ## 6. Operational notes (not code, but easy to forget)
 
