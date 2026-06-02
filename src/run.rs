@@ -187,6 +187,25 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
     }
 }
 
+/// Persist *only* the rotated Monzo refresh token, leaving the rest of the
+/// on-disk state (payee cache, pending reviews, `last_run`) untouched. Monzo
+/// invalidates the previous refresh
+/// token on every successful refresh, so the new one must reach disk before any
+/// fallible work; otherwise a later failure strands it and the next run replays
+/// a dead token (Monzo answers 401). Re-loads the on-disk state and copies just
+/// the token (and the account id, if not yet recorded) onto it.
+fn persist_rotated_token(cfg: &Config, state: &State) -> anyhow::Result<()> {
+    let mut on_disk = State::load(&cfg.state_path)?;
+    on_disk
+        .monzo
+        .refresh_token
+        .clone_from(&state.monzo.refresh_token);
+    if on_disk.monzo.account_id.is_empty() {
+        on_disk.monzo.account_id.clone_from(&state.monzo.account_id);
+    }
+    on_disk.save(&cfg.state_path)
+}
+
 // Top-level orchestration: deliberately long and wired to many collaborators.
 // It is never spawned across threads (driven directly under a timeout in main),
 // so `future_not_send` does not apply.
@@ -206,9 +225,12 @@ pub async fn run(
     channel: Option<&dyn ConfirmChannel>,
     autoimport: Confidence,
 ) -> anyhow::Result<()> {
-    // 1. Auth (rotated token persisted into state even in dry-run).
+    // 1. Auth. Monzo rotates the refresh token on every successful refresh and
+    // invalidates the previous one server-side, so persist the rotated token to
+    // disk IMMEDIATELY — before any fallible fetch/Actual work. Otherwise a later
+    // failure strands the new token and the next run replays a dead one (401).
     match bank.ensure_auth(state).await {
-        Ok(()) => {}
+        Ok(()) => persist_rotated_token(cfg, state)?,
         Err(BankError::AuthExpired(msg)) => {
             warn!("{} auth expired: {msg}", bank.name());
             if !dry_run {
@@ -456,17 +478,9 @@ pub async fn run(
                 println!("    ~ {raw} -> {payee}");
             }
         }
-        // Persist ONLY the rotated Monzo token; discard in-memory cache/pending/last_run
-        // changes by re-loading the on-disk state and copying just the token onto it.
-        let mut on_disk = State::load(&cfg.state_path)?;
-        on_disk
-            .monzo
-            .refresh_token
-            .clone_from(&state.monzo.refresh_token);
-        if on_disk.monzo.account_id.is_empty() {
-            on_disk.monzo.account_id.clone_from(&state.monzo.account_id);
-        }
-        on_disk.save(&cfg.state_path)?;
+        // Re-persist only the rotated token (see persist_rotated_token); discard
+        // the in-memory cache/pending/last_run changes a dry-run must not commit.
+        persist_rotated_token(cfg, state)?;
         return Ok(());
     }
 
@@ -1038,6 +1052,27 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         )
     }
 
+    /// Like `fake_actual` but `get_payees` fails — simulates the Actual server
+    /// being unreachable *after* a successful Monzo refresh (the exact path that
+    /// silently burned rotated refresh tokens).
+    fn fake_actual_failing_get_payees(dir: &TempDir) -> ActualClient {
+        let script = r"
+let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
+  const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
+  if(req.op==='get_payees'){ out({ok:false,error:'network-failure'}); }
+  else { out({ok:false,error:'unknown op'}); }
+});
+";
+        std::fs::write(dir.path().join("index.js"), script).unwrap();
+        ActualClient::new(
+            dir.path().to_path_buf(),
+            false,
+            "http://t".into(),
+            "pw".into(),
+            "sync".into(),
+        )
+    }
+
     fn cfg_at(state_path: &std::path::Path) -> Config {
         Config::from_getter(|k| match k {
             "ANTHROPIC_API_KEY" => Some("ak".into()),
@@ -1397,6 +1432,55 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert_eq!(
             on_disk.monzo.refresh_token, "new",
             "only the rotated token persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_token_persisted_when_later_step_fails() {
+        // Regression for the Monzo lock-out bug: `ensure_auth` rotates the refresh
+        // token (Monzo invalidates the previous one server-side), but a later step
+        // — here `get_payees` — fails and `run` returns Err. The rotated token MUST
+        // already be on disk; otherwise the next run replays the dead token and
+        // Monzo answers 401, locking the user out until a manual re-auth.
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_failing_get_payees(&shim);
+        let notifier = NullNotifier;
+
+        let baseline = State {
+            monzo: crate::state::MonzoState {
+                refresh_token: "old".into(),
+                account_id: "acc".into(),
+            },
+            ..State::default()
+        };
+        baseline.save(&state_path).unwrap();
+
+        let mut state = State::load(&state_path).unwrap();
+        let mut bank = RotatingBank {
+            rotate_to: "new".into(),
+        };
+        let claude = FakeClaude { out: vec![] };
+        let result = run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await;
+
+        assert!(result.is_err(), "run should fail at get_payees");
+        let on_disk = State::load(&state_path).unwrap();
+        assert_eq!(
+            on_disk.monzo.refresh_token, "new",
+            "rotated refresh token must be persisted before the failing step"
         );
     }
 
