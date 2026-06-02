@@ -89,3 +89,20 @@ Requires test doubles for `BankSource`, `ClaudeMatcher`, `Notifier`, and a fake
 - Prompt caching does **not** help at the once-daily cadence (≈5-min ephemeral TTL
   expires between runs). It only pays off for runs <5 min apart (retries/testing)
   or a higher-frequency schedule. Revisit if the schedule changes.
+
+## 7. Telegram confirm loop (#1) — post-implementation follow-ups
+
+Item #1 is **implemented** (see `docs/superpowers/specs|plans/2026-06-01-telegram-confirm-loop-*.md`).
+Small follow-ups surfaced by the final review, deferred by decision:
+
+- **`encode_callback` `debug_assert!(len <= 64)`** (`src/telegram.rs`): Monzo external_ids
+  (~30 chars) stay well under Telegram's 64-byte `callback_data` cap, but a longer-id
+  source (e.g. GoCardless, item #2) could exceed it and panic in debug/test builds.
+  Replace the `debug_assert!` with truncation or a `Result` **before** wiring GoCardless.
+- **Stale Telegram prompt on failed remap** (`src/run.rs` remap-normalisation): when a
+  free-text remap doesn't fuzzy-match and the entry is re-held, `telegram_message_id` is
+  cleared so a fresh "create it?" prompt is sent — but the previous inline-keyboard
+  message lingers in the chat with still-valid buttons. Harmless single-user; optional
+  cleanup via `editMessageText`/`deleteMessage`. Low priority.
+- The `create_payee`→`import` transactional hazard (item #4) is now also reachable via the
+  Telegram create-new flow — address with #4.
