@@ -30,3 +30,25 @@ tempfile = "3"
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "test-util"] }
+
+# Single source of truth for clippy lints — read by `cargo clippy` everywhere:
+# the PostToolUse edit hook (warn), CI (`-- -D warnings`, promotes these to errors),
+# and any manual run. Mirrors the former hardcoded flag list. To remediate:
+#   cargo clippy --fix --allow-dirty --all-targets
+# Groups get priority -1 so the individual `allow`s below (priority 0) override them.
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_docs_in_private_items = "allow"
+separated_literal_suffix = "allow"
+implicit_return = "allow"
+print_stderr = "allow"
+exhaustive_enums = "allow"
+exhaustive_structs = "allow"
+single_char_lifetime_names = "allow"
+missing_inline_in_public_items = "allow"
+self_named_module_files = "allow"
+wildcard_enum_match_arm = "allow"
+pattern_type_mismatch = "allow"
+std_instead_of_core = "allow"

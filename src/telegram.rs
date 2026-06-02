@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 /// A resolved user action against a held entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyAction {
     Confirm,
     CreateNew,
@@ -15,23 +15,23 @@ pub enum ReplyAction {
     Remap(String),
 }
 
-/// A reply correlated to a pending entry (`entry_key` = transaction external_id).
-#[derive(Debug, Clone, PartialEq)]
+/// A reply correlated to a pending entry (`entry_key` = transaction `external_id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
     pub entry_key: String,
     pub action: ReplyAction,
 }
 
-/// A prepared prompt: text + inline-keyboard buttons (label, callback_data).
+/// A prepared prompt: text + inline-keyboard buttons (label, `callback_data`).
 /// Built by `run` (which has the payee list); the channel only transmits it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     pub chat_text: String,
     pub buttons: Vec<(String, String)>,
 }
 
 /// Result of parsing one `getUpdates` batch.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ParsedUpdates {
     pub replies: Vec<Reply>,
     pub new_offset: i64,
@@ -40,7 +40,7 @@ pub struct ParsedUpdates {
 
 #[async_trait]
 pub trait ConfirmChannel: Send + Sync {
-    /// Drain updates newer than `since`. `msg_map` maps a prompt's message_id to
+    /// Drain updates newer than `since`. `msg_map` maps a prompt's `message_id` to
     /// the entry it was sent for, so free-text replies can be correlated.
     /// Returns (applied replies, new offset to persist).
     async fn poll_replies(
@@ -49,7 +49,7 @@ pub trait ConfirmChannel: Send + Sync {
         msg_map: &BTreeMap<i64, String>,
     ) -> anyhow::Result<(Vec<Reply>, i64)>;
 
-    /// Send a prepared prompt; returns the Telegram message_id.
+    /// Send a prepared prompt; returns the Telegram `message_id`.
     async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64>;
 
     /// Edit a previously-sent prompt's text and drop its inline keyboard
@@ -193,6 +193,9 @@ impl HttpTelegram {
     }
 
     /// Replace any occurrence of the bot token in `s` with `***`.
+    // Always called on freshly-owned `to_string()` temporaries; a `&str` signature
+    // would only force `&`-borrows at every call site for no benefit.
+    #[allow(clippy::needless_pass_by_value)]
     fn redact(&self, s: String) -> String {
         s.replace(&self.token, "***")
     }
@@ -220,7 +223,10 @@ impl ConfirmChannel for HttpTelegram {
             )
         })?;
         if !status.is_success() {
-            return Err(anyhow!("telegram error {status}: {}", self.redact(value.to_string())));
+            return Err(anyhow!(
+                "telegram error {status}: {}",
+                self.redact(value.to_string())
+            ));
         }
         let parsed = parse_get_updates(&value["result"], self.chat_id, msg_map);
 
@@ -237,8 +243,7 @@ impl ConfirmChannel for HttpTelegram {
         // Empty batch -> keep the caller's offset (parse returns 0 for empty).
         let new_offset = if value["result"]
             .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(true)
+            .is_none_or(std::vec::Vec::is_empty)
         {
             since
         } else {
@@ -269,7 +274,10 @@ impl ConfirmChannel for HttpTelegram {
             )
         })?;
         if !status.is_success() {
-            return Err(anyhow!("telegram error {status}: {}", self.redact(value.to_string())));
+            return Err(anyhow!(
+                "telegram error {status}: {}",
+                self.redact(value.to_string())
+            ));
         }
         value["result"]["message_id"]
             .as_i64()
@@ -302,7 +310,10 @@ impl ConfirmChannel for HttpTelegram {
             )
         })?;
         if !status.is_success() {
-            return Err(anyhow!("telegram error {status}: {}", self.redact(value.to_string())));
+            return Err(anyhow!(
+                "telegram error {status}: {}",
+                self.redact(value.to_string())
+            ));
         }
         Ok(())
     }
@@ -406,7 +417,10 @@ mod tests {
         assert_eq!(kb[0]["text"], "✅ Confirm");
         assert_eq!(kb[0]["callback_data"], "cf:tx1");
         assert_eq!(kb[1]["callback_data"], "sk:tx1");
-        assert!(body.get("parse_mode").is_none(), "prompts must be plain text");
+        assert!(
+            body.get("parse_mode").is_none(),
+            "prompts must be plain text"
+        );
     }
 
     #[test]
@@ -617,9 +631,15 @@ mod tests {
             .mount(&server)
             .await;
         let tg = HttpTelegram::new("SUPERSECRET".into(), 42).with_base_url(server.uri());
-        let prompt = Prompt { chat_text: "hi".into(), buttons: vec![] };
+        let prompt = Prompt {
+            chat_text: "hi".into(),
+            buttons: vec![],
+        };
         let err = tg.send_prompt(&prompt).await.expect_err("400 should error");
         let chain = format!("{err:#}");
-        assert!(!chain.contains("SUPERSECRET"), "token must be redacted: {chain}");
+        assert!(
+            !chain.contains("SUPERSECRET"),
+            "token must be redacted: {chain}"
+        );
     }
 }

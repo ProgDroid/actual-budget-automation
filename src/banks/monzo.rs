@@ -7,6 +7,9 @@ use serde::Deserialize;
 use crate::banks::{BankError, BankSource, RawTransaction};
 use crate::state::{MonzoState, State};
 
+// `monzo` holds this bank's persisted MonzoState; the name mirrors the domain and
+// reads clearly at call sites, so the struct-name overlap is intentional.
+#[allow(clippy::struct_field_names)]
 pub struct Monzo {
     http: reqwest::Client,
     client_id: String,
@@ -78,7 +81,7 @@ impl Monzo {
     }
 
     #[cfg(test)]
-    pub fn set_max_pages_for_test(&mut self, max_pages: usize) {
+    pub const fn set_max_pages_for_test(&mut self, max_pages: usize) {
         self.max_pages = max_pages;
     }
 }
@@ -130,9 +133,12 @@ impl BankSource for Monzo {
         self.access_token = Some(token.access_token);
         // Persist the rotated refresh token immediately.
         self.monzo.refresh_token = token.refresh_token;
-        state.monzo.refresh_token = self.monzo.refresh_token.clone();
+        state
+            .monzo
+            .refresh_token
+            .clone_from(&self.monzo.refresh_token);
         if state.monzo.account_id.is_empty() {
-            state.monzo.account_id = self.monzo.account_id.clone();
+            state.monzo.account_id.clone_from(&self.monzo.account_id);
         }
         Ok(())
     }
@@ -384,7 +390,8 @@ mod tests {
             .and(path("/transactions"))
             .and(query_param("since", since.to_rfc3339()))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "transactions": page1 })),
             )
             .mount(&server)
             .await;
@@ -408,7 +415,11 @@ mod tests {
         m.set_access_token_for_test("at_x".into());
         let txs = m.fetch_since(since).await.unwrap();
 
-        assert_eq!(txs.len(), 102, "both pages should be fetched and concatenated");
+        assert_eq!(
+            txs.len(),
+            102,
+            "both pages should be fetched and concatenated"
+        );
         assert_eq!(txs[0].external_id, "tx_0");
         assert_eq!(txs[101].external_id, "tx_101");
         assert_eq!(txs[101].amount_minor, -300);
@@ -437,7 +448,8 @@ mod tests {
             .and(path("/transactions"))
             .and(query_param("since", since.to_rfc3339()))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "transactions": page1 })),
             )
             .mount(&server)
             .await;
@@ -485,7 +497,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/transactions"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": full })),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "transactions": full })),
             )
             .mount(&server)
             .await;
@@ -497,7 +510,10 @@ mod tests {
 
         assert!(matches!(err, BankError::Other(_)));
         let msg = format!("{err}");
-        assert!(msg.contains("pages"), "cap error should mention pages, got: {msg}");
+        assert!(
+            msg.contains("pages"),
+            "cap error should mention pages, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -526,7 +542,8 @@ mod tests {
             .and(path("/transactions"))
             .and(query_param("since", since.to_rfc3339()))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "transactions": page1 })),
             )
             .mount(&server)
             .await;
@@ -572,7 +589,8 @@ mod tests {
             .and(path("/transactions"))
             .and(query_param("since", since.to_rfc3339()))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "transactions": page1 })),
             )
             .mount(&server)
             .await;

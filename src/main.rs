@@ -29,16 +29,18 @@ fn build_channel(cfg: &Config) -> Option<HttpTelegram> {
         cfg.telegram_bot_token.as_ref(),
         cfg.telegram_chat_id.as_ref(),
     ) {
-        (Some(tok), Some(chat)) => match chat.parse::<i64>() {
-            Ok(chat_id) => Some(
-                HttpTelegram::new(tok.clone(), chat_id)
-                    .with_base_url(cfg.telegram_base_url.clone()),
-            ),
-            Err(_) => {
+        (Some(tok), Some(chat)) => chat.parse::<i64>().map_or_else(
+            |_| {
                 tracing::warn!("TELEGRAM_CHAT_ID is not a valid integer; Telegram disabled");
                 None
-            }
-        },
+            },
+            |chat_id| {
+                Some(
+                    HttpTelegram::new(tok.clone(), chat_id)
+                        .with_base_url(cfg.telegram_base_url.clone()),
+                )
+            },
+        ),
         _ => None,
     }
 }
@@ -70,12 +72,14 @@ async fn main() -> Result<()> {
             };
             let mut state = State::load(&cfg.state_path)?;
             match tokio::time::timeout(
-                std::time::Duration::from_secs(600),
+                std::time::Duration::from_mins(10),
                 poll(&cfg, &mut state, &channel),
             )
             .await
             {
-                Ok(res) => { res?; }
+                Ok(res) => {
+                    res?;
+                }
                 Err(_) => return Err(anyhow::anyhow!("poll timed out after 600s")),
             }
             Ok(())
@@ -101,24 +105,24 @@ async fn main() -> Result<()> {
             let channel = build_channel(&cfg);
             let autoimport = Confidence::from_env_str(&cfg.autoimport_confidence)?;
 
-            match tokio::time::timeout(std::time::Duration::from_secs(600), run::run(
-                &cfg,
-                dry_run,
-                &mut state,
-                &mut bank,
-                &actual,
-                &claude,
-                &notifier,
-                channel
-                    .as_ref()
-                    .map(|c| c as &dyn crate::telegram::ConfirmChannel),
-                autoimport,
-            ))
+            tokio::time::timeout(
+                std::time::Duration::from_mins(10),
+                run::run(
+                    &cfg,
+                    dry_run,
+                    &mut state,
+                    &mut bank,
+                    &actual,
+                    &claude,
+                    &notifier,
+                    channel
+                        .as_ref()
+                        .map(|c| c as &dyn crate::telegram::ConfirmChannel),
+                    autoimport,
+                ),
+            )
             .await
-            {
-                Ok(res) => res,
-                Err(_) => Err(anyhow::anyhow!("run timed out after 600s")),
-            }
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("run timed out after 600s")))
         }
     }
 }

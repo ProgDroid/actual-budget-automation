@@ -18,7 +18,7 @@ pub struct ActualClient {
     program: PathBuf,
     /// Leading args (production: the shim's index.js path).
     script_args: Vec<String>,
-    /// Working dir (also where node_modules lives in production).
+    /// Working dir (also where `node_modules` lives in production).
     cwd: PathBuf,
     read_only: bool,
     server_url: String,
@@ -68,16 +68,14 @@ impl ActualClient {
             stdin.write_all(&payload).await?;
             stdin.shutdown().await?;
         }
-        let output = match tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            child.wait_with_output(),
-        )
-        .await
-        {
-            Ok(res) => res.context("shim wait failed")?,
-            // Future dropped here -> child dropped -> killed via kill_on_drop.
-            Err(_) => return Err(anyhow!("shim timed out after 120s")),
-        };
+        let output =
+            match tokio::time::timeout(std::time::Duration::from_mins(2), child.wait_with_output())
+                .await
+            {
+                Ok(res) => res.context("shim wait failed")?,
+                // Future dropped here -> child dropped -> killed via kill_on_drop.
+                Err(_) => return Err(anyhow!("shim timed out after 120s")),
+            };
         if !output.stderr.is_empty() {
             let mut err_text = String::from_utf8_lossy(&output.stderr).into_owned();
             if !self.password.is_empty() {
@@ -142,13 +140,13 @@ impl ActualClient {
     }
 }
 
-#[derive(Debug, serde::Deserialize, PartialEq)]
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
 pub struct ImportSummary {
     pub added: usize,
     pub updated: usize,
 }
 
-#[derive(Debug, serde::Deserialize, PartialEq)]
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
 pub struct CreatedPayee {
     pub id: String,
 }
@@ -162,7 +160,7 @@ mod tests {
     async fn get_payees_parses_data() {
         let dir = tempdir().unwrap();
         // Fake shim: ignore stdin content, print a canned ok envelope.
-        let fake = r#"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'}]}));});"#;
+        let fake = r"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'}]}));});";
         std::fs::write(dir.path().join("index.js"), fake).unwrap();
 
         let client = ActualClient::new(

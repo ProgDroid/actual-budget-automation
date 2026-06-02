@@ -12,30 +12,30 @@ pub enum Confidence {
 }
 
 impl Confidence {
-    pub const fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Confidence::High => "high",
-            Confidence::Medium => "medium",
-            Confidence::Low => "low",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
         }
     }
 
     /// Higher = more confident. Used for the auto-import cutoff comparison.
-    pub const fn rank(&self) -> u8 {
+    pub const fn rank(self) -> u8 {
         match self {
-            Confidence::High => 2,
-            Confidence::Medium => 1,
-            Confidence::Low => 0,
+            Self::High => 2,
+            Self::Medium => 1,
+            Self::Low => 0,
         }
     }
 
     /// Parse the model's string; anything unrecognised is treated as Medium
     /// (conservative — it gets held for confirmation rather than auto-imported).
-    pub fn parse(s: &str) -> Confidence {
+    pub fn parse(s: &str) -> Self {
         match s {
-            "high" => Confidence::High,
-            "low" => Confidence::Low,
-            _ => Confidence::Medium,
+            "high" => Self::High,
+            "low" => Self::Low,
+            _ => Self::Medium,
         }
     }
 
@@ -43,11 +43,11 @@ impl Confidence {
     /// defaults unknown Claude API output to Medium), a bad value here is a hard
     /// config error — a typo like "High"/"MEDIUM" must not silently widen
     /// auto-import.
-    pub fn from_env_str(s: &str) -> anyhow::Result<Confidence> {
+    pub fn from_env_str(s: &str) -> anyhow::Result<Self> {
         match s {
-            "high" => Ok(Confidence::High),
-            "medium" => Ok(Confidence::Medium),
-            "low" => Ok(Confidence::Low),
+            "high" => Ok(Self::High),
+            "medium" => Ok(Self::Medium),
+            "low" => Ok(Self::Low),
             other => Err(anyhow::anyhow!(
                 "ABA_AUTOIMPORT_CONFIDENCE must be high|medium|low, got '{other}'"
             )),
@@ -55,7 +55,7 @@ impl Confidence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayeeMatch {
     pub raw: String,
     pub payee: Option<String>,
@@ -165,7 +165,7 @@ pub struct HttpClaude {
 impl HttpClaude {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            http: crate::http::client(std::time::Duration::from_secs(120)),
+            http: crate::http::client(std::time::Duration::from_mins(2)),
             api_key,
             model,
             base_url: "https://api.anthropic.com".to_string(),
@@ -216,9 +216,15 @@ mod tests {
     #[test]
     fn from_env_str_is_strict() {
         assert_eq!(Confidence::from_env_str("high").unwrap(), Confidence::High);
-        assert_eq!(Confidence::from_env_str("medium").unwrap(), Confidence::Medium);
+        assert_eq!(
+            Confidence::from_env_str("medium").unwrap(),
+            Confidence::Medium
+        );
         assert_eq!(Confidence::from_env_str("low").unwrap(), Confidence::Low);
-        assert!(Confidence::from_env_str("High").is_err(), "case-typo must error");
+        assert!(
+            Confidence::from_env_str("High").is_err(),
+            "case-typo must error"
+        );
         assert!(Confidence::from_env_str("bogus").is_err());
     }
 

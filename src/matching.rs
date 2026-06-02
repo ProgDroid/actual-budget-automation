@@ -4,7 +4,7 @@
 pub fn normalise(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
+        .flat_map(char::to_lowercase)
         .collect()
 }
 
@@ -29,7 +29,7 @@ use chrono::NaiveDate;
 use crate::banks::RawTransaction;
 
 /// A scheduled transaction's next occurrence, as returned by the Actual shim.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
     /// Fixed amount in minor units, or `None` for variable/ranged schedules.
     pub amount: Option<i64>,
@@ -52,10 +52,8 @@ pub fn matches_scheduled(
     schedules.iter().any(|s| {
         let date_ok = (s.date - tx.date).num_days().abs() <= date_tolerance_days;
         let payee_ok = payee_similarity(&s.payee, &tx.raw_merchant) >= payee_threshold;
-        let amount_ok = match s.amount {
-            Some(a) => a == tx.amount_minor,
-            None => true, // variable/ranged schedule: ignore amount
-        };
+        // variable/ranged schedule (None) ignores amount
+        let amount_ok = s.amount.is_none_or(|a| a == tx.amount_minor);
         amount_ok && date_ok && payee_ok
     })
 }

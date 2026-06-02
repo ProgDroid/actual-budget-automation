@@ -25,14 +25,14 @@ pub struct ImportTxn {
     pub imported_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Payee {
     pub id: String,
     pub name: String,
 }
 
 /// Raw schedule row from the shim (`_payee` is an id resolved to a name later).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ScheduleRow {
     pub date: Option<String>,
     #[serde(default)]

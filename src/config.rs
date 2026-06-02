@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
@@ -61,15 +61,15 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Result<Config> {
+    pub fn from_env() -> Result<Self> {
         Self::from_getter(|k| std::env::var(k).ok())
     }
 
     /// Build from any getter (used by tests).
-    pub fn from_getter(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
+    pub fn from_getter(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let req = |k: &str| get(k).ok_or_else(|| anyhow!("missing env var {k}"));
         let req_state = req("ABA_STATE_PATH")?;
-        Ok(Config {
+        Ok(Self {
             anthropic_api_key: req("ANTHROPIC_API_KEY")?,
             claude_model: get("CLAUDE_MODEL").unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string()),
             monzo_client_id: req("MONZO_CLIENT_ID")?,
@@ -89,9 +89,12 @@ impl Config {
             telegram_chat_id: get("TELEGRAM_CHAT_ID"),
             autoimport_confidence: get("ABA_AUTOIMPORT_CONFIDENCE")
                 .unwrap_or_else(|| "high".to_string()),
-            lock_path: get("ABA_LOCK_PATH").map(PathBuf::from).unwrap_or_else(|| {
-                PathBuf::from(req_state.clone()).with_extension("lock") // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-            }),
+            lock_path: get("ABA_LOCK_PATH").map_or_else(
+                || {
+                    PathBuf::from(req_state.clone()).with_extension("lock") // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+                },
+                PathBuf::from,
+            ),
             telegram_base_url: get("TELEGRAM_BASE_URL")
                 .unwrap_or_else(|| "https://api.telegram.org".to_string()),
         })

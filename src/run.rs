@@ -1,6 +1,7 @@
 //! Run pipeline and auth bootstrap.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use anyhow::Context;
 use chrono::{NaiveDate, Utc};
@@ -17,9 +18,9 @@ use crate::state::{PendingReview, State};
 use crate::telegram::{ConfirmChannel, Prompt};
 
 /// Result of splitting fetched transactions against the payee cache.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ResolutionPlan {
-    /// (external_id, payee_name) for cache hits.
+    /// (`external_id`, `payee_name`) for cache hits.
     pub cached: Vec<(String, String)>,
     /// Distinct raw merchant names that need a Claude lookup.
     pub needs_claude: Vec<String>,
@@ -42,16 +43,19 @@ pub fn plan_resolution(txs: &[RawTransaction], cache: &BTreeMap<String, String>)
 }
 
 /// Result of applying Claude matches, split by the auto-import cutoff.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MatchOutcome {
-    /// (external_id, payee_name) confident enough to import + cache now.
+    /// (`external_id`, `payee_name`) confident enough to import + cache now.
     pub matched: Vec<(String, String)>,
-    /// (tx, suggested_payee, confidence) held for Telegram confirmation.
+    /// (tx, `suggested_payee`, confidence) held for Telegram confirmation.
     pub proposed: Vec<(RawTransaction, String, Confidence)>,
     /// No usable match — held with no suggestion.
     pub unmatched: Vec<RawTransaction>,
 }
 
+// `matches` (input) and `matched` (auto-imported output) are distinct, well-named
+// concepts here despite their lexical similarity.
+#[allow(clippy::similar_names)]
 pub fn apply_matches(
     txs: &[RawTransaction],
     matches: &[PayeeMatch],
@@ -72,7 +76,7 @@ pub fn apply_matches(
                     if m.confidence.rank() >= autoimport.rank()
                         && existing.contains(payee.as_str()) =>
                 {
-                    matched.push((tx.external_id.clone(), payee.clone()))
+                    matched.push((tx.external_id.clone(), payee.clone()));
                 }
                 Some(payee) => proposed.push((tx.clone(), payee.clone(), m.confidence)),
                 None => unmatched.push(tx.clone()),
@@ -106,12 +110,11 @@ fn schedules_from_rows(rows: Vec<ScheduleRow>, payees: &[Payee]) -> Vec<Schedule
                     return None;
                 }
             };
-            let Some(payee) = r
-                .payee_id
-                .as_deref()
-                .and_then(|id| by_id.get(id).copied())
-            else {
-                warn!("schedule dropped: payee_id {:?} not in payee list", r.payee_id);
+            let Some(payee) = r.payee_id.as_deref().and_then(|id| by_id.get(id).copied()) else {
+                warn!(
+                    "schedule dropped: payee_id {:?} not in payee list",
+                    r.payee_id
+                );
                 return None;
             };
             Some(Schedule {
@@ -171,10 +174,7 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
             }
         }
         Some(s) => Prompt {
-            chat_text: format!(
-                "No existing payee '{}'. Create it?\nOr reply with a payee name.",
-                s
-            ),
+            chat_text: format!("No existing payee '{s}'. Create it?\nOr reply with a payee name."),
             buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
         },
         None => Prompt {
@@ -187,7 +187,14 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// Top-level orchestration: deliberately long and wired to many collaborators.
+// It is never spawned across threads (driven directly under a timeout in main),
+// so `future_not_send` does not apply.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::future_not_send
+)]
 pub async fn run(
     cfg: &Config,
     dry_run: bool,
@@ -254,25 +261,21 @@ pub async fn run(
     // resolve_to cleared, prompt re-sent next run).
     for pr in &mut state.pending_reviews {
         if !pr.create_new && !pr.resolve_to.is_empty() {
-            match best_payee_match(&pr.resolve_to, &payee_names, PAYEE_THRESHOLD) {
-                Some(canon) => pr.resolve_to = canon,
-                None => {
-                    // Free-text remap didn't match a real payee: re-hold as a
-                    // "create it?" suggestion and re-prompt next. Edit the stale
-                    // inline-keyboard message first so its old buttons can't be
-                    // tapped (best-effort; failure must not abort the run).
-                    if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id) {
-                        let text = format!(
-                            "↪️ Couldn't match '{}' — re-asking below.",
-                            pr.resolve_to
-                        );
-                        if let Err(e) = ch.edit_message_text(old_id, &text).await {
-                            warn!("telegram edit_message_text failed (stale prompt left in chat): {e}");
-                        }
+            if let Some(canon) = best_payee_match(&pr.resolve_to, &payee_names, PAYEE_THRESHOLD) {
+                pr.resolve_to = canon;
+            } else {
+                // Free-text remap didn't match a real payee: re-hold as a
+                // "create it?" suggestion and re-prompt next. Edit the stale
+                // inline-keyboard message first so its old buttons can't be
+                // tapped (best-effort; failure must not abort the run).
+                if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id) {
+                    let text = format!("↪️ Couldn't match '{}' — re-asking below.", pr.resolve_to);
+                    if let Err(e) = ch.edit_message_text(old_id, &text).await {
+                        warn!("telegram edit_message_text failed (stale prompt left in chat): {e}");
                     }
-                    pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
-                    pr.telegram_message_id = None;
                 }
+                pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
+                pr.telegram_message_id = None;
             }
         }
     }
@@ -329,8 +332,12 @@ pub async fn run(
                 );
                 let date = tx.date.format("%Y-%m-%d").to_string();
                 if state.add_pending_full(
-                    &tx.external_id, &tx.raw_merchant, tx.amount_minor, &date,
-                    Some(payee_name.clone()), None,
+                    &tx.external_id,
+                    &tx.raw_merchant,
+                    tx.amount_minor,
+                    &date,
+                    Some(payee_name.clone()),
+                    None,
                 ) {
                     held += 1;
                 }
@@ -362,8 +369,12 @@ pub async fn run(
                 );
                 let date = tx.date.format("%Y-%m-%d").to_string();
                 if state.add_pending_full(
-                    &tx.external_id, &tx.raw_merchant, tx.amount_minor, &date,
-                    Some(payee_name.clone()), None,
+                    &tx.external_id,
+                    &tx.raw_merchant,
+                    tx.amount_minor,
+                    &date,
+                    Some(payee_name.clone()),
+                    None,
                 ) {
                     held += 1;
                 }
@@ -448,9 +459,12 @@ pub async fn run(
         // Persist ONLY the rotated Monzo token; discard in-memory cache/pending/last_run
         // changes by re-loading the on-disk state and copying just the token onto it.
         let mut on_disk = State::load(&cfg.state_path)?;
-        on_disk.monzo.refresh_token = state.monzo.refresh_token.clone();
+        on_disk
+            .monzo
+            .refresh_token
+            .clone_from(&state.monzo.refresh_token);
         if on_disk.monzo.account_id.is_empty() {
-            on_disk.monzo.account_id = state.monzo.account_id.clone();
+            on_disk.monzo.account_id.clone_from(&state.monzo.account_id);
         }
         on_disk.save(&cfg.state_path)?;
         return Ok(());
@@ -491,7 +505,9 @@ pub async fn run(
                     state.pending_reviews[i].telegram_message_id = Some(message_id);
                     // Persist now so a later failure can't strand this id (M6).
                     if let Err(e) = state.save(&cfg.state_path) {
-                        warn!("failed to persist telegram_message_id (may re-prompt next run): {e}");
+                        warn!(
+                            "failed to persist telegram_message_id (may re-prompt next run): {e}"
+                        );
                     }
                 }
                 Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
@@ -507,13 +523,13 @@ pub async fn run(
         summary.added, summary.updated, held
     );
     if !newly_cached.is_empty() {
-        body.push_str(&format!("\nNewly auto-matched ({}):", newly_cached.len()));
+        let _ = write!(body, "\nNewly auto-matched ({}):", newly_cached.len());
         for (raw, payee) in &newly_cached {
-            body.push_str(&format!("\n  {raw} -> {payee}"));
+            let _ = write!(body, "\n  {raw} -> {payee}");
         }
     }
     if awaiting > 0 {
-        body.push_str(&format!("\n{awaiting} item(s) awaiting your confirmation."));
+        let _ = write!(body, "\n{awaiting} item(s) awaiting your confirmation.");
     }
     notifier.notify("Actual import complete", &body).await.ok();
 
@@ -524,7 +540,10 @@ pub async fn run(
 fn random_state() -> anyhow::Result<String> {
     let mut buf = [0u8; 16];
     getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("RNG failure generating state: {e}"))?;
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(buf.iter().fold(String::with_capacity(32), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    }))
 }
 
 /// Verify the OAuth `state` echoed back on the redirect matches what we sent.
@@ -619,16 +638,18 @@ fn urlencoding(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
     use crate::actual::ActualClient;
     use crate::banks::{BankError, BankSource, RawTransaction};
@@ -698,7 +719,10 @@ pub(crate) mod tests {
             Ok(*id)
         }
         async fn edit_message_text(&self, message_id: i64, text: &str) -> anyhow::Result<()> {
-            self.edited.lock().unwrap().push((message_id, text.to_string()));
+            self.edited
+                .lock()
+                .unwrap()
+                .push((message_id, text.to_string()));
             if self.edit_should_fail {
                 return Err(anyhow::anyhow!("edit failed (test)"));
             }
@@ -781,8 +805,16 @@ pub(crate) mod tests {
             telegram_message_id: None,
         };
         let p = build_prompt(&proposed, &payees);
-        assert!(p.chat_text.contains("'Local Cafe'"), "expected plain-text quoting: {}", p.chat_text);
-        assert!(!p.chat_text.contains("*Local Cafe*"), "must not use Markdown bold for payee: {}", p.chat_text);
+        assert!(
+            p.chat_text.contains("'Local Cafe'"),
+            "expected plain-text quoting: {}",
+            p.chat_text
+        );
+        assert!(
+            !p.chat_text.contains("*Local Cafe*"),
+            "must not use Markdown bold for payee: {}",
+            p.chat_text
+        );
         assert_eq!(p.buttons.len(), 3);
         assert_eq!(p.buttons[0].1, "cf:tx1");
 
@@ -896,13 +928,18 @@ pub(crate) mod tests {
     }
     impl RecordingNotifier {
         fn new() -> Self {
-            Self { calls: Mutex::new(Vec::new()) }
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
         }
     }
     #[async_trait]
     impl Notifier for RecordingNotifier {
         async fn notify(&self, t: &str, b: &str) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push((t.to_string(), b.to_string()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((t.to_string(), b.to_string()));
             Ok(())
         }
     }
@@ -951,7 +988,7 @@ pub(crate) mod tests {
     /// `create_payee` returns `{id: p_new}`, and `import_transactions` appends
     /// the imported rows to `<dir>/imports.log` (one JSON array per call).
     fn fake_actual(dir: &TempDir) -> ActualClient {
-        let script = r#"
+        let script = r"
 let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
   const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
   const fs=require('fs'), path=require('path');
@@ -963,7 +1000,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
     out({ok:true,data:{added:req.transactions.length,updated:0}});
   } else { out({ok:false,error:'unknown op'}); }
 });
-"#;
+";
         std::fs::write(dir.path().join("index.js"), script).unwrap();
         ActualClient::new(
             dir.path().to_path_buf(),
@@ -977,7 +1014,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
     /// Like `fake_actual` but `import_transactions` fails, and `create_payee`
     /// records that it was called (to `payees.log`) before returning an id.
     fn fake_actual_failing_import(dir: &TempDir) -> ActualClient {
-        let script = r#"
+        let script = r"
 let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
   const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
   const fs=require('fs'), path=require('path');
@@ -990,7 +1027,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
   else if(req.op==='import_transactions'){ out({ok:false,error:'boom'}); }
   else { out({ok:false,error:'unknown op'}); }
 });
-"#;
+";
         std::fs::write(dir.path().join("index.js"), script).unwrap();
         ActualClient::new(
             dir.path().to_path_buf(),
@@ -1232,7 +1269,15 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let mut bank = AuthExpiredBank;
         let claude = FakeClaude { out: vec![] };
         run(
-            &cfg, false, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
         )
         .await
         .unwrap();
@@ -1240,6 +1285,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let calls = notifier.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "one re-auth notification");
         assert_eq!(calls[0].0, "Monzo re-auth required");
+        drop(calls);
         assert!(state_path.exists(), "state saved on !dry_run auth-expired");
         assert!(!imports_log.exists(), "no fetch/import after auth-expired");
     }
@@ -1257,12 +1303,23 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let mut bank = AuthExpiredBank;
         let claude = FakeClaude { out: vec![] };
         run(
-            &cfg, true, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+            &cfg,
+            true,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
         )
         .await
         .unwrap();
 
-        assert!(notifier.calls.lock().unwrap().is_empty(), "dry-run: no notify");
+        assert!(
+            notifier.calls.lock().unwrap().is_empty(),
+            "dry-run: no notify"
+        );
         assert!(!state_path.exists(), "dry-run auth-expired writes no state");
     }
 
@@ -1303,10 +1360,20 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         baseline.save(&state_path).unwrap();
 
         let mut state = State::load(&state_path).unwrap();
-        let mut bank = RotatingBank { rotate_to: "new".into() };
+        let mut bank = RotatingBank {
+            rotate_to: "new".into(),
+        };
         let claude = FakeClaude { out: vec![] };
         run(
-            &cfg, true, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+            &cfg,
+            true,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
         )
         .await
         .unwrap();
@@ -1318,10 +1385,19 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         );
 
         let on_disk = State::load(&state_path).unwrap();
-        assert_eq!(on_disk.payee_cache, baseline.payee_cache, "cache unchanged on disk");
-        assert_eq!(on_disk.pending_reviews, baseline.pending_reviews, "pending unchanged on disk");
+        assert_eq!(
+            on_disk.payee_cache, baseline.payee_cache,
+            "cache unchanged on disk"
+        );
+        assert_eq!(
+            on_disk.pending_reviews, baseline.pending_reviews,
+            "pending unchanged on disk"
+        );
         assert_eq!(on_disk.last_run, baseline.last_run, "last_run not advanced");
-        assert_eq!(on_disk.monzo.refresh_token, "new", "only the rotated token persisted");
+        assert_eq!(
+            on_disk.monzo.refresh_token, "new",
+            "only the rotated token persisted"
+        );
     }
 
     #[tokio::test]
@@ -1359,7 +1435,15 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let mut bank = FakeBank { txs: vec![] };
         let claude = FakeClaude { out: vec![] };
         let result = run(
-            &cfg, false, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
         )
         .await;
 
@@ -1368,7 +1452,10 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             format!("{err:#}").contains("import_transactions"),
             "error must originate from the import step, got: {err:#}"
         );
-        assert!(payees_log.exists(), "create_payee was attempted (transient orphan)");
+        assert!(
+            payees_log.exists(),
+            "create_payee was attempted (transient orphan)"
+        );
         let on_disk = State::load(&state_path).unwrap();
         assert_eq!(
             on_disk.pending_reviews.len(),
@@ -1422,6 +1509,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let edited = channel.edited.lock().unwrap();
         assert_eq!(edited.len(), 1);
         assert_eq!(edited[0].0, 500);
+        drop(edited);
 
         // Entry re-held as a "create it?" suggestion, resolve_to cleared, and a
         // fresh prompt was sent (new message_id, recorded in `sent`).
@@ -1506,14 +1594,24 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             }],
         };
         run(
-            &cfg, false, &mut state, &mut bank, &actual, &claude, &notifier,
-            Some(&channel as &dyn ConfirmChannel), Confidence::High,
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
         )
         .await
         .unwrap();
 
         // Not imported...
-        assert!(!imports_log.exists(), "non-existent payee must NOT be imported");
+        assert!(
+            !imports_log.exists(),
+            "non-existent payee must NOT be imported"
+        );
         // ...held for review with the proposed name as the suggestion...
         assert_eq!(state.pending_reviews.len(), 1);
         assert_eq!(state.pending_reviews[0].external_id, "tx_ghost");
@@ -1527,16 +1625,35 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
 
     #[test]
     fn schedules_from_rows_drops_bad_date_and_missing_payee_loudly() {
-        let payees = vec![Payee { id: "p1".into(), name: "Rent Co".into() }];
+        let payees = vec![Payee {
+            id: "p1".into(),
+            name: "Rent Co".into(),
+        }];
         let rows = vec![
             // good
-            ScheduleRow { date: Some("2026-06-01".into()), amount: Some(-1000), payee_id: Some("p1".into()) },
+            ScheduleRow {
+                date: Some("2026-06-01".into()),
+                amount: Some(-1000),
+                payee_id: Some("p1".into()),
+            },
             // bad date -> dropped
-            ScheduleRow { date: Some("not-a-date".into()), amount: Some(-1000), payee_id: Some("p1".into()) },
+            ScheduleRow {
+                date: Some("not-a-date".into()),
+                amount: Some(-1000),
+                payee_id: Some("p1".into()),
+            },
             // missing date -> dropped
-            ScheduleRow { date: None, amount: Some(-1000), payee_id: Some("p1".into()) },
+            ScheduleRow {
+                date: None,
+                amount: Some(-1000),
+                payee_id: Some("p1".into()),
+            },
             // payee not in list -> dropped
-            ScheduleRow { date: Some("2026-06-02".into()), amount: Some(-1000), payee_id: Some("nope".into()) },
+            ScheduleRow {
+                date: Some("2026-06-02".into()),
+                amount: Some(-1000),
+                payee_id: Some("nope".into()),
+            },
         ];
         let schedules = super::schedules_from_rows(rows, &payees);
         assert_eq!(schedules.len(), 1, "only the fully-valid row survives");

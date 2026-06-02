@@ -8,7 +8,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use crate::state::State;
 
 /// A transaction as fetched from a bank, before payee normalisation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTransaction {
     /// Bank's stable id; used as Actual's `imported_id` for idempotency.
     pub external_id: String,
@@ -28,7 +28,7 @@ pub enum BankError {
     Other(#[from] anyhow::Error),
 }
 
-/// A pluggable bank source. Monzo this phase; GoCardless in Phase 2.
+/// A pluggable bank source. Monzo this phase; `GoCardless` in Phase 2.
 #[async_trait]
 pub trait BankSource {
     fn name(&self) -> &'static str;

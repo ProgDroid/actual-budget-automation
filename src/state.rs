@@ -6,7 +6,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub last_run: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -20,7 +20,7 @@ pub struct State {
     pub telegram: TelegramState,
 }
 
-#[derive(Default, PartialEq, Serialize, Deserialize)]
+#[derive(Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonzoState {
     #[serde(default)]
     pub refresh_token: String,
@@ -33,21 +33,25 @@ impl std::fmt::Debug for MonzoState {
         f.debug_struct("MonzoState")
             .field(
                 "refresh_token",
-                &if self.refresh_token.is_empty() { "<empty>" } else { "***" },
+                &if self.refresh_token.is_empty() {
+                    "<empty>"
+                } else {
+                    "***"
+                },
             )
             .field("account_id", &self.account_id)
             .finish()
     }
 }
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelegramState {
     /// Highest acknowledged getUpdates offset; advanced only by `aba poll`.
     #[serde(default)]
     pub last_update_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
     #[serde(default)]
     pub external_id: String,
@@ -73,12 +77,12 @@ pub struct PendingReview {
 }
 
 impl State {
-    pub fn load(path: &Path) -> anyhow::Result<State> {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
         // path comes from CLI config, not from untrusted user input
         let read_result = std::fs::read_to_string(path); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         match read_result {
             Ok(s) => Ok(toml::from_str(&s)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
     }
@@ -241,7 +245,7 @@ impl State {
 }
 
 /// A pending review the user has resolved, ready to import.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedReview {
     pub external_id: String,
     pub raw_merchant: String,
@@ -402,9 +406,15 @@ mod tests {
 
     #[test]
     fn monzo_state_debug_redacts_refresh_token() {
-        let m = MonzoState { refresh_token: "SECRET_RT".into(), account_id: "acc_1".into() };
+        let m = MonzoState {
+            refresh_token: "SECRET_RT".into(),
+            account_id: "acc_1".into(),
+        };
         let s = format!("{m:?}");
-        assert!(!s.contains("SECRET_RT"), "refresh_token must be redacted: {s}");
+        assert!(
+            !s.contains("SECRET_RT"),
+            "refresh_token must be redacted: {s}"
+        );
         assert!(s.contains("acc_1"), "account_id is fine to show");
     }
 
