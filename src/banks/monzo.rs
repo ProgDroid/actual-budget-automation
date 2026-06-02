@@ -409,4 +409,54 @@ mod tests {
         assert_eq!(txs[101].external_id, "tx_101");
         assert_eq!(txs[101].amount_minor, -300);
     }
+
+    #[tokio::test]
+    async fn fetch_pages_on_raw_count_not_filtered_count() {
+        let server = MockServer::start().await;
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+
+        // Page 1: 100 raw rows, 40 of them declined (mapped output would be 60),
+        // last id = tx_99. The raw count is 100 so a second page MUST be requested.
+        let mut page1 = Vec::new();
+        for i in 0..100 {
+            let declined = i % 10 < 4; // 40 declined
+            page1.push(serde_json::json!({
+                "id": format!("tx_{i}"),
+                "created": "2026-05-30T08:15:00Z",
+                "amount": -100,
+                "description": "X",
+                "decline_reason": if declined { serde_json::json!("INSUFFICIENT_FUNDS") } else { serde_json::json!(null) },
+                "merchant": null
+            }));
+        }
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", since.to_rfc3339()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+            )
+            .mount(&server)
+            .await;
+
+        // Page 2 (cursor = tx_99): one non-declined row, then the walk ends.
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", "tx_99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": [
+                    { "id": "tx_100", "created": "2026-05-31T09:00:00Z", "amount": -200,
+                      "description": "Y", "decline_reason": null, "merchant": null }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let txs = m.fetch_since(since).await.unwrap();
+
+        // 60 non-declined from page 1 + 1 from page 2 = 61.
+        assert_eq!(txs.len(), 61);
+        assert_eq!(txs[60].external_id, "tx_100");
+    }
 }
