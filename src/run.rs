@@ -117,9 +117,25 @@ fn payee_id_for<'a>(payees: &'a [Payee], name: &str) -> Option<&'a str> {
 /// - suggestion in payee list  -> "raw → suggestion?"  [Confirm][Create new][Skip]
 /// - suggestion NOT in payees   -> "No payee 'x'. Create it?" [Create][Skip]
 /// - no suggestion              -> "New merchant raw — which payee?" [Create new][Skip]
+///
+/// If the entry's external_id is too long to fit Telegram's 64-byte
+/// `callback_data` cap, the keyboard is dropped entirely (every button shares
+/// the same key, so it is all-or-nothing); the user resolves via a free-text
+/// reply, which is correlated by `telegram_message_id` instead.
 fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
     use crate::telegram::encode_callback;
     let key = &entry.external_id;
+    // Encode every (label, action) spec; if any key is too long they all are,
+    // so collect into Option<Vec<_>> and fall back to no buttons.
+    let buttons = |specs: &[(&str, &str)]| -> Vec<(String, String)> {
+        specs
+            .iter()
+            .map(|(label, action)| {
+                encode_callback(action, key).map(|data| ((*label).to_string(), data))
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    };
     match &entry.suggestion {
         Some(s) if payee_names.iter().any(|p| p == s) => {
             let conf = entry.confidence.as_deref().unwrap_or("medium");
@@ -128,11 +144,11 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
                     "`{}` → *{}*?  _({} confidence)_\nReply with a different payee to remap.",
                     entry.raw_merchant, s, conf
                 ),
-                buttons: vec![
-                    ("✅ Confirm".into(), encode_callback("cf", key)),
-                    ("🆕 Create new".into(), encode_callback("nw", key)),
-                    ("❌ Skip".into(), encode_callback("sk", key)),
-                ],
+                buttons: buttons(&[
+                    ("✅ Confirm", "cf"),
+                    ("🆕 Create new", "nw"),
+                    ("❌ Skip", "sk"),
+                ]),
             }
         }
         Some(s) => Prompt {
@@ -140,20 +156,14 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
                 "No existing payee *{}*. Create it?\nOr reply with a payee name.",
                 s
             ),
-            buttons: vec![
-                ("🆕 Create".into(), encode_callback("nw", key)),
-                ("❌ Skip".into(), encode_callback("sk", key)),
-            ],
+            buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
         },
         None => Prompt {
             chat_text: format!(
                 "New merchant `{}` — which payee?\nReply with a payee name, or:",
                 entry.raw_merchant
             ),
-            buttons: vec![
-                ("🆕 Create new".into(), encode_callback("nw", key)),
-                ("❌ Skip".into(), encode_callback("sk", key)),
-            ],
+            buttons: buttons(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")]),
         },
     }
 }
@@ -726,6 +736,32 @@ pub(crate) mod tests {
         assert_eq!(p3.buttons.len(), 2);
         assert_eq!(p3.buttons[0].1, "nw:tx3"); // create
         assert_eq!(p3.buttons[1].1, "sk:tx3"); // skip
+    }
+
+    #[test]
+    fn build_prompt_drops_buttons_when_external_id_too_long() {
+        // 80-char external_id + "cf:" overflows Telegram's 64-byte callback cap,
+        // so the prompt must carry no buttons (free-text reply still works).
+        let long_id = "z".repeat(80);
+        let payees = vec!["Local Cafe".to_string()];
+        let entry = PendingReview {
+            external_id: long_id,
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some("Local Cafe".into()),
+            confidence: Some("medium".into()),
+            telegram_message_id: None,
+        };
+        let p = build_prompt(&entry, &payees);
+        assert!(
+            p.buttons.is_empty(),
+            "over-long external_id must yield no buttons, got: {:?}",
+            p.buttons
+        );
+        assert!(!p.chat_text.is_empty(), "chat text must still be present");
     }
 
     // ---- Task 10: in-process doubles ----
