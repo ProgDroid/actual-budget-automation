@@ -38,11 +38,17 @@ phone before it becomes permanent.
 - Fallback when Telegram is unreachable (don't block the import).
 - Keep Apprise for one-way alerts; add Telegram only for the confirm channel.
 
-## 2. GoCardless / Nordigen bank source (Santander + other UK banks)
+## 2. GoCardless / Nordigen bank source — SKIPPED (2026-06-02)
 
-Already planned as Phase 2 in the original spec. Implement the existing
-`BankSource` trait for GoCardless/Nordigen. Reuse the same fetch → match → import
-pipeline; only the auth + fetch + transaction mapping differ.
+**Won't do for now (decision 2026-06-02).** GoCardless/Nordigen is blocked anyway
+(not accepting new registrations), and the other UK accounts are much smaller, so
+the user will **enter those transactions manually in Actual** rather than automate
+them. Monzo (the high-volume account) stays the only automated source.
+
+If revisited: implement the existing `BankSource` trait for the chosen aggregator
+and reuse the same fetch → match → import pipeline (only auth + fetch + transaction
+mapping differ). The `encode_callback` 64-byte path and stale-prompt cleanup that
+this was once gated on are already handled (see #7a/#7b).
 
 ## 3. Monzo transaction pagination — DONE (2026-06-02)
 
