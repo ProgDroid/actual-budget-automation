@@ -44,12 +44,17 @@ Already planned as Phase 2 in the original spec. Implement the existing
 `BankSource` trait for GoCardless/Nordigen. Reuse the same fetch → match → import
 pipeline; only the auth + fetch + transaction mapping differ.
 
-## 3. Monzo transaction pagination
+## 3. Monzo transaction pagination — DONE (2026-06-02)
 
-`fetch_since` currently requests `limit=100` and logs a warning if exactly 100 are
-returned, but does **not** paginate. Implement cursor-based pagination (Monzo
-`before` parameter) so high-volume windows aren't silently truncated. Today the
-warning is the only safeguard.
+**Implemented** on `main` (merge `95590b7`; spec/plan at
+`docs/superpowers/specs|plans/2026-06-02-monzo-pagination-*.md`). `fetch_since`
+now walks every page using Monzo's **last-transaction-id cursor** (`since=<last
+raw id>`), not the `before` timestamp the original note assumed — the id cursor
+avoids the same-`created`-timestamp skip/duplicate hazard. The page-size check and
+the cursor both use the **raw** response count/id (before decline filtering). A
+`MAX_PAGES = 100` (~10k txns) runaway guard returns `BankError::Other` and aborts
+loudly rather than silently truncating (so `run.rs` never advances `last_run` on a
+partial fetch). The old `warn!`-at-100 is gone.
 
 ## 4. `run()` integration test coverage
 
