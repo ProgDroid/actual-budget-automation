@@ -158,6 +158,29 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
     }
 }
 
+/// Count proposed + unmatched entries that a real run would NEWLY hold — i.e.
+/// excluding any whose `external_id` is already in `pending_reviews`. Mirrors the
+/// live `add_pending*` "skip if already present" rule so the dry-run figure is
+/// truthful. Read-only: does not mutate state.
+fn would_hold_count(outcome: &MatchOutcome, state: &State) -> usize {
+    let existing: std::collections::BTreeSet<&str> = state
+        .pending_reviews
+        .iter()
+        .map(|p| p.external_id.as_str())
+        .collect();
+    let proposed_new = outcome
+        .proposed
+        .iter()
+        .filter(|(tx, _, _)| !existing.contains(tx.external_id.as_str()))
+        .count();
+    let unmatched_new = outcome
+        .unmatched
+        .iter()
+        .filter(|tx| !existing.contains(tx.external_id.as_str()))
+        .count();
+    proposed_new + unmatched_new
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: &Config,
@@ -359,10 +382,7 @@ pub async fn run(
             "  would skip   : {} (matched a schedule)",
             fetched_count.saturating_sub(candidates.len())
         );
-        println!(
-            "  would hold   : {}",
-            outcome.proposed.len() + outcome.unmatched.len()
-        );
+        println!("  would hold   : {}", would_hold_count(&outcome, &state));
         for r in &import_rows {
             println!("    + {} {} -> payee {}", r.date, r.amount, r.payee);
         }
@@ -1017,6 +1037,37 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             1,
             "telegram_message_id.is_none() filter skipped the already-prompted entry"
         );
+    }
+
+    #[test]
+    fn would_hold_count_excludes_already_pending() {
+        let mut state = State::default();
+        // external_id "2" is already held on disk.
+        state.pending_reviews.push(PendingReview {
+            external_id: "2".into(),
+            raw_merchant: "Existing".into(),
+            amount: -100,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            telegram_message_id: None,
+        });
+
+        let outcome = MatchOutcome {
+            matched: vec![],
+            // proposed external_id "1" is new; "2" already pending.
+            proposed: vec![
+                (tx("1", "Cafe", -200), "Local Cafe".to_string(), Confidence::Medium),
+                (tx("2", "Existing", -100), "Existing".to_string(), Confidence::Medium),
+            ],
+            // unmatched external_id "3" is new.
+            unmatched: vec![tx("3", "Mystery", -50)],
+        };
+
+        // New holds: "1" and "3" => 2. "2" is already pending => excluded.
+        assert_eq!(would_hold_count(&outcome, &state), 2);
     }
 
     #[test]
