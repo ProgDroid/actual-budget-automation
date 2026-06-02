@@ -24,6 +24,7 @@ strsim = "0.11"
 url = "2"
 tiny_http = "0.12"
 webbrowser = "1"
+getrandom = "0.3"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -31,7 +31,7 @@ async function handle(req) {
       );
       return data.map((s) => ({
         date: typeof s._date === 'string' ? s._date : null,
-        amount: typeof s._amount === 'number' ? s._amount : (s._amount && s._amount.num1) || 0,
+        amount: typeof s._amount === 'number' ? s._amount : null,
         payee_id: s._payee || null,
       }));
     }

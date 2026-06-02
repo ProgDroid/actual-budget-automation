@@ -35,7 +35,8 @@ pub struct Payee {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ScheduleRow {
     pub date: Option<String>,
-    pub amount: i64,
+    #[serde(default)]
+    pub amount: Option<i64>,
     pub payee_id: Option<String>,
 }
 
@@ -73,6 +74,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(row.date, None);
+        assert_eq!(row.amount, Some(0));
+    }
+
+    #[test]
+    fn schedule_row_accepts_null_amount() {
+        let row: ScheduleRow = serde_json::from_value(serde_json::json!({
+            "date": "2026-06-01", "amount": null, "payee_id": "p1"
+        }))
+        .unwrap();
+        assert_eq!(row.amount, None);
+    }
+
+    #[test]
+    fn schedule_row_numeric_amount_is_some() {
+        let row: ScheduleRow = serde_json::from_value(serde_json::json!({
+            "date": "2026-06-01", "amount": -1500, "payee_id": "p1"
+        }))
+        .unwrap();
+        assert_eq!(row.amount, Some(-1500));
     }
 
     #[test]

@@ -31,13 +31,18 @@ use crate::banks::RawTransaction;
 /// A scheduled transaction's next occurrence, as returned by the Actual shim.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schedule {
-    pub amount: i64,
+    /// Fixed amount in minor units, or `None` for variable/ranged schedules.
+    pub amount: Option<i64>,
     pub date: NaiveDate,
     pub payee: String,
 }
 
-/// True if `tx` looks like a manifestation of any schedule: exact amount,
+/// True if `tx` looks like a manifestation of any schedule.
+///
+/// For fixed-amount schedules (`amount` is `Some`): requires exact amount,
 /// date within `date_tolerance_days`, and payee similarity >= `payee_threshold`.
+/// For variable/ranged schedules (`amount` is `None`): matches on date + payee only,
+/// ignoring the transaction amount.
 pub fn matches_scheduled(
     tx: &RawTransaction,
     schedules: &[Schedule],
@@ -45,9 +50,13 @@ pub fn matches_scheduled(
     payee_threshold: f64,
 ) -> bool {
     schedules.iter().any(|s| {
-        s.amount == tx.amount_minor
-            && (s.date - tx.date).num_days().abs() <= date_tolerance_days
-            && payee_similarity(&s.payee, &tx.raw_merchant) >= payee_threshold
+        let date_ok = (s.date - tx.date).num_days().abs() <= date_tolerance_days;
+        let payee_ok = payee_similarity(&s.payee, &tx.raw_merchant) >= payee_threshold;
+        let amount_ok = match s.amount {
+            Some(a) => a == tx.amount_minor,
+            None => true, // variable/ranged schedule: ignore amount
+        };
+        amount_ok && date_ok && payee_ok
     })
 }
 
@@ -87,7 +96,7 @@ mod tests {
     #[test]
     fn matches_scheduled_within_tolerance() {
         let schedules = vec![Schedule {
-            amount: -1500,
+            amount: Some(-1500),
             date: d(2026, 6, 1),
             payee: "Netflix".into(),
         }];
@@ -98,7 +107,7 @@ mod tests {
     #[test]
     fn no_match_when_amount_differs() {
         let schedules = vec![Schedule {
-            amount: -1500,
+            amount: Some(-1500),
             date: d(2026, 6, 1),
             payee: "Netflix".into(),
         }];
@@ -109,7 +118,7 @@ mod tests {
     #[test]
     fn no_match_when_date_out_of_tolerance() {
         let schedules = vec![Schedule {
-            amount: -1500,
+            amount: Some(-1500),
             date: d(2026, 6, 1),
             payee: "Netflix".into(),
         }];
@@ -120,12 +129,40 @@ mod tests {
     #[test]
     fn no_match_when_payee_unrelated() {
         let schedules = vec![Schedule {
-            amount: -1500,
+            amount: Some(-1500),
             date: d(2026, 6, 1),
             payee: "Netflix".into(),
         }];
         let t = tx(-1500, d(2026, 6, 1), "AMAZON PRIME");
         assert!(!matches_scheduled(&t, &schedules, 3, 0.85));
+    }
+
+    #[test]
+    fn variable_amount_matches_on_date_and_payee_regardless_of_amount() {
+        let schedules = vec![Schedule {
+            amount: None, // variable / ranged schedule
+            date: d(2026, 6, 1),
+            payee: "Netflix".into(),
+        }];
+        // Any amount near the date with a matching payee should be treated as the
+        // schedule's manifestation and skipped.
+        let t = tx(-9999, d(2026, 5, 30), "NETFLIX.COM");
+        assert!(matches_scheduled(&t, &schedules, 3, 0.85));
+    }
+
+    #[test]
+    fn variable_amount_still_requires_date_and_payee() {
+        let schedules = vec![Schedule {
+            amount: None,
+            date: d(2026, 6, 1),
+            payee: "Netflix".into(),
+        }];
+        // Wrong payee -> no match even though amount is ignored.
+        let wrong_payee = tx(-9999, d(2026, 6, 1), "AMAZON PRIME");
+        assert!(!matches_scheduled(&wrong_payee, &schedules, 3, 0.85));
+        // Out-of-tolerance date -> no match.
+        let wrong_date = tx(-9999, d(2026, 6, 10), "NETFLIX.COM");
+        assert!(!matches_scheduled(&wrong_date, &schedules, 3, 0.85));
     }
 
     #[test]
