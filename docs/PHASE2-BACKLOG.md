@@ -56,9 +56,18 @@ the cursor both use the **raw** response count/id (before decline filtering). A
 loudly rather than silently truncating (so `run.rs` never advances `last_run` on a
 partial fetch). The old `warn!`-at-100 is gone.
 
-## 4. `run()` integration test coverage
+## 4. `run()` integration test coverage — DONE (2026-06-02)
 
-`run()` has no automated test (only its pure helpers do). Highest-risk untested
+**Implemented** on `main` (spec/plan at
+`docs/superpowers/specs|plans/2026-06-02-run-coverage-*.md`). Added 4 `run()`
+integration tests + doubles (`RecordingNotifier`, `AuthExpiredBank`,
+`RotatingBank`, `fake_actual_failing_import`): AuthExpired early-return (notify+save
+gated on `!dry_run`), dry-run state-splice (only the rotated Monzo token persisted),
+and create_payee→import-failure recoverability (review survives on disk → clean
+retry; the hazard self-heals and is NOT a "no clean retry" bug). Original notes
+retained below for reference.
+
+`run()` had no automated test (only its pure helpers did). Highest-risk untested
 paths to cover before adding more write paths:
 - **Resolved-review + `create_payee` transactional hazard**: payee is created
   before the import call; a failure between the two leaves a created payee with no
