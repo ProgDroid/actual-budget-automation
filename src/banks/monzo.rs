@@ -204,7 +204,11 @@ impl BankSource for Monzo {
             }
             match last_id {
                 Some(id) => cursor = id,
-                None => break, // unreachable: raw_len == 100 implies a last row
+                None => {
+                    return Err(BankError::Other(anyhow::anyhow!(
+                        "Monzo returned a full page ({raw_len}) with no last id; cannot advance cursor"
+                    )));
+                }
             }
         }
 
@@ -492,5 +496,101 @@ mod tests {
         let err = m.fetch_since(since).await.unwrap_err();
 
         assert!(matches!(err, BankError::Other(_)));
+        let msg = format!("{err}");
+        assert!(msg.contains("pages"), "cap error should mention pages, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fetch_cursor_uses_raw_last_id_when_last_row_declined() {
+        let server = MockServer::start().await;
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+
+        // Page 1: 100 raw rows. The LAST raw row (tx_99) IS declined; tx_98 is
+        // not. The cursor MUST advance to the last RAW id (tx_99), not the last
+        // non-declined id (tx_98). If the code regressed to using the last
+        // non-declined id, the page-2 mock (keyed on tx_99) would not match,
+        // wiremock would 404, and fetch_since would error → .unwrap() panics.
+        let mut page1 = Vec::new();
+        for i in 0..100 {
+            let declined = i == 99; // only the last raw row is declined
+            page1.push(serde_json::json!({
+                "id": format!("tx_{i}"),
+                "created": "2026-05-30T08:15:00Z",
+                "amount": -100,
+                "description": "X",
+                "decline_reason": if declined { serde_json::json!("INSUFFICIENT_FUNDS") } else { serde_json::json!(null) },
+                "merchant": null
+            }));
+        }
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", since.to_rfc3339()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+            )
+            .mount(&server)
+            .await;
+
+        // Page 2 keyed on the RAW last id (tx_99): short final page, one row.
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", "tx_99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": [
+                    { "id": "tx_100", "created": "2026-05-31T09:00:00Z", "amount": -200,
+                      "description": "Y", "decline_reason": null, "merchant": null }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let txs = m.fetch_since(since).await.unwrap();
+
+        assert_eq!(txs.last().unwrap().external_id, "tx_100");
+    }
+
+    #[tokio::test]
+    async fn fetch_terminates_on_empty_final_page() {
+        let server = MockServer::start().await;
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+
+        // Page 1: exactly 100 rows (last id tx_99) → a second page is requested.
+        let mut page1 = Vec::new();
+        for i in 0..100 {
+            page1.push(serde_json::json!({
+                "id": format!("tx_{i}"),
+                "created": "2026-05-30T08:15:00Z",
+                "amount": -100,
+                "description": "X",
+                "decline_reason": null,
+                "merchant": null
+            }));
+        }
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", since.to_rfc3339()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": page1 })),
+            )
+            .mount(&server)
+            .await;
+
+        // Page 2 (cursor = tx_99): empty page ends the walk via raw_len < 100.
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("since", "tx_99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let txs = m.fetch_since(since).await.unwrap();
+
+        assert_eq!(txs.len(), 100);
     }
 }
