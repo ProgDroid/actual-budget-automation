@@ -771,6 +771,62 @@ pub(crate) mod tests {
         }
     }
 
+    /// Notifier double that records every notify(title, body) call.
+    struct RecordingNotifier {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+    impl RecordingNotifier {
+        fn new() -> Self {
+            Self { calls: Mutex::new(Vec::new()) }
+        }
+    }
+    #[async_trait]
+    impl Notifier for RecordingNotifier {
+        async fn notify(&self, t: &str, b: &str) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push((t.to_string(), b.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Bank whose `ensure_auth` always reports the 90-day re-auth condition.
+    struct AuthExpiredBank;
+    #[async_trait]
+    impl BankSource for AuthExpiredBank {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        async fn ensure_auth(&mut self, _s: &mut State) -> Result<(), BankError> {
+            Err(BankError::AuthExpired("test".into()))
+        }
+        async fn fetch_since(
+            &self,
+            _since: DateTime<Utc>,
+        ) -> Result<Vec<RawTransaction>, BankError> {
+            panic!("fetch_since must not be called after AuthExpired");
+        }
+    }
+
+    /// Bank that simulates Monzo's refresh-token rotation during `ensure_auth`.
+    struct RotatingBank {
+        rotate_to: String,
+    }
+    #[async_trait]
+    impl BankSource for RotatingBank {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        async fn ensure_auth(&mut self, s: &mut State) -> Result<(), BankError> {
+            s.monzo.refresh_token = self.rotate_to.clone();
+            Ok(())
+        }
+        async fn fetch_since(
+            &self,
+            _since: DateTime<Utc>,
+        ) -> Result<Vec<RawTransaction>, BankError> {
+            Ok(vec![])
+        }
+    }
+
     /// Build an `ActualClient` backed by a fake node shim in `dir`.
     /// `get_payees` returns `[{p_cafe, Local Cafe}]`, `get_scheduled` is empty,
     /// `create_payee` returns `{id: p_new}`, and `import_transactions` appends
@@ -787,6 +843,33 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
     fs.appendFileSync(path.join(__dirname,'imports.log'), JSON.stringify(req.transactions)+'\n');
     out({ok:true,data:{added:req.transactions.length,updated:0}});
   } else { out({ok:false,error:'unknown op'}); }
+});
+"#;
+        std::fs::write(dir.path().join("index.js"), script).unwrap();
+        ActualClient::new(
+            dir.path().to_path_buf(),
+            false,
+            "http://t".into(),
+            "pw".into(),
+            "sync".into(),
+        )
+    }
+
+    /// Like `fake_actual` but `import_transactions` fails, and `create_payee`
+    /// records that it was called (to `payees.log`) before returning an id.
+    fn fake_actual_failing_import(dir: &TempDir) -> ActualClient {
+        let script = r#"
+let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
+  const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
+  const fs=require('fs'), path=require('path');
+  if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'}]}); }
+  else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
+  else if(req.op==='create_payee'){
+    fs.appendFileSync(path.join(__dirname,'payees.log'), 'called\n');
+    out({ok:true,data:{id:'p_new'}});
+  }
+  else if(req.op==='import_transactions'){ out({ok:false,error:'boom'}); }
+  else { out({ok:false,error:'unknown op'}); }
 });
 "#;
         std::fs::write(dir.path().join("index.js"), script).unwrap();
@@ -1014,6 +1097,166 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             1,
             "telegram_message_id.is_none() filter skipped the already-prompted entry"
         );
+    }
+
+    #[tokio::test]
+    async fn auth_expired_notifies_and_saves_when_not_dry_run() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = RecordingNotifier::new();
+
+        let mut state = State::default();
+        let mut bank = AuthExpiredBank;
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg, false, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one re-auth notification");
+        assert_eq!(calls[0].0, "Monzo re-auth required");
+        assert!(state_path.exists(), "state saved on !dry_run auth-expired");
+        assert!(!imports_log.exists(), "no fetch/import after auth-expired");
+    }
+
+    #[tokio::test]
+    async fn auth_expired_dry_run_does_not_notify_or_save() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = RecordingNotifier::new();
+
+        let mut state = State::default();
+        let mut bank = AuthExpiredBank;
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg, true, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert!(notifier.calls.lock().unwrap().is_empty(), "dry-run: no notify");
+        assert!(!state_path.exists(), "dry-run auth-expired writes no state");
+    }
+
+    #[tokio::test]
+    async fn dry_run_persists_only_rotated_token() {
+        use chrono::TimeZone;
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+
+        // Baseline on disk: a retained cache entry, a RESOLVED pending review, last_run, old token.
+        // The review is resolved (resolve_to an existing payee) so the run mutates the IN-MEMORY
+        // state (take_resolved removes the review + adds a cache entry). A broken splice that
+        // persisted the whole in-memory state instead of just the token would then be caught.
+        let baseline = State {
+            last_run: Some(Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap()),
+            monzo: crate::state::MonzoState {
+                refresh_token: "old".into(),
+                account_id: "acc".into(),
+            },
+            payee_cache: BTreeMap::from([("KEPT".to_string(), "Kept Payee".to_string())]),
+            pending_reviews: vec![PendingReview {
+                external_id: "p1".into(),
+                raw_merchant: "RESOLVE_ME".into(),
+                amount: -100,
+                date: "2026-06-01".into(),
+                resolve_to: "Local Cafe".into(), // existing payee in fake_actual
+                create_new: false,
+                suggestion: None,
+                confidence: None,
+                telegram_message_id: None,
+            }],
+            ..State::default()
+        };
+        baseline.save(&state_path).unwrap();
+
+        let mut state = State::load(&state_path).unwrap();
+        let mut bank = RotatingBank { rotate_to: "new".into() };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg, true, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Sanity: the in-memory state DID diverge (review resolved away) -> assertions are non-vacuous.
+        assert!(
+            state.pending_reviews.is_empty(),
+            "in-memory review was resolved; test is non-vacuous"
+        );
+
+        let on_disk = State::load(&state_path).unwrap();
+        assert_eq!(on_disk.payee_cache, baseline.payee_cache, "cache unchanged on disk");
+        assert_eq!(on_disk.pending_reviews, baseline.pending_reviews, "pending unchanged on disk");
+        assert_eq!(on_disk.last_run, baseline.last_run, "last_run not advanced");
+        assert_eq!(on_disk.monzo.refresh_token, "new", "only the rotated token persisted");
+    }
+
+    #[tokio::test]
+    async fn create_payee_import_failure_leaves_review_for_retry() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let payees_log = shim.path().join("payees.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_failing_import(&shim);
+        let notifier = NullNotifier;
+
+        // A resolved create_new review (payee name falls back to raw_merchant).
+        // Struct literal to avoid clippy::field_reassign_with_default.
+        let mut state = State {
+            monzo: crate::state::MonzoState {
+                refresh_token: String::new(),
+                account_id: "acc".into(),
+            },
+            pending_reviews: vec![PendingReview {
+                external_id: "tx_x".into(),
+                raw_merchant: "MyStore".into(),
+                amount: -500,
+                date: "2026-05-30".into(),
+                resolve_to: String::new(),
+                create_new: true,
+                suggestion: None,
+                confidence: None,
+                telegram_message_id: None,
+            }],
+            ..State::default()
+        };
+        state.save(&state_path).unwrap(); // baseline on disk
+
+        let mut bank = FakeBank { txs: vec![] };
+        let claude = FakeClaude { out: vec![] };
+        let result = run(
+            &cfg, false, &mut state, &mut bank, &actual, &claude, &notifier, None, Confidence::High,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("import_transactions"),
+            "error must originate from the import step, got: {err:#}"
+        );
+        assert!(payees_log.exists(), "create_payee was attempted (transient orphan)");
+        let on_disk = State::load(&state_path).unwrap();
+        assert_eq!(
+            on_disk.pending_reviews.len(),
+            1,
+            "resolved review still on disk -> retry is clean (state not saved on failure)"
+        );
+        assert_eq!(on_disk.pending_reviews[0].external_id, "tx_x");
     }
 
     #[test]
