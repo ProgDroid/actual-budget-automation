@@ -588,12 +588,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test double: returns scripted replies once, records sent prompts.
+    /// Test double: returns scripted replies once, records sent prompts and edits.
     pub struct FakeChannel {
         pub scripted: Mutex<Vec<Reply>>,
         pub offset: i64,
         pub sent: Mutex<Vec<Prompt>>,
         pub next_id: Mutex<i64>,
+        pub edited: Mutex<Vec<(i64, String)>>,
+        pub edit_should_fail: bool,
     }
     impl FakeChannel {
         pub fn new(scripted: Vec<Reply>, offset: i64) -> Self {
@@ -602,7 +604,16 @@ pub(crate) mod tests {
                 offset,
                 sent: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1000),
+                edited: Mutex::new(Vec::new()),
+                edit_should_fail: false,
             }
+        }
+
+        /// Variant whose `edit_message_text` always errors, to prove the run
+        /// continues regardless.
+        pub fn with_failing_edit(mut self) -> Self {
+            self.edit_should_fail = true;
+            self
         }
     }
     #[async_trait]
@@ -622,6 +633,13 @@ pub(crate) mod tests {
             let mut id = self.next_id.lock().unwrap();
             *id += 1;
             Ok(*id)
+        }
+        async fn edit_message_text(&self, message_id: i64, text: &str) -> anyhow::Result<()> {
+            self.edited.lock().unwrap().push((message_id, text.to_string()));
+            if self.edit_should_fail {
+                return Err(anyhow::anyhow!("edit failed (test)"));
+            }
+            Ok(())
         }
     }
 

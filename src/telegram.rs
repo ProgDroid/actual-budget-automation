@@ -51,6 +51,10 @@ pub trait ConfirmChannel: Send + Sync {
 
     /// Send a prepared prompt; returns the Telegram message_id.
     async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64>;
+
+    /// Edit a previously-sent prompt's text and drop its inline keyboard
+    /// (no `reply_markup` is sent). Best-effort: callers must not abort on error.
+    async fn edit_message_text(&self, message_id: i64, text: &str) -> anyhow::Result<()>;
 }
 
 #[must_use]
@@ -271,6 +275,38 @@ impl ConfirmChannel for HttpTelegram {
         value["result"]["message_id"]
             .as_i64()
             .context("sendMessage response missing message_id")
+    }
+
+    async fn edit_message_text(&self, message_id: i64, text: &str) -> anyhow::Result<()> {
+        let body = json!({
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        });
+        let resp = self
+            .http
+            .post(self.url("editMessageText"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "telegram editMessageText failed: {}",
+                    self.redact(e.to_string())
+                )
+            })?;
+        let status = resp.status();
+        let value: Value = resp.json().await.map_err(|e| {
+            anyhow!(
+                "editMessageText response not JSON: {}",
+                self.redact(e.to_string())
+            )
+        })?;
+        if !status.is_success() {
+            return Err(anyhow!("telegram error {status}: {value}"));
+        }
+        Ok(())
     }
 }
 
@@ -496,6 +532,28 @@ mod tests {
         };
         let id = tg.send_prompt(&prompt).await.unwrap();
         assert_eq!(id, 12345);
+    }
+
+    #[tokio::test]
+    async fn http_edit_message_text_posts_without_reply_markup() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/editMessageText"))
+            .and(body_json(serde_json::json!({
+                "chat_id": 42,
+                "message_id": 500,
+                "text": "superseded",
+                "parse_mode": "Markdown"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": {} })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tg = HttpTelegram::new("tok".into(), 42).with_base_url(server.uri());
+        tg.edit_message_text(500, "superseded").await.unwrap();
     }
 
     // --- Token-redaction tests ---
