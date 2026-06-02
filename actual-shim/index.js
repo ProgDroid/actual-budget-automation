@@ -1,5 +1,17 @@
 'use strict';
 
+// stdout is this shim's single-message JSON protocol channel back to the Rust
+// caller. @actual-app/api logs verbose "[Breadcrumb]" lines via console.log
+// (verboseMode defaults to true) and may otherwise write to stdout, which would
+// corrupt the response ("shim output not valid JSON: [Breadcrumb] ..."). The
+// "Closing budget" breadcrumb fires inside api.shutdown() on every call, so this
+// affects success responses too, not just errors. Reserve the real stdout for the
+// final JSON envelope only and route all other writes (console.* and any direct
+// stdout writes) to stderr, which the Rust side already captures as diagnostics.
+const realStdoutWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = process.stderr.write.bind(process.stderr);
+
+const fs = require('fs');
 const api = require('@actual-app/api');
 
 const READ_ONLY = process.argv.includes('--read-only');
@@ -55,7 +67,16 @@ async function handle(req) {
   try {
     const raw = await readStdin();
     const req = JSON.parse(raw);
-    await api.init({ dataDir: DATA_DIR, serverURL: SERVER_URL, password: PASSWORD });
+    // Actual's init() does not create dataDir; it scandir's it and throws ENOENT
+    // if missing. The bind-mounted /data exists (writable by uid 1000) but the
+    // actual-cache subdir is never pre-created by the deploy, so ensure it here.
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    await api.init({
+      dataDir: DATA_DIR,
+      serverURL: SERVER_URL,
+      password: PASSWORD,
+      verbose: false,
+    });
     await api.downloadBudget(SYNC_ID);
     const data = await handle(req);
     response = { ok: true, data };
@@ -70,6 +91,6 @@ async function handle(req) {
       /* ignore shutdown errors */
     }
   }
-  process.stdout.write(JSON.stringify(response));
+  realStdoutWrite(JSON.stringify(response));
   process.exit(response.ok ? 0 : 1);
 })();
