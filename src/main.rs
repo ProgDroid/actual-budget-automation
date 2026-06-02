@@ -2,6 +2,7 @@ mod actual;
 mod banks;
 mod claude;
 mod config;
+mod http;
 mod lock;
 mod matching;
 mod notify;
@@ -68,7 +69,15 @@ async fn main() -> Result<()> {
                 return Ok(());
             };
             let mut state = State::load(&cfg.state_path)?;
-            poll(&cfg, &mut state, &channel).await?;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                poll(&cfg, &mut state, &channel),
+            )
+            .await
+            {
+                Ok(res) => { res?; }
+                Err(_) => return Err(anyhow::anyhow!("poll timed out after 600s")),
+            }
             Ok(())
         }
         Command::Run { dry_run } => {
@@ -90,9 +99,9 @@ async fn main() -> Result<()> {
             let claude = HttpClaude::new(cfg.anthropic_api_key.clone(), cfg.claude_model.clone());
             let notifier = HttpApprise::new(cfg.apprise_url.clone());
             let channel = build_channel(&cfg);
-            let autoimport = Confidence::parse(&cfg.autoimport_confidence);
+            let autoimport = Confidence::from_env_str(&cfg.autoimport_confidence)?;
 
-            run::run(
+            match tokio::time::timeout(std::time::Duration::from_secs(600), run::run(
                 &cfg,
                 dry_run,
                 &mut state,
@@ -104,8 +113,12 @@ async fn main() -> Result<()> {
                     .as_ref()
                     .map(|c| c as &dyn crate::telegram::ConfirmChannel),
                 autoimport,
-            )
+            ))
             .await
+            {
+                Ok(res) => res,
+                Err(_) => Err(anyhow::anyhow!("run timed out after 600s")),
+            }
         }
     }
 }

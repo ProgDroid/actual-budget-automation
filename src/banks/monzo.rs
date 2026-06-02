@@ -60,7 +60,7 @@ impl Monzo {
         monzo: MonzoState,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::client(std::time::Duration::from_secs(30)),
             client_id,
             client_secret,
             base_url,

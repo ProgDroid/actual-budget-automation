@@ -60,7 +60,9 @@ async function handle(req) {
     const data = await handle(req);
     response = { ok: true, data };
   } catch (e) {
-    response = { ok: false, error: String((e && e.message) || e) };
+    let msg = String((e && e.message) || e);
+    if (PASSWORD) msg = msg.split(PASSWORD).join('***');
+    response = { ok: false, error: msg };
   } finally {
     try {
       await api.shutdown();

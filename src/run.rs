@@ -1,6 +1,6 @@
 //! Run pipeline and auth bootstrap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use chrono::{NaiveDate, Utc};
@@ -56,6 +56,7 @@ pub fn apply_matches(
     txs: &[RawTransaction],
     matches: &[PayeeMatch],
     autoimport: Confidence,
+    existing: &BTreeSet<&str>,
 ) -> MatchOutcome {
     let lookup: BTreeMap<&str, &PayeeMatch> = matches.iter().map(|m| (m.raw.as_str(), m)).collect();
     let mut matched = Vec::new();
@@ -64,7 +65,13 @@ pub fn apply_matches(
     for tx in txs {
         match lookup.get(tx.raw_merchant.as_str()) {
             Some(m) => match &m.payee {
-                Some(payee) if m.confidence.rank() >= autoimport.rank() => {
+                // Auto-import only a confident match to a payee that ACTUALLY
+                // exists in Actual — otherwise it would be silently dropped at
+                // import (no payee id), so hold it for review instead.
+                Some(payee)
+                    if m.confidence.rank() >= autoimport.rank()
+                        && existing.contains(payee.as_str()) =>
+                {
                     matched.push((tx.external_id.clone(), payee.clone()))
                 }
                 Some(payee) => proposed.push((tx.clone(), payee.clone(), m.confidence)),
@@ -88,17 +95,29 @@ fn schedules_from_rows(rows: Vec<ScheduleRow>, payees: &[Payee]) -> Vec<Schedule
         .collect();
     rows.into_iter()
         .filter_map(|r| {
-            let date = NaiveDate::parse_from_str(r.date.as_deref()?, "%Y-%m-%d").ok()?;
-            let payee = r
+            let Some(date_str) = r.date.as_deref() else {
+                warn!("schedule dropped: missing date (payee_id={:?})", r.payee_id);
+                return None;
+            };
+            let date = match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("schedule dropped: unparseable date '{date_str}': {e}");
+                    return None;
+                }
+            };
+            let Some(payee) = r
                 .payee_id
                 .as_deref()
                 .and_then(|id| by_id.get(id).copied())
-                .unwrap_or("")
-                .to_string();
+            else {
+                warn!("schedule dropped: payee_id {:?} not in payee list", r.payee_id);
+                return None;
+            };
             Some(Schedule {
                 amount: r.amount,
                 date,
-                payee,
+                payee: payee.to_string(),
             })
         })
         .collect()
@@ -141,7 +160,7 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
             let conf = entry.confidence.as_deref().unwrap_or("medium");
             Prompt {
                 chat_text: format!(
-                    "`{}` → *{}*?  _({} confidence)_\nReply with a different payee to remap.",
+                    "'{}' -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
                     entry.raw_merchant, s, conf
                 ),
                 buttons: buttons(&[
@@ -153,14 +172,14 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
         }
         Some(s) => Prompt {
             chat_text: format!(
-                "No existing payee *{}*. Create it?\nOr reply with a payee name.",
+                "No existing payee '{}'. Create it?\nOr reply with a payee name.",
                 s
             ),
             buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
         },
         None => Prompt {
             chat_text: format!(
-                "New merchant `{}` — which payee?\nReply with a payee name, or:",
+                "New merchant '{}' — which payee?\nReply with a payee name, or:",
                 entry.raw_merchant
             ),
             buttons: buttons(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")]),
@@ -204,6 +223,10 @@ pub async fn run(
     let since = state
         .last_run
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
+    // Cursor for a successful run: stamp BEFORE fetching so a transaction that
+    // arrives mid-run is re-fetched next time (dedup covers the overlap) rather
+    // than falling into a gap and being lost (M1).
+    let fetch_start = Utc::now();
     let fetched = bank.fetch_since(since).await.map_err(|e| match e {
         BankError::Other(e) => e,
         BankError::AuthExpired(m) => anyhow::anyhow!("auth expired mid-fetch: {m}"),
@@ -272,7 +295,8 @@ pub async fn run(
         .filter(|tx| !state.payee_cache.contains_key(&tx.raw_merchant))
         .cloned()
         .collect();
-    let outcome = apply_matches(&unknown_txs, &claude_matches, autoimport);
+    let existing: BTreeSet<&str> = payee_names.iter().map(String::as_str).collect();
+    let outcome = apply_matches(&unknown_txs, &claude_matches, autoimport, &existing);
 
     // 6. Assemble import rows (payee NAME -> id; never auto-create on the matched path).
     let mut import_rows: Vec<ImportTxn> = Vec::new();
@@ -299,9 +323,18 @@ pub async fn run(
             payee_id_for(&payees, payee_name),
         ) {
             (Some(tx), Some(pid)) => push_row(&mut import_rows, tx, pid),
-            (Some(_), None) => warn!(
-                "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; skipping (re-resolve it)"
-            ),
+            (Some(tx), None) => {
+                warn!(
+                    "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; holding for review"
+                );
+                let date = tx.date.format("%Y-%m-%d").to_string();
+                if state.add_pending_full(
+                    &tx.external_id, &tx.raw_merchant, tx.amount_minor, &date,
+                    Some(payee_name.clone()), None,
+                ) {
+                    held += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -321,9 +354,20 @@ pub async fn run(
                     newly_cached.push((tx.raw_merchant.clone(), payee_name.clone()));
                 }
             }
-            (Some(_), None) => warn!(
-                "matched payee '{payee_name}' for tx {ext_id} not found in Actual payee list; skipping"
-            ),
+            (Some(tx), None) => {
+                // Defensive: apply_matches guarantees matched payees exist. If
+                // this ever fires, hold for review rather than dropping (fail-loud).
+                warn!(
+                    "matched payee '{payee_name}' for tx {ext_id} unexpectedly missing; holding for review"
+                );
+                let date = tx.date.format("%Y-%m-%d").to_string();
+                if state.add_pending_full(
+                    &tx.external_id, &tx.raw_merchant, tx.amount_minor, &date,
+                    Some(payee_name.clone()), None,
+                ) {
+                    held += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -428,7 +472,7 @@ pub async fn run(
         summary.added, summary.updated
     );
 
-    state.last_run = Some(Utc::now());
+    state.last_run = Some(fetch_start);
 
     // Send a prompt for every held entry that hasn't been prompted yet.
     if let Some(ch) = channel {
@@ -443,7 +487,13 @@ pub async fn run(
         for i in to_prompt {
             let prompt = build_prompt(&state.pending_reviews[i], &payee_names);
             match ch.send_prompt(&prompt).await {
-                Ok(message_id) => state.pending_reviews[i].telegram_message_id = Some(message_id),
+                Ok(message_id) => {
+                    state.pending_reviews[i].telegram_message_id = Some(message_id);
+                    // Persist now so a later failure can't strand this id (M6).
+                    if let Err(e) = state.save(&cfg.state_path) {
+                        warn!("failed to persist telegram_message_id (may re-prompt next run): {e}");
+                    }
+                }
                 Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
             }
         }
@@ -534,7 +584,7 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     ));
 
     // Exchange code for tokens.
-    let http = reqwest::Client::new();
+    let http = crate::http::client(std::time::Duration::from_secs(30));
     let resp = http
         .post(format!("{}/oauth2/token", cfg.monzo_base_url))
         .form(&[
@@ -588,7 +638,7 @@ pub(crate) mod tests {
     use crate::telegram::{ConfirmChannel, Prompt, Reply};
     use async_trait::async_trait;
     use chrono::{DateTime, NaiveDate, Utc};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -700,7 +750,8 @@ pub(crate) mod tests {
                 confidence: Confidence::Low,
             },
         ];
-        let outcome = apply_matches(&txs, &matches, Confidence::High);
+        let existing: BTreeSet<&str> = ["Tesco", "Local Cafe"].iter().copied().collect();
+        let outcome = apply_matches(&txs, &matches, Confidence::High, &existing);
         assert_eq!(
             outcome.matched,
             vec![("1".to_string(), "Tesco".to_string())]
@@ -730,7 +781,8 @@ pub(crate) mod tests {
             telegram_message_id: None,
         };
         let p = build_prompt(&proposed, &payees);
-        assert!(p.chat_text.contains("Local Cafe"));
+        assert!(p.chat_text.contains("'Local Cafe'"), "expected plain-text quoting: {}", p.chat_text);
+        assert!(!p.chat_text.contains("*Local Cafe*"), "must not use Markdown bold for payee: {}", p.chat_text);
         assert_eq!(p.buttons.len(), 3);
         assert_eq!(p.buttons[0].1, "cf:tx1");
 
@@ -1428,6 +1480,67 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             state.pending_reviews[0].suggestion.as_deref(),
             Some("Nonexistent Payee")
         );
+    }
+
+    #[tokio::test]
+    async fn high_confidence_match_to_nonexistent_payee_is_held_not_dropped() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim); // get_payees -> [Local Cafe]
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_ghost", "SQ *GHOST", -999)],
+        };
+        // Claude returns a HIGH-confidence payee that does NOT exist in Actual.
+        let claude = FakeClaude {
+            out: vec![PayeeMatch {
+                raw: "SQ *GHOST".into(),
+                payee: Some("Ghost Payee".into()),
+                confidence: Confidence::High,
+            }],
+        };
+        run(
+            &cfg, false, &mut state, &mut bank, &actual, &claude, &notifier,
+            Some(&channel as &dyn ConfirmChannel), Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Not imported...
+        assert!(!imports_log.exists(), "non-existent payee must NOT be imported");
+        // ...held for review with the proposed name as the suggestion...
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert_eq!(state.pending_reviews[0].external_id, "tx_ghost");
+        assert_eq!(
+            state.pending_reviews[0].suggestion.as_deref(),
+            Some("Ghost Payee")
+        );
+        // ...and last_run still advanced (the tx is safely held, not lost).
+        assert!(state.last_run.is_some());
+    }
+
+    #[test]
+    fn schedules_from_rows_drops_bad_date_and_missing_payee_loudly() {
+        let payees = vec![Payee { id: "p1".into(), name: "Rent Co".into() }];
+        let rows = vec![
+            // good
+            ScheduleRow { date: Some("2026-06-01".into()), amount: Some(-1000), payee_id: Some("p1".into()) },
+            // bad date -> dropped
+            ScheduleRow { date: Some("not-a-date".into()), amount: Some(-1000), payee_id: Some("p1".into()) },
+            // missing date -> dropped
+            ScheduleRow { date: None, amount: Some(-1000), payee_id: Some("p1".into()) },
+            // payee not in list -> dropped
+            ScheduleRow { date: Some("2026-06-02".into()), amount: Some(-1000), payee_id: Some("nope".into()) },
+        ];
+        let schedules = super::schedules_from_rows(rows, &payees);
+        assert_eq!(schedules.len(), 1, "only the fully-valid row survives");
+        assert_eq!(schedules[0].payee, "Rent Co");
     }
 
     #[test]

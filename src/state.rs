@@ -20,12 +20,24 @@ pub struct State {
     pub telegram: TelegramState,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Default, PartialEq, Serialize, Deserialize)]
 pub struct MonzoState {
     #[serde(default)]
     pub refresh_token: String,
     #[serde(default)]
     pub account_id: String,
+}
+
+impl std::fmt::Debug for MonzoState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonzoState")
+            .field(
+                "refresh_token",
+                &if self.refresh_token.is_empty() { "<empty>" } else { "***" },
+            )
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -71,17 +83,23 @@ impl State {
         }
     }
 
-    /// Atomic write: write to a temp sibling then rename.
+    /// Atomic write: write to a temp file in the target directory, then persist
+    /// (rename) over the destination. Same-dir temp avoids cross-filesystem
+    /// EXDEV rename failures.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        use std::io::Write as _;
         let body = toml::to_string_pretty(self)?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, path)?;
+        let dir = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(p) => {
+                std::fs::create_dir_all(p)?;
+                p.to_path_buf()
+            }
+            None => std::path::PathBuf::from("."),
+        };
+        let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+        tmp.write_all(body.as_bytes())?;
+        tmp.flush()?;
+        tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
     }
 
@@ -380,6 +398,14 @@ mod tests {
         assert_eq!(p.suggestion.as_deref(), Some("Local Cafe"));
         assert_eq!(p.confidence.as_deref(), Some("low"));
         assert!(p.telegram_message_id.is_none());
+    }
+
+    #[test]
+    fn monzo_state_debug_redacts_refresh_token() {
+        let m = MonzoState { refresh_token: "SECRET_RT".into(), account_id: "acc_1".into() };
+        let s = format!("{m:?}");
+        assert!(!s.contains("SECRET_RT"), "refresh_token must be redacted: {s}");
+        assert!(s.contains("acc_1"), "account_id is fine to show");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
@@ -39,7 +39,7 @@ pub enum AuthCommand {
     Monzo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub anthropic_api_key: String,
     pub claude_model: String,
@@ -98,6 +98,33 @@ impl Config {
     }
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("anthropic_api_key", &"***")
+            .field("claude_model", &self.claude_model)
+            .field("monzo_client_id", &self.monzo_client_id)
+            .field("monzo_client_secret", &"***")
+            .field("monzo_redirect_uri", &self.monzo_redirect_uri)
+            .field("apprise_url", &"***")
+            .field("actual_server_url", &self.actual_server_url)
+            .field("actual_password", &"***")
+            .field("actual_sync_id", &self.actual_sync_id)
+            .field("state_path", &self.state_path)
+            .field("shim_dir", &self.shim_dir)
+            .field("monzo_base_url", &self.monzo_base_url)
+            .field(
+                "telegram_bot_token",
+                &self.telegram_bot_token.as_ref().map(|_| "***"),
+            )
+            .field("telegram_chat_id", &self.telegram_chat_id)
+            .field("autoimport_confidence", &self.autoimport_confidence)
+            .field("lock_path", &self.lock_path)
+            .field("telegram_base_url", &self.telegram_base_url)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +149,35 @@ mod tests {
         assert_eq!(c.claude_model, "claude-sonnet-4-6");
         assert_eq!(c.actual_server_url, "http://actual:5006");
         assert_eq!(c.state_path.to_string_lossy(), "/data/aba.state.toml");
+    }
+
+    #[test]
+    fn config_debug_redacts_secrets() {
+        let cfg = Config::from_getter(|k| match k {
+            "ANTHROPIC_API_KEY" => Some("AK_SECRET".into()),
+            "MONZO_CLIENT_ID" => Some("cid".into()),
+            "MONZO_CLIENT_SECRET" => Some("CS_SECRET".into()),
+            "MONZO_REDIRECT_URI" => Some("http://localhost/cb".into()),
+            "APPRISE_URL" => Some("tgram://APP_SECRET/123".into()),
+            "ACTUAL_SERVER_URL" => Some("http://actual".into()),
+            "ACTUAL_PASSWORD" => Some("PW_SECRET".into()),
+            "ACTUAL_SYNC_ID" => Some("sync".into()),
+            "ABA_STATE_PATH" => Some("/tmp/s.toml".into()),
+            "TELEGRAM_BOT_TOKEN" => Some("BOT_SECRET".into()),
+            _ => None,
+        })
+        .unwrap();
+        let s = format!("{cfg:?}");
+        for secret in [
+            "AK_SECRET",
+            "CS_SECRET",
+            "PW_SECRET",
+            "APP_SECRET",
+            "BOT_SECRET",
+        ] {
+            assert!(!s.contains(secret), "secret {secret} leaked in Debug: {s}");
+        }
+        assert!(s.contains("cid"), "non-secret client id should show");
     }
 
     #[test]

@@ -154,7 +154,6 @@ pub fn build_send_request(prompt: &Prompt, chat_id: i64) -> Value {
     let mut body = json!({
         "chat_id": chat_id,
         "text": prompt.chat_text,
-        "parse_mode": "Markdown",
     });
     if !prompt.buttons.is_empty() {
         let row: Vec<Value> = prompt
@@ -177,7 +176,7 @@ pub struct HttpTelegram {
 impl HttpTelegram {
     pub fn new(token: String, chat_id: i64) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::client(std::time::Duration::from_secs(30)),
             token,
             chat_id,
             base_url: "https://api.telegram.org".to_string(),
@@ -221,7 +220,7 @@ impl ConfirmChannel for HttpTelegram {
             )
         })?;
         if !status.is_success() {
-            return Err(anyhow!("telegram error {status}: {value}"));
+            return Err(anyhow!("telegram error {status}: {}", self.redact(value.to_string())));
         }
         let parsed = parse_get_updates(&value["result"], self.chat_id, msg_map);
 
@@ -270,7 +269,7 @@ impl ConfirmChannel for HttpTelegram {
             )
         })?;
         if !status.is_success() {
-            return Err(anyhow!("telegram error {status}: {value}"));
+            return Err(anyhow!("telegram error {status}: {}", self.redact(value.to_string())));
         }
         value["result"]["message_id"]
             .as_i64()
@@ -303,7 +302,7 @@ impl ConfirmChannel for HttpTelegram {
             )
         })?;
         if !status.is_success() {
-            return Err(anyhow!("telegram error {status}: {value}"));
+            return Err(anyhow!("telegram error {status}: {}", self.redact(value.to_string())));
         }
         Ok(())
     }
@@ -407,6 +406,7 @@ mod tests {
         assert_eq!(kb[0]["text"], "✅ Confirm");
         assert_eq!(kb[0]["callback_data"], "cf:tx1");
         assert_eq!(kb[1]["callback_data"], "sk:tx1");
+        assert!(body.get("parse_mode").is_none(), "prompts must be plain text");
     }
 
     #[test]
@@ -604,5 +604,22 @@ mod tests {
             !chain.contains("SUPERSECRETTOKEN"),
             "token leaked in send_prompt error chain: {chain}"
         );
+    }
+
+    #[tokio::test]
+    async fn telegram_error_body_is_redacted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botSUPERSECRET/sendMessage"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({ "ok": false, "description": "bad", "leaked": "SUPERSECRET" }),
+            ))
+            .mount(&server)
+            .await;
+        let tg = HttpTelegram::new("SUPERSECRET".into(), 42).with_base_url(server.uri());
+        let prompt = Prompt { chat_text: "hi".into(), buttons: vec![] };
+        let err = tg.send_prompt(&prompt).await.expect_err("400 should error");
+        let chain = format!("{err:#}");
+        assert!(!chain.contains("SUPERSECRET"), "token must be redacted: {chain}");
     }
 }
