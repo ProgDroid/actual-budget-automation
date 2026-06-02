@@ -53,6 +53,7 @@ pub trait ConfirmChannel: Send + Sync {
     async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64>;
 }
 
+#[must_use]
 pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
     let s = format!("{action}:{entry_key}");
     // Telegram caps callback_data at 64 bytes; `str::len` is the byte length.

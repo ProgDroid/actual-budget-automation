@@ -118,7 +118,7 @@ fn payee_id_for<'a>(payees: &'a [Payee], name: &str) -> Option<&'a str> {
 /// - suggestion NOT in payees   -> "No payee 'x'. Create it?" [Create][Skip]
 /// - no suggestion              -> "New merchant raw — which payee?" [Create new][Skip]
 ///
-/// If the entry's external_id is too long to fit Telegram's 64-byte
+/// If the entry's `external_id` is too long to fit Telegram's 64-byte
 /// `callback_data` cap, the keyboard is dropped entirely (every button shares
 /// the same key, so it is all-or-nothing); the user resolves via a free-text
 /// reply, which is correlated by `telegram_message_id` instead.
@@ -131,7 +131,7 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
         specs
             .iter()
             .map(|(label, action)| {
-                encode_callback(action, key).map(|data| ((*label).to_string(), data))
+                encode_callback(action, key).map(|data| (label.to_string(), data))
             })
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
