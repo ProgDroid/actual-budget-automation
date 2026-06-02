@@ -459,4 +459,38 @@ mod tests {
         assert_eq!(txs.len(), 61);
         assert_eq!(txs[60].external_id, "tx_100");
     }
+
+    #[tokio::test]
+    async fn fetch_aborts_when_pagination_exceeds_cap() {
+        let server = MockServer::start().await;
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+
+        // Every request returns a full page of 100, so the walk never reaches a
+        // short final page. With no `since` matcher this responds to all cursors.
+        let mut full = Vec::new();
+        for i in 0..100 {
+            full.push(serde_json::json!({
+                "id": format!("tx_{i}"),
+                "created": "2026-05-30T08:15:00Z",
+                "amount": -100,
+                "description": "X",
+                "decline_reason": null,
+                "merchant": null
+            }));
+        }
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "transactions": full })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        m.set_max_pages_for_test(3);
+        let err = m.fetch_since(since).await.unwrap_err();
+
+        assert!(matches!(err, BankError::Other(_)));
+    }
 }
