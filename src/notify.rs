@@ -18,7 +18,7 @@ pub struct HttpApprise {
 impl HttpApprise {
     pub fn new(url: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::client(std::time::Duration::from_secs(15)),
             url,
         }
     }

@@ -150,7 +150,7 @@ pub struct HttpClaude {
 impl HttpClaude {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::client(std::time::Duration::from_secs(120)),
             api_key,
             model,
             base_url: "https://api.anthropic.com".to_string(),

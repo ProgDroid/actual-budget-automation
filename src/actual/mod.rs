@@ -51,6 +51,7 @@ impl ActualClient {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.script_args)
             .current_dir(&self.cwd)
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -67,7 +68,16 @@ impl ActualClient {
             stdin.write_all(&payload).await?;
             stdin.shutdown().await?;
         }
-        let output = child.wait_with_output().await.context("shim wait failed")?;
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(res) => res.context("shim wait failed")?,
+            // Future dropped here -> child dropped -> killed via kill_on_drop.
+            Err(_) => return Err(anyhow!("shim timed out after 120s")),
+        };
         let parsed: ShimResponse<T> =
             serde_json::from_slice(&output.stdout).with_context(|| {
                 format!(

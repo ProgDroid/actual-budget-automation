@@ -177,7 +177,7 @@ pub struct HttpTelegram {
 impl HttpTelegram {
     pub fn new(token: String, chat_id: i64) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::client(std::time::Duration::from_secs(30)),
             token,
             chat_id,
             base_url: "https://api.telegram.org".to_string(),

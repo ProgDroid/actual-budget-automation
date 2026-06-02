@@ -534,7 +534,7 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     ));
 
     // Exchange code for tokens.
-    let http = reqwest::Client::new();
+    let http = crate::http::client(std::time::Duration::from_secs(30));
     let resp = http
         .post(format!("{}/oauth2/token", cfg.monzo_base_url))
         .form(&[
