@@ -20,12 +20,24 @@ pub struct State {
     pub telegram: TelegramState,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Default, PartialEq, Serialize, Deserialize)]
 pub struct MonzoState {
     #[serde(default)]
     pub refresh_token: String,
     #[serde(default)]
     pub account_id: String,
+}
+
+impl std::fmt::Debug for MonzoState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonzoState")
+            .field(
+                "refresh_token",
+                &if self.refresh_token.is_empty() { "<empty>" } else { "***" },
+            )
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -380,6 +392,14 @@ mod tests {
         assert_eq!(p.suggestion.as_deref(), Some("Local Cafe"));
         assert_eq!(p.confidence.as_deref(), Some("low"));
         assert!(p.telegram_message_id.is_none());
+    }
+
+    #[test]
+    fn monzo_state_debug_redacts_refresh_token() {
+        let m = MonzoState { refresh_token: "SECRET_RT".into(), account_id: "acc_1".into() };
+        let s = format!("{m:?}");
+        assert!(!s.contains("SECRET_RT"), "refresh_token must be redacted: {s}");
+        assert!(s.contains("acc_1"), "account_id is fine to show");
     }
 
     #[test]
