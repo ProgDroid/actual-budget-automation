@@ -15,10 +15,32 @@ use clap::Parser;
 
 use crate::actual::ActualClient;
 use crate::banks::monzo::Monzo;
-use crate::claude::HttpClaude;
+use crate::claude::{Confidence, HttpClaude};
 use crate::config::{AuthCommand, Cli, Command, Config};
+use crate::lock::{lock_blocking, lock_try};
 use crate::notify::HttpApprise;
+use crate::poll::poll;
 use crate::state::State;
+use crate::telegram::HttpTelegram;
+
+fn build_channel(cfg: &Config) -> Option<HttpTelegram> {
+    match (
+        cfg.telegram_bot_token.as_ref(),
+        cfg.telegram_chat_id.as_ref(),
+    ) {
+        (Some(tok), Some(chat)) => match chat.parse::<i64>() {
+            Ok(chat_id) => Some(
+                HttpTelegram::new(tok.clone(), chat_id)
+                    .with_base_url(cfg.telegram_base_url.clone()),
+            ),
+            Err(_) => {
+                tracing::warn!("TELEGRAM_CHAT_ID is not a valid integer; Telegram disabled");
+                None
+            }
+        },
+        _ => None,
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,9 +57,22 @@ async fn main() -> Result<()> {
         Command::Auth {
             which: AuthCommand::Monzo,
         } => run::auth_monzo(&cfg).await,
-        // Temporary stub — real dispatch wired in Task 11.
-        Command::Poll => unimplemented!("poll wired in Task 11"),
+        Command::Poll => {
+            let Some(channel) = build_channel(&cfg) else {
+                tracing::info!("Telegram not configured; poll is a no-op");
+                return Ok(());
+            };
+            // Try-lock: if `run` (or another poll) holds it, skip this tick.
+            let Some(_lock) = lock_try(&cfg.lock_path)? else {
+                tracing::info!("state locked by another process; skipping this poll");
+                return Ok(());
+            };
+            let mut state = State::load(&cfg.state_path)?;
+            poll(&cfg, &mut state, &channel).await?;
+            Ok(())
+        }
         Command::Run { dry_run } => {
+            let _lock = lock_blocking(&cfg.lock_path)?;
             let mut state = State::load(&cfg.state_path)?;
             let mut bank = Monzo::new(
                 cfg.monzo_client_id.clone(),
@@ -54,6 +89,8 @@ async fn main() -> Result<()> {
             );
             let claude = HttpClaude::new(cfg.anthropic_api_key.clone(), cfg.claude_model.clone());
             let notifier = HttpApprise::new(cfg.apprise_url.clone());
+            let channel = build_channel(&cfg);
+            let autoimport = Confidence::parse(&cfg.autoimport_confidence);
 
             run::run(
                 &cfg,
@@ -63,8 +100,10 @@ async fn main() -> Result<()> {
                 &actual,
                 &claude,
                 &notifier,
-                None,
-                crate::claude::Confidence::parse(&cfg.autoimport_confidence),
+                channel
+                    .as_ref()
+                    .map(|c| c as &dyn crate::telegram::ConfirmChannel),
+                autoimport,
             )
             .await
         }
