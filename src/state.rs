@@ -83,17 +83,23 @@ impl State {
         }
     }
 
-    /// Atomic write: write to a temp sibling then rename.
+    /// Atomic write: write to a temp file in the target directory, then persist
+    /// (rename) over the destination. Same-dir temp avoids cross-filesystem
+    /// EXDEV rename failures.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        use std::io::Write as _;
         let body = toml::to_string_pretty(self)?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, path)?;
+        let dir = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(p) => {
+                std::fs::create_dir_all(p)?;
+                p.to_path_buf()
+            }
+            None => std::path::PathBuf::from("."),
+        };
+        let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+        tmp.write_all(body.as_bytes())?;
+        tmp.flush()?;
+        tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
     }
 

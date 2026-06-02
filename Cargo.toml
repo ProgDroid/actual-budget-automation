@@ -25,8 +25,8 @@ url = "2"
 tiny_http = "0.12"
 webbrowser = "1"
 getrandom = "0.3"
+tempfile = "3"
 
 [dev-dependencies]
 wiremock = "0.6"
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "test-util"] }
