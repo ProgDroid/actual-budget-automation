@@ -99,7 +99,14 @@ Requires test doubles for `BankSource`, `ClaudeMatcher`, `Notifier`, and a fake
   read post-mutation state and always printed `0`; review caught it, fix reuses
   `held`.)
 
-## 6. Operational notes (not code, but easy to forget)
+## 6. Operational notes (not code, but easy to forget) — DONE (2026-06-02)
+
+**Documented** in `docs/RUNBOOK.md` (spec/plan at
+`docs/superpowers/specs|plans/2026-06-02-backlog-6-7.md`). Both notes are now in
+the runbook: the uid-1000 volume-ownership step (`chown -R 1000:1000 /srv/aba`)
+sits at the top of the "Daily run" section, and the prompt-caching cadence
+caveat is a new "Operational notes" subsection. Docs-only by decision (no
+`chown` automation script). Original notes retained below.
 
 - The runtime container runs as the non-root `node` user (uid 1000). The mounted
   `/data` volume (state file + `ACTUAL_DATA_DIR`) must be **writable by uid 1000**
@@ -112,16 +119,22 @@ Requires test doubles for `BankSource`, `ClaudeMatcher`, `Notifier`, and a fake
 ## 7. Telegram confirm loop (#1) — post-implementation follow-ups
 
 Item #1 is **implemented** (see `docs/superpowers/specs|plans/2026-06-01-telegram-confirm-loop-*.md`).
-Small follow-ups surfaced by the final review, deferred by decision:
+Small follow-ups surfaced by the final review (spec/plan for the fixes at
+`docs/superpowers/specs|plans/2026-06-02-backlog-6-7.md`):
 
-- **`encode_callback` `debug_assert!(len <= 64)`** (`src/telegram.rs`): Monzo external_ids
-  (~30 chars) stay well under Telegram's 64-byte `callback_data` cap, but a longer-id
-  source (e.g. GoCardless, item #2) could exceed it and panic in debug/test builds.
-  Replace the `debug_assert!` with truncation or a `Result` **before** wiring GoCardless.
-- **Stale Telegram prompt on failed remap** (`src/run.rs` remap-normalisation): when a
-  free-text remap doesn't fuzzy-match and the entry is re-held, `telegram_message_id` is
-  cleared so a fresh "create it?" prompt is sent — but the previous inline-keyboard
-  message lingers in the chat with still-valid buttons. Harmless single-user; optional
-  cleanup via `editMessageText`/`deleteMessage`. Low priority.
+- **`encode_callback` `debug_assert!(len <= 64)`** (`src/telegram.rs`) — **DONE (2026-06-02)**.
+  `encode_callback` now returns `Option<String>` (`None` when `<action>:<key>` exceeds
+  64 bytes). `build_prompt` drops the entire inline keyboard when the key won't fit
+  (all-or-nothing, since every button shares the key); the held entry stays resolvable
+  via free-text reply (correlated by `telegram_message_id`) and the state-file fire-exit.
+  `build_send_request` now omits `reply_markup` entirely when there are no buttons
+  (it previously emitted an empty `[[]]` keyboard that real Telegram rejects).
+- **Stale Telegram prompt on failed remap** (`src/run.rs` remap-normalisation) —
+  **DONE (2026-06-02)**. The `None` arm now best-effort `editMessageText`s the superseded
+  prompt to a plain-text breadcrumb before clearing `telegram_message_id`, so its old
+  buttons can't be tapped. Sent as plain text (no `parse_mode`) so a user remap containing
+  Markdown specials can't 400 the edit and silently leave the buttons live. A failed edit
+  only `warn!`s; it never aborts the run.
 - The `create_payee`→`import` transactional hazard (item #4) is now also reachable via the
-  Telegram create-new flow — address with #4.
+  Telegram create-new flow — **resolved under #4** (concluded self-healing: the review
+  survives on disk, so a failed import retries cleanly next run).
