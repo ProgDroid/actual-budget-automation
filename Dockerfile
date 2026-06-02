@@ -1,6 +1,10 @@
 # --- Rust build stage ---
-# Digest resolved 2026-06-02 via: docker buildx imagetools inspect rust:1-slim
-FROM rust:1-slim@sha256:26abcef3d79b8d890c4ceb17093154573e1f6479cf6dd7c1450043b8458350f6 AS rust-build
+# Pinned to -bookworm so the build glibc matches the node:22-slim runtime (Debian
+# bookworm, glibc 2.36). Bare `rust:1-slim` tracks the latest Debian (trixie,
+# glibc 2.39), which links symbols the runtime libc lacks: `aba: ... version
+# `GLIBC_2.39' not found`. Keep both stages on the same Debian codename.
+# Digest resolved 2026-06-02 via: docker buildx imagetools inspect rust:1-slim-bookworm
+FROM rust:1-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS rust-build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
