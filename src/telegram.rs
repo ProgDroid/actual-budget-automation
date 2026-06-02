@@ -53,13 +53,13 @@ pub trait ConfirmChannel: Send + Sync {
     async fn send_prompt(&self, prompt: &Prompt) -> anyhow::Result<i64>;
 }
 
-pub fn encode_callback(action: &str, entry_key: &str) -> String {
+pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
     let s = format!("{action}:{entry_key}");
-    debug_assert!(
-        s.len() <= 64,
-        "callback_data exceeds Telegram's 64-byte limit"
-    );
-    s
+    // Telegram caps callback_data at 64 bytes; `str::len` is the byte length.
+    if s.len() > 64 {
+        return None;
+    }
+    Some(s)
 }
 
 pub fn parse_callback(data: &str) -> Option<(String, String)> {
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn callback_roundtrips() {
         let data = encode_callback("cf", "tx_0001");
-        assert_eq!(data, "cf:tx_0001");
+        assert_eq!(data, Some("cf:tx_0001".to_string()));
         assert_eq!(
             parse_callback("cf:tx_0001"),
             Some(("cf".into(), "tx_0001".into()))
@@ -287,6 +287,19 @@ mod tests {
         // empty action or empty key are both rejected
         assert_eq!(parse_callback(":key"), None);
         assert_eq!(parse_callback("code:"), None);
+    }
+
+    #[test]
+    fn encode_callback_rejects_over_64_bytes() {
+        // 62-char key + "cf:" (3) = 65 bytes > 64 -> None.
+        let long_key = "x".repeat(62);
+        assert_eq!(encode_callback("cf", &long_key), None);
+        // 61-char key + "cf:" = 64 bytes exactly -> Some.
+        let max_key = "x".repeat(61);
+        assert_eq!(
+            encode_callback("cf", &max_key),
+            Some(format!("cf:{max_key}"))
+        );
     }
 
     #[test]
