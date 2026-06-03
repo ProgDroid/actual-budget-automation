@@ -274,11 +274,16 @@ aba run
 - Existing `run`/matching/monzo tests updated for the new `RawTransaction`
   field and the `accounts` state shape.
 
+## Decisions locked after spec review (2026-06-03)
+
+- **Override model:** auto-suggest + edit-the-state-file only. No interactive
+  confirm prompt in `aba accounts`.
+- **Pot listing:** `list_pots` **is included** in Phase 1 as informational
+  output of `aba accounts` (printed, flagged "Phase 3 — not linked yet"). Pots
+  are not linked or imported in Phase 1.
+
 ## Open items for the implementation plan
 
 - Exact surfacing of "unmapped source account" in the run summary / notifier.
 - Name-similarity threshold for auto-suggest (start from the payee threshold,
   tune).
-- Whether `list_pots` lands in Phase 1 (informational only) or is deferred with
-  pots entirely — leaning: include the listing, it's cheap and orients the user
-  for Phase 3.
