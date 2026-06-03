@@ -8,13 +8,13 @@ use chrono::{NaiveDate, Utc};
 use tracing::{info, warn};
 
 use crate::actual::ActualClient;
-use crate::actual::shim_protocol::{ImportTxn, Payee, ScheduleRow};
+use crate::actual::shim_protocol::{Category, ImportTxn, Payee, ScheduleRow};
 use crate::banks::{BankError, BankSource, RawTransaction};
 use crate::claude::{Classification, ClaudeMatcher, Confidence};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
 use crate::matching::{Schedule, best_payee_match, matches_scheduled};
 use crate::notify::Notifier;
-use crate::state::{AccountLink, PendingReview, State};
+use crate::state::{AccountLink, ClassifiedHold, PendingReview, State};
 use crate::telegram::{ConfirmChannel, Prompt};
 
 /// Minimum normalised-name similarity for `aba accounts` to auto-link a Monzo
@@ -40,23 +40,37 @@ fn actual_id_for(source_monzo_id: &str, links: &[AccountLink]) -> Option<String>
     }
 }
 
-/// Result of splitting fetched transactions against the payee cache.
+/// Result of splitting fetched transactions against the payee + category caches.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ResolutionPlan {
-    /// (`external_id`, `payee_name`) for cache hits.
-    pub cached: Vec<(String, String)>,
+    /// (`external_id`, `payee_name`, `category_name`) for FULL cache hits.
+    /// Convention: an empty `category_name` String is the "uncategorised"
+    /// sentinel (so `cached[i].2 == ""` means cached as uncategorised).
+    pub cached: Vec<(String, String, String)>,
     /// Distinct raw merchant names that need a Claude lookup.
     pub needs_claude: Vec<String>,
 }
 
-pub fn plan_resolution(txs: &[RawTransaction], cache: &BTreeMap<String, String>) -> ResolutionPlan {
+pub fn plan_resolution(
+    txs: &[RawTransaction],
+    payee_cache: &BTreeMap<String, String>,
+    category_cache: &BTreeMap<String, String>,
+) -> ResolutionPlan {
     let mut cached = Vec::new();
     let mut needs_claude = Vec::new();
     for tx in txs {
-        if let Some(payee) = cache.get(&tx.raw_merchant) {
-            cached.push((tx.external_id.clone(), payee.clone()));
-        } else if !needs_claude.contains(&tx.raw_merchant) {
-            needs_claude.push(tx.raw_merchant.clone());
+        match (
+            payee_cache.get(&tx.raw_merchant),
+            category_cache.get(&tx.raw_merchant),
+        ) {
+            (Some(payee), Some(category)) => {
+                cached.push((tx.external_id.clone(), payee.clone(), category.clone()));
+            }
+            // Payee cached but category not (legacy entry) -> needs Claude.
+            _ if !needs_claude.contains(&tx.raw_merchant) => {
+                needs_claude.push(tx.raw_merchant.clone());
+            }
+            _ => {}
         }
     }
     ResolutionPlan {
@@ -65,53 +79,178 @@ pub fn plan_resolution(txs: &[RawTransaction], cache: &BTreeMap<String, String>)
     }
 }
 
-/// Result of applying Claude matches, split by the auto-import cutoff.
+/// One held transaction with per-dimension state for review.
 #[derive(Debug, PartialEq, Eq)]
-pub struct MatchOutcome {
-    /// (`external_id`, `payee_name`) confident enough to import + cache now.
-    pub matched: Vec<(String, String)>,
-    /// (tx, `suggested_payee`, confidence) held for Telegram confirmation.
-    pub proposed: Vec<(RawTransaction, String, Confidence)>,
-    /// No usable match — held with no suggestion.
-    pub unmatched: Vec<RawTransaction>,
+pub struct HeldClassification {
+    pub tx: RawTransaction,
+    /// `Some(name)` if the payee was confident & exists (pre-settled, no prompt).
+    pub payee_resolved: Option<String>,
+    /// Suggestion to prompt for when the payee is uncertain.
+    pub payee_suggestion: Option<String>,
+    pub payee_confidence: Option<Confidence>,
+    /// `Some(name)` if the category was confident & exists (pre-settled, no prompt).
+    pub category_resolved: Option<String>,
+    /// Suggestion to prompt for when the category is uncertain.
+    pub category_suggestion: Option<String>,
+    pub category_confidence: Option<Confidence>,
 }
 
-// `matches` (input) and `matched` (auto-imported output) are distinct, well-named
-// concepts here despite their lexical similarity.
+/// Result of applying Claude classifications, split by the auto-import cutoff.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MatchOutcome {
+    /// (`external_id`, `payee_name`, `category_name`) confident in BOTH dimensions.
+    /// Convention: an empty `category_name` String is the "uncategorised"
+    /// sentinel (so `matched[i].2 == ""` when no categories exist). Imported now.
+    pub matched: Vec<(String, String, String)>,
+    /// Held: at least one dimension uncertain.
+    pub held: Vec<HeldClassification>,
+}
+
+/// Per-dimension settle state for the category dimension during gating.
+enum CatState {
+    Settled(String),
+    Uncertain,
+}
+
+// `matches` (input) and `matched` (auto-imported output) are distinct concepts
+// despite their lexical similarity.
 #[allow(clippy::similar_names)]
 pub fn apply_matches(
     txs: &[RawTransaction],
     matches: &[Classification],
     autoimport: Confidence,
-    existing: &BTreeSet<&str>,
+    existing_payees: &BTreeSet<&str>,
+    existing_categories: &BTreeSet<&str>,
+    categories_available: bool,
 ) -> MatchOutcome {
     let lookup: BTreeMap<&str, &Classification> =
         matches.iter().map(|m| (m.raw.as_str(), m)).collect();
     let mut matched = Vec::new();
-    let mut proposed = Vec::new();
-    let mut unmatched = Vec::new();
+    let mut held = Vec::new();
     for tx in txs {
-        match lookup.get(tx.raw_merchant.as_str()) {
-            Some(m) => match &m.payee {
-                // Auto-import only a confident match to a payee that ACTUALLY
-                // exists in Actual — otherwise it would be silently dropped at
-                // import (no payee id), so hold it for review instead.
-                Some(payee)
-                    if m.payee_confidence.rank() >= autoimport.rank()
-                        && existing.contains(payee.as_str()) =>
-                {
-                    matched.push((tx.external_id.clone(), payee.clone()));
-                }
-                Some(payee) => proposed.push((tx.clone(), payee.clone(), m.payee_confidence)),
-                None => unmatched.push(tx.clone()),
-            },
-            None => unmatched.push(tx.clone()),
+        let Some(m) = lookup.get(tx.raw_merchant.as_str()) else {
+            // No classification at all -> hold, both dimensions unsettled
+            // (category auto-settled to uncategorised if none exist).
+            held.push(HeldClassification {
+                tx: tx.clone(),
+                payee_resolved: None,
+                payee_suggestion: None,
+                payee_confidence: None,
+                category_resolved: if categories_available {
+                    None
+                } else {
+                    Some(String::new())
+                },
+                category_suggestion: None,
+                category_confidence: None,
+            });
+            continue;
+        };
+
+        // Payee dimension.
+        let payee_ok = m.payee.as_deref().is_some_and(|p| {
+            m.payee_confidence.rank() >= autoimport.rank() && existing_payees.contains(p)
+        });
+
+        // Category dimension. Not applicable (no categories) counts as
+        // settled-uncategorised.
+        let category_state: CatState = if !categories_available {
+            CatState::Settled(String::new())
+        } else if let Some(cat) = m.category.as_deref() {
+            if m.category_confidence.rank() >= autoimport.rank()
+                && existing_categories.contains(cat)
+            {
+                CatState::Settled(cat.to_string())
+            } else {
+                CatState::Uncertain
+            }
+        } else {
+            CatState::Uncertain
+        };
+
+        if let (true, CatState::Settled(cat)) = (payee_ok, &category_state) {
+            // Both confident -> import now.
+            matched.push((
+                tx.external_id.clone(),
+                m.payee.clone().unwrap(),
+                cat.clone(),
+            ));
+        } else {
+            // Hold; pre-settle whichever dimension is confident.
+            let payee_resolved = payee_ok.then(|| m.payee.clone().unwrap());
+            let (payee_suggestion, payee_confidence) = if payee_ok {
+                (None, None)
+            } else {
+                (
+                    m.payee.clone(),
+                    m.payee.as_ref().map(|_| m.payee_confidence),
+                )
+            };
+            let (category_resolved, category_suggestion, category_confidence) =
+                match &category_state {
+                    CatState::Settled(cat) => (Some(cat.clone()), None, None),
+                    CatState::Uncertain => (
+                        None,
+                        m.category.clone(),
+                        m.category.as_ref().map(|_| m.category_confidence),
+                    ),
+                };
+            held.push(HeldClassification {
+                tx: tx.clone(),
+                payee_resolved,
+                payee_suggestion,
+                payee_confidence,
+                category_resolved,
+                category_suggestion,
+                category_confidence,
+            });
         }
     }
-    MatchOutcome {
-        matched,
-        proposed,
-        unmatched,
+    MatchOutcome { matched, held }
+}
+
+/// Map a category name to its id. Returns `None` (→ caller holds, fail-loud) if
+/// the name is unknown OR ambiguous: Actual permits same-named categories in
+/// different groups, and we must not silently pick the wrong one.
+fn category_id_for<'a>(cats: &'a [Category], name: &str) -> Option<&'a str> {
+    let mut matches = cats.iter().filter(|c| c.name == name);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        warn!("category name '{name}' is ambiguous (>1 group); holding for review");
+        return None;
+    }
+    Some(first.id.as_str())
+}
+
+/// Hold a transaction whose source Monzo account is not mapped to an Actual
+/// account (no routing target yet). Payee/category default to unsettled.
+fn hold_unmapped(state: &mut State, tx: &RawTransaction, held: &mut usize) {
+    let date = tx.date.format("%Y-%m-%d").to_string();
+    if state.add_pending(
+        &tx.external_id,
+        &tx.raw_merchant,
+        tx.amount_minor,
+        &date,
+        &tx.source_monzo_id,
+    ) {
+        *held += 1;
+    }
+}
+
+/// Hold a transaction whose cached payee (or category) no longer resolves in
+/// Actual. Preserves the cached payee name as the suggestion for re-confirmation.
+fn hold_cached_missing(state: &mut State, tx: &RawTransaction, payee_name: &str, held: &mut usize) {
+    let date = tx.date.format("%Y-%m-%d").to_string();
+    if state.add_pending_full(
+        &tx.external_id,
+        &tx.raw_merchant,
+        tx.amount_minor,
+        &date,
+        Some(payee_name.to_string()),
+        None,
+        &tx.source_monzo_id,
+    ) {
+        *held += 1;
     }
 }
 
@@ -418,10 +557,17 @@ pub async fn run(
     info!("fetched {} transactions since {since}", fetched.len());
     let fetched_count = fetched.len();
 
-    // 3. Read Actual payees + schedules.
+    // 3. Read Actual payees + schedules + categories. `get_payees` must stay
+    // strictly before `get_categories`: the rotated-token regression test injects
+    // a `get_payees` failure and asserts the run aborts at that earlier point.
     let payees = actual.get_payees().await.context("get_payees")?;
     let schedule_rows = actual.get_scheduled().await.context("get_scheduled")?;
     let schedules = schedules_from_rows(schedule_rows, &payees);
+    let categories = actual.get_categories().await.context("get_categories")?;
+    let category_names: Vec<String> = categories.iter().map(|c| c.name.clone()).collect();
+    // Zero categories => degrade to Phase-1 behavior (category dimension auto-
+    // settles to uncategorised everywhere, never prompts).
+    let categories_available = !category_names.is_empty();
 
     // 4. Drop scheduled matches.
     let candidates: Vec<RawTransaction> = fetched
@@ -460,9 +606,10 @@ pub async fn run(
     // 5a. Apply already-resolved pending reviews from previous runs.
     let resolved = state.take_resolved();
 
-    // 5b. Cache split + Claude for the rest.
-    let plan = plan_resolution(&candidates, &state.payee_cache);
-    let category_names: Vec<String> = Vec::new(); // wired in Task 5
+    // 5b. Cache split + Claude for the rest. A FULL cache hit needs both the
+    // payee AND the category cached; a legacy payee-only entry falls through to
+    // Claude (and the gating path) so its category gets resolved.
+    let plan = plan_resolution(&candidates, &state.payee_cache, &state.category_cache);
     let claude_matches: Vec<Classification> = if plan.needs_claude.is_empty() {
         Vec::new()
     } else {
@@ -471,13 +618,23 @@ pub async fn run(
             .await
             .context("claude classify")?
     };
+    // Everything that was NOT a full cache hit is gated by apply_matches.
+    let cached_ids: BTreeSet<&str> = plan.cached.iter().map(|(id, _, _)| id.as_str()).collect();
     let unknown_txs: Vec<RawTransaction> = candidates
         .iter()
-        .filter(|tx| !state.payee_cache.contains_key(&tx.raw_merchant))
+        .filter(|tx| !cached_ids.contains(tx.external_id.as_str()))
         .cloned()
         .collect();
-    let existing: BTreeSet<&str> = payee_names.iter().map(String::as_str).collect();
-    let outcome = apply_matches(&unknown_txs, &claude_matches, autoimport, &existing);
+    let existing_payees: BTreeSet<&str> = payee_names.iter().map(String::as_str).collect();
+    let existing_cats: BTreeSet<&str> = category_names.iter().map(String::as_str).collect();
+    let outcome = apply_matches(
+        &unknown_txs,
+        &claude_matches,
+        autoimport,
+        &existing_payees,
+        &existing_cats,
+        categories_available,
+    );
 
     // Clone links so the routing closure/holds don't fight the borrow checker
     // against `state` mutations below. Cheap: a handful of entries.
@@ -487,12 +644,23 @@ pub async fn run(
     let mut grouped: BTreeMap<String, Vec<ImportTxn>> = BTreeMap::new();
     let mut held = 0usize;
 
-    let make_row = |tx: &RawTransaction, payee_id: &str| ImportTxn {
+    let make_row = |tx: &RawTransaction, payee_id: &str, category_id: Option<String>| ImportTxn {
         date: tx.date.format("%Y-%m-%d").to_string(),
         amount: tx.amount_minor,
         payee: payee_id.to_string(),
-        category: None,
+        category: category_id,
         imported_id: tx.external_id.clone(),
+    };
+
+    // Resolve a cached/matched category NAME (empty = uncategorised) to a row
+    // `category` value. `Some(_)` = resolved (inner `None` = uncategorised);
+    // outer `None` = the name no longer resolves -> caller must hold (fail-loud).
+    let resolve_cat = |category_name: &str| -> Option<Option<String>> {
+        if category_name.is_empty() {
+            Some(None) // uncategorised, valid
+        } else {
+            category_id_for(&categories, category_name).map(|id| Some(id.to_string()))
+        }
     };
 
     let by_id: BTreeMap<&str, &RawTransaction> = candidates
@@ -500,103 +668,79 @@ pub async fn run(
         .map(|t| (t.external_id.as_str(), t))
         .collect();
 
-    // cached hits
-    for (ext_id, payee_name) in &plan.cached {
+    // cached hits (full: payee + category)
+    for (ext_id, payee_name, category_name) in &plan.cached {
+        let cat_id = resolve_cat(category_name);
         match (
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
+            cat_id,
         ) {
-            (Some(tx), Some(pid)) => {
+            (Some(tx), Some(pid), Some(cat)) => {
                 if let Some(aid) = actual_id_for(&tx.source_monzo_id, &account_links) {
-                    grouped.entry(aid).or_default().push(make_row(tx, pid));
+                    grouped.entry(aid).or_default().push(make_row(tx, pid, cat));
                 } else {
                     warn!(
                         "tx {ext_id} from unmapped Monzo account '{}' — holding (run `aba accounts`)",
                         tx.source_monzo_id
                     );
-                    let date = tx.date.format("%Y-%m-%d").to_string();
-                    if state.add_pending(
-                        &tx.external_id,
-                        &tx.raw_merchant,
-                        tx.amount_minor,
-                        &date,
-                        &tx.source_monzo_id,
-                    ) {
-                        held += 1;
-                    }
+                    hold_unmapped(state, tx, &mut held);
                 }
             }
-            (Some(tx), None) => {
+            (Some(tx), None, _) => {
                 warn!(
                     "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; holding for review"
                 );
-                let date = tx.date.format("%Y-%m-%d").to_string();
-                if state.add_pending_full(
-                    &tx.external_id,
-                    &tx.raw_merchant,
-                    tx.amount_minor,
-                    &date,
-                    Some(payee_name.clone()),
-                    None,
-                    &tx.source_monzo_id,
-                ) {
-                    held += 1;
-                }
+                hold_cached_missing(state, tx, payee_name, &mut held);
+            }
+            (Some(tx), Some(_), None) => {
+                warn!(
+                    "cached category '{category_name}' for tx {ext_id} no longer exists in Actual; holding for review"
+                );
+                hold_cached_missing(state, tx, payee_name, &mut held);
             }
             _ => {}
         }
     }
-    // claude matches
+    // claude matches (both dimensions confident)
     let mut newly_cached: Vec<(String, String)> = Vec::new();
-    for (ext_id, payee_name) in &outcome.matched {
+    for (ext_id, payee_name, category_name) in &outcome.matched {
+        let cat_id = resolve_cat(category_name);
         match (
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
+            cat_id,
         ) {
-            (Some(tx), Some(pid)) => {
+            (Some(tx), Some(pid), Some(cat)) => {
                 if let Some(aid) = actual_id_for(&tx.source_monzo_id, &account_links) {
-                    grouped.entry(aid).or_default().push(make_row(tx, pid));
+                    grouped.entry(aid).or_default().push(make_row(tx, pid, cat));
                     if !state.payee_cache.contains_key(&tx.raw_merchant) {
                         state
                             .payee_cache
                             .insert(tx.raw_merchant.clone(), payee_name.clone());
                         newly_cached.push((tx.raw_merchant.clone(), payee_name.clone()));
                     }
+                    // Only cache a real (non-uncategorised) category.
+                    if !category_name.is_empty() {
+                        state
+                            .category_cache
+                            .insert(tx.raw_merchant.clone(), category_name.clone());
+                    }
                 } else {
                     warn!(
                         "matched tx {ext_id} from unmapped Monzo account '{}' — holding (run `aba accounts`)",
                         tx.source_monzo_id
                     );
-                    let date = tx.date.format("%Y-%m-%d").to_string();
-                    if state.add_pending(
-                        &tx.external_id,
-                        &tx.raw_merchant,
-                        tx.amount_minor,
-                        &date,
-                        &tx.source_monzo_id,
-                    ) {
-                        held += 1;
-                    }
+                    hold_unmapped(state, tx, &mut held);
                 }
             }
-            (Some(tx), None) => {
-                // Defensive: apply_matches guarantees matched payees exist. If
-                // this ever fires, hold for review rather than dropping (fail-loud).
+            (Some(tx), None, _) | (Some(tx), Some(_), None) => {
+                // Defensive: apply_matches guarantees matched payee+category
+                // exist. If this ever fires, hold rather than drop (fail-loud).
                 warn!(
-                    "matched payee '{payee_name}' for tx {ext_id} unexpectedly missing; holding for review"
+                    "matched payee/category for tx {ext_id} unexpectedly missing; holding for review"
                 );
-                let date = tx.date.format("%Y-%m-%d").to_string();
-                if state.add_pending_full(
-                    &tx.external_id,
-                    &tx.raw_merchant,
-                    tx.amount_minor,
-                    &date,
-                    Some(payee_name.clone()),
-                    None,
-                    &tx.source_monzo_id,
-                ) {
-                    held += 1;
-                }
+                hold_cached_missing(state, tx, payee_name, &mut held);
             }
             _ => {}
         }
@@ -614,12 +758,39 @@ pub async fn run(
                 continue;
             }
         };
+        // Resolve the category name to an id; empty/None = uncategorised.
+        let cat_id: Option<String> = match &r.category_name {
+            None => None,
+            Some(name) => {
+                if let Some(id) = category_id_for(&categories, name) {
+                    Some(id.to_string())
+                } else {
+                    // Fail-loud: resolved category no longer exists -> re-hold.
+                    warn!(
+                        "resolved category '{name}' for '{}' no longer exists; re-holding",
+                        r.raw_merchant
+                    );
+                    if state.add_pending_full(
+                        &r.external_id,
+                        &r.raw_merchant,
+                        r.amount,
+                        &r.date,
+                        Some(r.payee_name.clone()),
+                        None,
+                        &r.source_monzo_id,
+                    ) {
+                        held += 1;
+                    }
+                    continue;
+                }
+            }
+        };
         if let Some(aid) = actual_id_for(&r.source_monzo_id, &account_links) {
             grouped.entry(aid).or_default().push(ImportTxn {
                 date: r.date.clone(),
                 amount: r.amount,
                 payee: pid,
-                category: None,
+                category: cat_id,
                 imported_id: if r.external_id.is_empty() {
                     format!("{}:{}", r.raw_merchant, r.date)
                 } else {
@@ -650,31 +821,25 @@ pub async fn run(
         }
     }
 
-    // proposed (medium/low) -> held WITH suggestion + confidence, NOT imported
-    for (tx, sugg, conf) in &outcome.proposed {
-        let date = tx.date.format("%Y-%m-%d").to_string();
-        if state.add_pending_full(
-            &tx.external_id,
-            &tx.raw_merchant,
-            tx.amount_minor,
+    // held classifications -> pending reviews carrying both dimensions' state.
+    for h in &outcome.held {
+        let date = h.tx.date.format("%Y-%m-%d").to_string();
+        let added = state.add_pending_classified(
+            &h.tx.external_id,
+            &h.tx.raw_merchant,
+            h.tx.amount_minor,
             &date,
-            Some(sugg.clone()),
-            Some(conf.as_str().to_string()),
-            &tx.source_monzo_id,
-        ) {
-            held += 1;
-        }
-    }
-    // unmatched -> held with no suggestion
-    for tx in &outcome.unmatched {
-        let date = tx.date.format("%Y-%m-%d").to_string();
-        if state.add_pending(
-            &tx.external_id,
-            &tx.raw_merchant,
-            tx.amount_minor,
-            &date,
-            &tx.source_monzo_id,
-        ) {
+            &h.tx.source_monzo_id,
+            ClassifiedHold {
+                payee_resolved: h.payee_resolved.clone(),
+                payee_suggestion: h.payee_suggestion.clone(),
+                payee_confidence: h.payee_confidence.map(|c| c.as_str().to_string()),
+                category_resolved: h.category_resolved.clone(),
+                category_suggestion: h.category_suggestion.clone(),
+                category_confidence: h.category_confidence.map(|c| c.as_str().to_string()),
+            },
+        );
+        if added {
             held += 1;
         }
     }
@@ -695,14 +860,21 @@ pub async fn run(
                 println!("    + {} {} -> payee {}", r.date, r.amount, r.payee);
             }
         }
-        for (tx, sugg, _) in &outcome.proposed {
+        for h in &outcome.held {
+            let p = h
+                .payee_resolved
+                .as_deref()
+                .or(h.payee_suggestion.as_deref())
+                .unwrap_or("?");
+            let c = h
+                .category_resolved
+                .as_deref()
+                .or(h.category_suggestion.as_deref())
+                .unwrap_or("?");
             println!(
-                "    ? hold {} {} (suggest {})",
-                tx.raw_merchant, tx.amount_minor, sugg
+                "    ? hold {} {} (payee {p}, category {c})",
+                h.tx.raw_merchant, h.tx.amount_minor
             );
-        }
-        for tx in &outcome.unmatched {
-            println!("    ? hold {} {}", tx.raw_merchant, tx.amount_minor);
         }
         if !newly_cached.is_empty() {
             println!("  would cache  : {}", newly_cached.len());
@@ -1009,67 +1181,150 @@ pub mod tests {
     }
 
     #[test]
-    fn splits_cache_hits_unknowns_for_claude() {
-        let mut cache = BTreeMap::new();
-        cache.insert(
+    fn plan_needs_claude_unless_both_caches_hit() {
+        let mut payee = BTreeMap::new();
+        let mut cat = BTreeMap::new();
+        payee.insert(
             "TFL TRAVEL CH".to_string(),
             "Transport for London".to_string(),
         );
+        cat.insert("TFL TRAVEL CH".to_string(), "Transport".to_string());
+        // AMZN only in payee cache -> still needs claude (no category)
+        payee.insert("AMZNMKTPLACE".to_string(), "Amazon".to_string());
         let txs = vec![
             tx("1", "TFL TRAVEL CH", -275),
             tx("2", "AMZNMKTPLACE", -1999),
         ];
-
-        let plan = plan_resolution(&txs, &cache);
+        let plan = plan_resolution(&txs, &payee, &cat);
         assert_eq!(
             plan.cached,
-            vec![("1".to_string(), "Transport for London".to_string())]
+            vec![(
+                "1".into(),
+                "Transport for London".to_string(),
+                "Transport".to_string()
+            )]
         );
         assert_eq!(plan.needs_claude, vec!["AMZNMKTPLACE".to_string()]);
     }
 
+    fn cls(
+        raw: &str,
+        payee: Option<&str>,
+        pc: Confidence,
+        cat: Option<&str>,
+        cc: Confidence,
+    ) -> Classification {
+        Classification {
+            raw: raw.into(),
+            payee: payee.map(Into::into),
+            payee_confidence: pc,
+            category: cat.map(Into::into),
+            category_confidence: cc,
+        }
+    }
+
     #[test]
-    fn apply_matches_partitions_by_confidence() {
+    fn apply_matches_gates_on_both_dimensions() {
         let txs = vec![
-            tx("1", "TESCO", -500),     // high -> auto import
-            tx("2", "SQ *CAFE", -450),  // medium -> proposed/held
-            tx("3", "WEIRD XYZ", -100), // none -> unmatched/held
+            tx("1", "TESCO", -500),   // both high + exist -> matched
+            tx("2", "CAFE", -450),    // payee high+exist, category low -> held, payee pre-settled
+            tx("3", "MYSTERY", -100), // payee none -> held, payee unsettled
         ];
         let matches = vec![
-            Classification {
-                raw: "TESCO".into(),
-                payee: Some("Tesco".into()),
-                payee_confidence: Confidence::High,
-                category: None,
-                category_confidence: Confidence::Low,
-            },
-            Classification {
-                raw: "SQ *CAFE".into(),
-                payee: Some("Local Cafe".into()),
-                payee_confidence: Confidence::Medium,
-                category: None,
-                category_confidence: Confidence::Low,
-            },
-            Classification {
-                raw: "WEIRD XYZ".into(),
-                payee: None,
-                payee_confidence: Confidence::Low,
-                category: None,
-                category_confidence: Confidence::Low,
-            },
+            cls(
+                "TESCO",
+                Some("Tesco"),
+                Confidence::High,
+                Some("Groceries"),
+                Confidence::High,
+            ),
+            cls(
+                "CAFE",
+                Some("Local Cafe"),
+                Confidence::High,
+                Some("Dining"),
+                Confidence::Low,
+            ),
+            cls("MYSTERY", None, Confidence::Low, None, Confidence::Low),
         ];
-        let existing: BTreeSet<&str> = ["Tesco", "Local Cafe"].iter().copied().collect();
-        let outcome = apply_matches(&txs, &matches, Confidence::High, &existing);
+        let payees: BTreeSet<&str> = ["Tesco", "Local Cafe"].into_iter().collect();
+        let cats: BTreeSet<&str> = ["Groceries", "Dining"].into_iter().collect();
+        let outcome = apply_matches(&txs, &matches, Confidence::High, &payees, &cats, true);
+
         assert_eq!(
             outcome.matched,
-            vec![("1".to_string(), "Tesco".to_string())]
+            vec![(
+                "1".to_string(),
+                "Tesco".to_string(),
+                "Groceries".to_string()
+            )]
         );
-        assert_eq!(outcome.proposed.len(), 1);
-        assert_eq!(outcome.proposed[0].0.external_id, "2");
-        assert_eq!(outcome.proposed[0].1, "Local Cafe");
-        assert_eq!(outcome.proposed[0].2, Confidence::Medium);
-        assert_eq!(outcome.unmatched.len(), 1);
-        assert_eq!(outcome.unmatched[0].external_id, "3");
+        assert_eq!(outcome.held.len(), 2);
+
+        let h2 = outcome
+            .held
+            .iter()
+            .find(|h| h.tx.external_id == "2")
+            .unwrap();
+        assert_eq!(h2.payee_resolved.as_deref(), Some("Local Cafe")); // pre-settled
+        assert_eq!(h2.category_suggestion.as_deref(), Some("Dining"));
+        assert_eq!(h2.category_resolved, None); // uncertain -> prompt
+
+        let h3 = outcome
+            .held
+            .iter()
+            .find(|h| h.tx.external_id == "3")
+            .unwrap();
+        assert_eq!(h3.payee_resolved, None);
+        assert_eq!(h3.payee_suggestion, None);
+    }
+
+    #[test]
+    fn apply_matches_autosettles_category_when_none_exist() {
+        let txs = vec![tx("1", "TESCO", -500)];
+        let matches = vec![cls(
+            "TESCO",
+            Some("Tesco"),
+            Confidence::High,
+            None,
+            Confidence::Low,
+        )];
+        let payees: BTreeSet<&str> = BTreeSet::from(["Tesco"]);
+        let cats: BTreeSet<&str> = BTreeSet::new();
+        // categories_available = false -> category dimension not applicable -> matched, category None
+        let outcome = apply_matches(&txs, &matches, Confidence::High, &payees, &cats, false);
+        assert_eq!(outcome.matched.len(), 1);
+        assert_eq!(
+            outcome.matched[0].2,
+            String::new(),
+            "uncategorised sentinel"
+        );
+    }
+
+    #[test]
+    fn category_id_for_holds_on_ambiguous_name() {
+        use crate::actual::shim_protocol::Category;
+        let cats = vec![
+            Category {
+                id: "c1".into(),
+                name: "Misc".into(),
+            },
+            Category {
+                id: "c2".into(),
+                name: "Misc".into(),
+            },
+            Category {
+                id: "c3".into(),
+                name: "Groceries".into(),
+            },
+        ];
+        assert_eq!(category_id_for(&cats, "Groceries"), Some("c3"));
+        assert_eq!(
+            category_id_for(&cats, "Misc"),
+            None,
+            "duplicate -> None (hold)"
+        );
+        assert_eq!(category_id_for(&cats, "Nope"), None);
     }
 
     #[test]
@@ -1299,6 +1554,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
   const fs=require('fs'), path=require('path');
   if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'}]}); }
   else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
+  else if(req.op==='get_categories'){ out({ok:true,data:[{id:'c_groc',name:'Groceries'},{id:'c_din',name:'Dining'}]}); }
   else if(req.op==='create_payee'){ out({ok:true,data:{id:'p_new'}}); }
   else if(req.op==='import_transactions'){
     fs.appendFileSync(path.join(__dirname,'imports.log'), JSON.stringify(req.transactions)+'\n');
@@ -1325,6 +1581,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
   const fs=require('fs'), path=require('path');
   if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'}]}); }
   else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
+  else if(req.op==='get_categories'){ out({ok:true,data:[{id:'c_groc',name:'Groceries'},{id:'c_din',name:'Dining'}]}); }
   else if(req.op==='create_payee'){
     fs.appendFileSync(path.join(__dirname,'payees.log'), 'called\n');
     out({ok:true,data:{id:'p_new'}});
@@ -1375,6 +1632,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
   const fs=require('fs'), path=require('path');
   if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'},{id:'p_bills',name:'Bills Co'}]}); }
   else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
+  else if(req.op==='get_categories'){ out({ok:true,data:[{id:'c_groc',name:'Groceries'},{id:'c_din',name:'Dining'}]}); }
   else if(req.op==='create_payee'){ out({ok:true,data:{id:'p_new'}}); }
   else if(req.op==='import_transactions'){
     fs.appendFileSync(path.join(__dirname,'routed.log'), JSON.stringify({account_id:req.account_id,transactions:req.transactions})+'\n');
@@ -1437,8 +1695,10 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                 raw: "SQ *CAFE".into(),
                 payee: Some("Local Cafe".into()),
                 payee_confidence: Confidence::Medium,
-                category: None,
-                category_confidence: Confidence::Low,
+                // Confident, existing category -> category dimension PRE-SETTLED;
+                // only the payee is reviewed (one prompt sent, no category prompt).
+                category: Some("Dining".into()),
+                category_confidence: Confidence::High,
             }],
         };
         run(
@@ -1544,15 +1804,17 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                     raw: "SQ *CAFE".into(),
                     payee: Some("Local Cafe".into()),
                     payee_confidence: Confidence::High,
-                    category: None,
-                    category_confidence: Confidence::Low,
+                    // Confident, existing category -> both dimensions confident,
+                    // so the tx still auto-imports (now with a category).
+                    category: Some("Groceries".into()),
+                    category_confidence: Confidence::High,
                 },
                 Classification {
                     raw: "BILLS LTD".into(),
                     payee: Some("Bills Co".into()),
                     payee_confidence: Confidence::High,
-                    category: None,
-                    category_confidence: Confidence::Low,
+                    category: Some("Groceries".into()),
+                    category_confidence: Confidence::High,
                 },
             ],
         };

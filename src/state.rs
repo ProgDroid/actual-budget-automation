@@ -395,6 +395,74 @@ impl State {
             false
         }
     }
+
+    /// Add a held review carrying both payee and category dimension state.
+    /// A `Some(name)` in `hold.payee_resolved`/`hold.category_resolved`
+    /// PRE-SETTLES that dimension (confident & exists -> no prompt); `None`
+    /// leaves it unsettled so the corresponding suggestion drives a review
+    /// prompt. The named `ClassifiedHold` (rather than a flat list of six
+    /// same-typed `Option<String>` params, or the run-side `HeldClassification`)
+    /// prevents silent field transposition and keeps the state→run dependency
+    /// direction correct. Returns false (no-op) if an entry with the same
+    /// `external_id` already exists.
+    pub fn add_pending_classified(
+        &mut self,
+        external_id: &str,
+        raw_merchant: &str,
+        amount: i64,
+        date: &str,
+        source_monzo_id: &str,
+        hold: ClassifiedHold,
+    ) -> bool {
+        if self
+            .pending_reviews
+            .iter()
+            .any(|p| p.external_id == external_id)
+        {
+            return false;
+        }
+        // Pre-settled payee -> resolve_to (create_new stays false: we only
+        // pre-settle to an EXISTING payee). Unsettled -> empty resolve_to.
+        let resolve_to = hold.payee_resolved.unwrap_or_default();
+        let cat_resolved = hold.category_resolved.is_some();
+        let resolve_category_to = hold.category_resolved.unwrap_or_default();
+        self.pending_reviews.push(PendingReview {
+            external_id: external_id.to_string(),
+            source_monzo_id: source_monzo_id.to_string(),
+            raw_merchant: raw_merchant.to_string(),
+            amount,
+            date: date.to_string(),
+            resolve_to,
+            create_new: false,
+            suggestion: hold.payee_suggestion,
+            confidence: hold.payee_confidence,
+            category_suggestion: hold.category_suggestion,
+            category_confidence: hold.category_confidence,
+            resolve_category_to,
+            category_resolved: cat_resolved,
+            telegram_message_id: None,
+        });
+        true
+    }
+}
+
+/// Per-dimension settle state for a held review, passed to
+/// [`State::add_pending_classified`]. Named fields prevent a silent
+/// transposition of the same-typed `Option<String>` values at the call site.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ClassifiedHold {
+    /// `Some(name)` pre-settles the payee dimension to an existing payee.
+    pub payee_resolved: Option<String>,
+    /// Suggestion prompted for when the payee dimension is unsettled.
+    pub payee_suggestion: Option<String>,
+    /// "high" | "medium" | "low" for the payee suggestion (display only).
+    pub payee_confidence: Option<String>,
+    /// `Some(name)` pre-settles the category dimension (empty = uncategorised).
+    pub category_resolved: Option<String>,
+    /// Suggestion prompted for when the category dimension is unsettled.
+    pub category_suggestion: Option<String>,
+    /// "high" | "medium" | "low" for the category suggestion (display only).
+    pub category_confidence: Option<String>,
 }
 
 /// A pending review the user has resolved, ready to import.
