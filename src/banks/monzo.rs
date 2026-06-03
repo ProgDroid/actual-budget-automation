@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::banks::{BankError, BankSource, RawTransaction};
 use crate::state::{MonzoState, State};
@@ -50,6 +51,38 @@ struct Merchant {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
+struct AccountList {
+    accounts: Vec<MonzoAccount>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
+struct MonzoAccount {
+    id: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    closed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
+struct PotList {
+    pots: Vec<MonzoPot>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
+struct MonzoPot {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    deleted: bool,
+}
+
 /// Runaway guard for `fetch_since` pagination. At `limit=100` per page this is
 /// ~10,000 transactions — far above any realistic personal-account window. If a
 /// fetch would exceed it we abort loudly rather than silently truncate.
@@ -83,6 +116,146 @@ impl Monzo {
     #[cfg(test)]
     pub const fn set_max_pages_for_test(&mut self, max_pages: usize) {
         self.max_pages = max_pages;
+    }
+}
+
+impl Monzo {
+    /// Fetch all transactions for a single Monzo account since `since`, walking
+    /// pagination via cursor. Fails loud: if the fetch errors the whole
+    /// `fetch_since` errors (no partial Ok).
+    async fn fetch_account(
+        &self,
+        monzo_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<RawTransaction>, BankError> {
+        let token = self
+            .access_token
+            .as_ref()
+            .ok_or_else(|| BankError::Other(anyhow::anyhow!("ensure_auth not called")))?;
+
+        let mut all: Vec<MonzoTx> = Vec::new();
+        let mut cursor = since.to_rfc3339();
+        for page in 0.. {
+            if page >= self.max_pages {
+                return Err(BankError::Other(anyhow::anyhow!(
+                    "Monzo pagination exceeded {} pages (~{} transactions) for {monzo_id}; aborting to avoid silently truncating — last_run is not advanced, the next run will retry",
+                    self.max_pages,
+                    self.max_pages * 100
+                )));
+            }
+            let resp = self
+                .http
+                .get(format!("{}/transactions", self.base_url))
+                .bearer_auth(token)
+                .query(&[
+                    ("account_id", monzo_id),
+                    ("since", cursor.as_str()),
+                    ("expand[]", "merchant"),
+                    ("limit", "100"),
+                ])
+                .send()
+                .await
+                .map_err(|e| BankError::Other(e.into()))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(BankError::AuthExpired("Monzo access token rejected".into()));
+            }
+            if !resp.status().is_success() {
+                let s = resp.status();
+                return Err(BankError::Other(anyhow::anyhow!("Monzo transactions error {s}")));
+            }
+            let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
+            let raw_len = list.transactions.len();
+            let last_id = list.transactions.last().map(|t| t.id.clone());
+            all.extend(list.transactions);
+            if raw_len < 100 {
+                break;
+            }
+            match last_id {
+                Some(id) => cursor = id,
+                None => {
+                    return Err(BankError::Other(anyhow::anyhow!(
+                        "Monzo returned a full page ({raw_len}) with no last id; cannot advance cursor"
+                    )));
+                }
+            }
+        }
+        Ok(all
+            .into_iter()
+            .filter(|t| t.decline_reason.is_none())
+            .map(|t| {
+                let raw_merchant = match &t.merchant {
+                    Some(m) if !m.name.is_empty() => m.name.clone(),
+                    _ => t.description.clone(),
+                };
+                RawTransaction {
+                    external_id: t.id,
+                    date: t.created.date_naive(),
+                    amount_minor: t.amount,
+                    raw_merchant,
+                    source_monzo_id: monzo_id.to_string(),
+                }
+            })
+            .collect())
+    }
+
+    /// List open Monzo accounts as (id, name). Requires a prior `ensure_auth`.
+    #[allow(dead_code)] // wired into the `aba accounts` command in Task 6
+    pub async fn list_accounts(&self) -> Result<Vec<(String, String)>, BankError> {
+        let token = self
+            .access_token
+            .as_ref()
+            .ok_or_else(|| BankError::Other(anyhow::anyhow!("ensure_auth not called")))?;
+        let resp = self
+            .http
+            .get(format!("{}/accounts", self.base_url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| BankError::Other(e.into()))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(BankError::Other(anyhow::anyhow!("Monzo accounts error {s}")));
+        }
+        let list: AccountList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
+        Ok(list
+            .accounts
+            .into_iter()
+            .filter(|a| !a.closed)
+            .map(|a| (a.id, a.description))
+            .collect())
+    }
+
+    /// List active pots for a current account as (id, name). Informational only.
+    #[allow(dead_code)] // wired into the `aba accounts` command in Task 6
+    pub async fn list_pots(
+        &self,
+        current_account_id: &str,
+    ) -> Result<Vec<(String, String)>, BankError> {
+        let token = self
+            .access_token
+            .as_ref()
+            .ok_or_else(|| BankError::Other(anyhow::anyhow!("ensure_auth not called")))?;
+        let resp = self
+            .http
+            .get(format!("{}/pots", self.base_url))
+            .bearer_auth(token)
+            .query(&[("current_account_id", current_account_id)])
+            .send()
+            .await
+            .map_err(|e| BankError::Other(e.into()))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(BankError::Other(anyhow::anyhow!("Monzo pots error {s}")));
+        }
+        let list: PotList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
+        Ok(list
+            .pots
+            .into_iter()
+            .filter(|p| !p.deleted)
+            .map(|p| (p.id, p.name))
+            .collect())
     }
 }
 
@@ -137,104 +310,34 @@ impl BankSource for Monzo {
             .monzo
             .refresh_token
             .clone_from(&self.monzo.refresh_token);
-        if state.monzo.account_id.is_empty() {
-            state.monzo.account_id.clone_from(&self.monzo.account_id);
-        }
         Ok(())
     }
 
     /// # Errors
     /// Returns [`BankError::AuthExpired`] when Monzo rejects the access token
     /// with 401/403 (refresh/re-auth required). Returns [`BankError::Other`]
-    /// when `ensure_auth` has not been called, the account id is unconfigured,
+    /// when `ensure_auth` has not been called, no accounts are configured,
     /// the transport fails, the status is otherwise non-success, or the body
     /// fails to deserialize.
     async fn fetch_since(&self, since: DateTime<Utc>) -> Result<Vec<RawTransaction>, BankError> {
-        let token = self
-            .access_token
-            .as_ref()
-            .ok_or_else(|| BankError::Other(anyhow::anyhow!("ensure_auth not called")))?;
-        if self.monzo.account_id.is_empty() {
+        if self.access_token.is_none() {
+            return Err(BankError::Other(anyhow::anyhow!("ensure_auth not called")));
+        }
+        if self.monzo.accounts.is_empty() {
             return Err(BankError::Other(anyhow::anyhow!(
-                "Monzo account_id not configured; set [monzo].account_id in the state file"
+                "no Monzo accounts configured; run `aba accounts` to map Monzo accounts to Actual accounts"
             )));
         }
-        // Walk every page via Monzo's cursor: the first page uses the window-start
-        // timestamp; each later page uses the previous page's last raw id. The
-        // page-size check and the cursor both use the RAW count/id (before decline
-        // filtering) so filtered-out declines can never falsely end the walk.
-        let mut all: Vec<MonzoTx> = Vec::new();
-        let mut cursor = since.to_rfc3339();
-        for page in 0.. {
-            if page >= self.max_pages {
-                return Err(BankError::Other(anyhow::anyhow!(
-                    "Monzo pagination exceeded {} pages (~{} transactions); aborting to avoid silently truncating — last_run is not advanced, the next run will retry",
-                    self.max_pages,
-                    self.max_pages * 100
-                )));
+        let mut out = Vec::new();
+        for link in &self.monzo.accounts {
+            if link.monzo_id.is_empty() {
+                warn!("skipping account link with empty monzo_id");
+                continue;
             }
-
-            let resp = self
-                .http
-                .get(format!("{}/transactions", self.base_url))
-                .bearer_auth(token)
-                .query(&[
-                    ("account_id", self.monzo.account_id.as_str()),
-                    ("since", cursor.as_str()),
-                    ("expand[]", "merchant"),
-                    ("limit", "100"),
-                ])
-                .send()
-                .await
-                .map_err(|e| BankError::Other(e.into()))?;
-
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                || resp.status() == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(BankError::AuthExpired("Monzo access token rejected".into()));
-            }
-            if !resp.status().is_success() {
-                let s = resp.status();
-                return Err(BankError::Other(anyhow::anyhow!(
-                    "Monzo transactions error {s}"
-                )));
-            }
-
-            let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
-            let raw_len = list.transactions.len();
-            let last_id = list.transactions.last().map(|t| t.id.clone());
-            all.extend(list.transactions);
-
-            if raw_len < 100 {
-                break; // final, partial page
-            }
-            match last_id {
-                Some(id) => cursor = id,
-                None => {
-                    return Err(BankError::Other(anyhow::anyhow!(
-                        "Monzo returned a full page ({raw_len}) with no last id; cannot advance cursor"
-                    )));
-                }
-            }
+            // Fail-loud: if ANY account errors, propagate — never return a
+            // partial Ok that would let last_run advance past dropped data.
+            out.extend(self.fetch_account(&link.monzo_id, since).await?);
         }
-
-        let out = all
-            .into_iter()
-            .filter(|t| t.decline_reason.is_none())
-            .map(|t| {
-                let raw_merchant = match &t.merchant {
-                    Some(m) if !m.name.is_empty() => m.name.clone(),
-                    _ => t.description.clone(),
-                };
-                RawTransaction {
-                    external_id: t.id,
-                    date: t.created.date_naive(),
-                    amount_minor: t.amount,
-                    raw_merchant,
-                    source_monzo_id: self.monzo.account_id.clone(),
-                }
-            })
-            .collect();
         Ok(out)
     }
 }
@@ -243,7 +346,8 @@ impl BankSource for Monzo {
 mod tests {
     use super::*;
     use crate::state::State;
-    use wiremock::matchers::{method, path};
+    use chrono::TimeZone;
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(base: String) -> Monzo {
@@ -298,9 +402,6 @@ mod tests {
         assert!(matches!(err, BankError::AuthExpired(_)));
     }
 
-    use chrono::TimeZone;
-    use wiremock::matchers::query_param;
-
     #[tokio::test]
     async fn fetch_maps_merchant_with_description_fallback_and_skips_declined() {
         let server = MockServer::start().await;
@@ -341,7 +442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_with_empty_account_id_errors() {
+    async fn fetch_with_no_accounts_errors() {
         let mut m = Monzo::new(
             "cid".into(),
             "csecret".into(),
@@ -617,5 +718,101 @@ mod tests {
         let txs = m.fetch_since(since).await.unwrap();
 
         assert_eq!(txs.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn fetch_routes_per_account_and_tags_source() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("account_id", "acc_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": [{
+                    "id": "a1", "created": "2026-05-30T08:00:00Z", "amount": -100,
+                    "description": "X", "decline_reason": null, "merchant": null
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .and(query_param("account_id", "acc_2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": [{
+                    "id": "b1", "created": "2026-05-30T09:00:00Z", "amount": -200,
+                    "description": "Y", "decline_reason": null, "merchant": null
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut m = Monzo::new(
+            "cid".into(),
+            "csecret".into(),
+            server.uri(),
+            crate::state::MonzoState {
+                refresh_token: "rt".into(),
+                account_id: String::new(),
+                accounts: vec![
+                    crate::state::AccountLink {
+                        monzo_id: "acc_1".into(),
+                        actual_id: "u1".into(),
+                        ..Default::default()
+                    },
+                    crate::state::AccountLink {
+                        monzo_id: "acc_2".into(),
+                        actual_id: "u2".into(),
+                        ..Default::default()
+                    },
+                ],
+            },
+        );
+        m.set_access_token_for_test("at_x".into());
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+        let txs = m.fetch_since(since).await.unwrap();
+
+        assert_eq!(txs.len(), 2);
+        let a = txs.iter().find(|t| t.external_id == "a1").unwrap();
+        let b = txs.iter().find(|t| t.external_id == "b1").unwrap();
+        assert_eq!(a.source_monzo_id, "acc_1");
+        assert_eq!(b.source_monzo_id, "acc_2");
+    }
+
+    #[tokio::test]
+    async fn list_accounts_filters_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/accounts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accounts": [
+                    {"id": "acc_1", "description": "Personal", "closed": false},
+                    {"id": "acc_old", "description": "Old", "closed": true}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let accts = m.list_accounts().await.unwrap();
+        assert_eq!(accts, vec![("acc_1".to_string(), "Personal".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn list_pots_filters_deleted() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pots"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pots": [
+                    {"id": "pot_1", "name": "Savings", "deleted": false},
+                    {"id": "pot_x", "name": "Gone", "deleted": true}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let pots = m.list_pots("acc_1").await.unwrap();
+        assert_eq!(pots, vec![("pot_1".to_string(), "Savings".to_string())]);
     }
 }
