@@ -9,6 +9,25 @@
 4. Copy the printed `refresh_token` into the server state file under `[monzo]`,
    and set `[monzo].account_id`.
 
+## Account mapping (multi-account)
+
+Transactions are routed to Actual accounts via `[[monzo.accounts]]` links in the
+state file (`monzo_id` → `actual_id`). Bootstrap them once:
+
+1. Ensure Monzo is authed (`aba auth monzo`) and a `refresh_token` is in state.
+2. Run `aba accounts` to preview the auto-suggested mapping (Monzo names matched
+   to Actual account names). Pots are listed for awareness but are NOT linked
+   (they become transfers in a later phase).
+3. Run `aba accounts --write` to persist it.
+4. Review the state file's `[[monzo.accounts]]` entries; fix any `actual_id` that
+   is empty (UNMAPPED) or wrong by editing it directly.
+
+**Migration:** an old state file with a single `[monzo] account_id` is auto-promoted
+on first load to one UNMAPPED `[[monzo.accounts]]` link (the old value is the Monzo
+id; the Actual side must be supplied via `aba accounts`). Until mapped, transactions
+from that account are HELD (never imported to a wrong/blank account) and surfaced in
+the run summary.
+
 ## Daily run (server, one-shot container)
 
 The container runs as the non-root `node` user (uid 1000, set by `USER node` in
