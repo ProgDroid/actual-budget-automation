@@ -14,8 +14,27 @@ use crate::claude::{ClaudeMatcher, Confidence, PayeeMatch};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
 use crate::matching::{Schedule, best_payee_match, matches_scheduled};
 use crate::notify::Notifier;
-use crate::state::{PendingReview, State};
+use crate::state::{AccountLink, PendingReview, State};
 use crate::telegram::{ConfirmChannel, Prompt};
+
+/// Resolve the Actual account id for a source Monzo account.
+/// Falls back to the sole mapped account when there's exactly one (covers
+/// single-account users and legacy held items with an empty source). Returns
+/// `None` when the source is unknown and the mapping is ambiguous → caller holds.
+fn actual_id_for(source_monzo_id: &str, links: &[AccountLink]) -> Option<String> {
+    if let Some(l) = links
+        .iter()
+        .find(|l| l.monzo_id == source_monzo_id && !l.actual_id.is_empty())
+    {
+        return Some(l.actual_id.clone());
+    }
+    let mapped: Vec<&AccountLink> = links.iter().filter(|l| !l.actual_id.is_empty()).collect();
+    if let [only] = mapped.as_slice() {
+        Some(only.actual_id.clone())
+    } else {
+        None
+    }
+}
 
 /// Result of splitting fetched transactions against the payee cache.
 #[derive(Debug, PartialEq, Eq)]
@@ -323,17 +342,19 @@ pub async fn run(
     let existing: BTreeSet<&str> = payee_names.iter().map(String::as_str).collect();
     let outcome = apply_matches(&unknown_txs, &claude_matches, autoimport, &existing);
 
+    // Clone links so the routing closure/holds don't fight the borrow checker
+    // against `state` mutations below. Cheap: a handful of entries.
+    let account_links = state.monzo.accounts.clone();
+
     // 6. Assemble import rows (payee NAME -> id; never auto-create on the matched path).
-    let mut import_rows: Vec<ImportTxn> = Vec::new();
+    let mut grouped: BTreeMap<String, Vec<ImportTxn>> = BTreeMap::new();
     let mut held = 0usize;
 
-    let push_row = |rows: &mut Vec<ImportTxn>, tx: &RawTransaction, payee_id: &str| {
-        rows.push(ImportTxn {
-            date: tx.date.format("%Y-%m-%d").to_string(),
-            amount: tx.amount_minor,
-            payee: payee_id.to_string(),
-            imported_id: tx.external_id.clone(),
-        });
+    let make_row = |tx: &RawTransaction, payee_id: &str| ImportTxn {
+        date: tx.date.format("%Y-%m-%d").to_string(),
+        amount: tx.amount_minor,
+        payee: payee_id.to_string(),
+        imported_id: tx.external_id.clone(),
     };
 
     let by_id: BTreeMap<&str, &RawTransaction> = candidates
@@ -347,7 +368,26 @@ pub async fn run(
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
         ) {
-            (Some(tx), Some(pid)) => push_row(&mut import_rows, tx, pid),
+            (Some(tx), Some(pid)) => {
+                if let Some(aid) = actual_id_for(&tx.source_monzo_id, &account_links) {
+                    grouped.entry(aid).or_default().push(make_row(tx, pid));
+                } else {
+                    warn!(
+                        "tx {ext_id} from unmapped Monzo account '{}' — holding (run `aba accounts`)",
+                        tx.source_monzo_id
+                    );
+                    let date = tx.date.format("%Y-%m-%d").to_string();
+                    if state.add_pending(
+                        &tx.external_id,
+                        &tx.raw_merchant,
+                        tx.amount_minor,
+                        &date,
+                        &tx.source_monzo_id,
+                    ) {
+                        held += 1;
+                    }
+                }
+            }
             (Some(tx), None) => {
                 warn!(
                     "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; holding for review"
@@ -360,6 +400,7 @@ pub async fn run(
                     &date,
                     Some(payee_name.clone()),
                     None,
+                    &tx.source_monzo_id,
                 ) {
                     held += 1;
                 }
@@ -375,12 +416,29 @@ pub async fn run(
             payee_id_for(&payees, payee_name),
         ) {
             (Some(tx), Some(pid)) => {
-                push_row(&mut import_rows, tx, pid);
-                if !state.payee_cache.contains_key(&tx.raw_merchant) {
-                    state
-                        .payee_cache
-                        .insert(tx.raw_merchant.clone(), payee_name.clone());
-                    newly_cached.push((tx.raw_merchant.clone(), payee_name.clone()));
+                if let Some(aid) = actual_id_for(&tx.source_monzo_id, &account_links) {
+                    grouped.entry(aid).or_default().push(make_row(tx, pid));
+                    if !state.payee_cache.contains_key(&tx.raw_merchant) {
+                        state
+                            .payee_cache
+                            .insert(tx.raw_merchant.clone(), payee_name.clone());
+                        newly_cached.push((tx.raw_merchant.clone(), payee_name.clone()));
+                    }
+                } else {
+                    warn!(
+                        "matched tx {ext_id} from unmapped Monzo account '{}' — holding",
+                        tx.source_monzo_id
+                    );
+                    let date = tx.date.format("%Y-%m-%d").to_string();
+                    if state.add_pending(
+                        &tx.external_id,
+                        &tx.raw_merchant,
+                        tx.amount_minor,
+                        &date,
+                        &tx.source_monzo_id,
+                    ) {
+                        held += 1;
+                    }
                 }
             }
             (Some(tx), None) => {
@@ -397,6 +455,7 @@ pub async fn run(
                     &date,
                     Some(payee_name.clone()),
                     None,
+                    &tx.source_monzo_id,
                 ) {
                     held += 1;
                 }
@@ -417,7 +476,7 @@ pub async fn run(
                 continue;
             }
         };
-        import_rows.push(ImportTxn {
+        let row = ImportTxn {
             date: r.date.clone(),
             amount: r.amount,
             payee: pid,
@@ -426,7 +485,15 @@ pub async fn run(
             } else {
                 r.external_id.clone()
             },
-        });
+        };
+        if let Some(aid) = actual_id_for(&r.source_monzo_id, &account_links) {
+            grouped.entry(aid).or_default().push(row);
+        } else {
+            warn!(
+                "resolved review '{}' from unmapped Monzo account '{}' — skipping import (run `aba accounts`)",
+                r.raw_merchant, r.source_monzo_id
+            );
+        }
     }
 
     // proposed (medium/low) -> held WITH suggestion + confidence, NOT imported
@@ -439,6 +506,7 @@ pub async fn run(
             &date,
             Some(sugg.clone()),
             Some(conf.as_str().to_string()),
+            &tx.source_monzo_id,
         ) {
             held += 1;
         }
@@ -446,22 +514,32 @@ pub async fn run(
     // unmatched -> held with no suggestion
     for tx in &outcome.unmatched {
         let date = tx.date.format("%Y-%m-%d").to_string();
-        if state.add_pending(&tx.external_id, &tx.raw_merchant, tx.amount_minor, &date) {
+        if state.add_pending(
+            &tx.external_id,
+            &tx.raw_merchant,
+            tx.amount_minor,
+            &date,
+            &tx.source_monzo_id,
+        ) {
             held += 1;
         }
     }
 
     // 7. Import or report.
     if dry_run {
+        let total: usize = grouped.values().map(Vec::len).sum();
         println!("DRY RUN — no writes to Actual");
-        println!("  would import : {}", import_rows.len());
+        println!("  would import : {total}");
         println!(
             "  would skip   : {} (matched a schedule)",
             fetched_count.saturating_sub(candidates.len())
         );
         println!("  would hold   : {held}");
-        for r in &import_rows {
-            println!("    + {} {} -> payee {}", r.date, r.amount, r.payee);
+        for (aid, rows) in &grouped {
+            println!("  -> account {aid}: {} txns", rows.len());
+            for r in rows {
+                println!("    + {} {} -> payee {}", r.date, r.amount, r.payee);
+            }
         }
         for (tx, sugg, _) in &outcome.proposed {
             println!(
@@ -484,17 +562,21 @@ pub async fn run(
         return Ok(());
     }
 
-    let summary = if import_rows.is_empty() {
-        crate::actual::ImportSummary {
-            added: 0,
-            updated: 0,
-        }
-    } else {
-        actual
-            .import_transactions(state.monzo.account_id.clone(), import_rows)
-            .await
-            .context("import_transactions")?
+    let mut summary = crate::actual::ImportSummary {
+        added: 0,
+        updated: 0,
     };
+    for (aid, rows) in grouped {
+        if rows.is_empty() {
+            continue;
+        }
+        let s = actual
+            .import_transactions(aid.clone(), rows)
+            .await
+            .with_context(|| format!("import_transactions for account {aid}"))?;
+        summary.added += s.added;
+        summary.updated += s.updated;
+    }
     info!(
         "imported added={} updated={} held={held}",
         summary.added, summary.updated
@@ -743,6 +825,31 @@ pub mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn actual_id_for_matches_source_then_falls_back_to_sole_mapped() {
+        let links = vec![
+            AccountLink {
+                monzo_id: "acc_1".into(),
+                actual_id: "u1".into(),
+                ..Default::default()
+            },
+            AccountLink {
+                monzo_id: "acc_2".into(),
+                actual_id: "u2".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(actual_id_for("acc_2", &links).as_deref(), Some("u2"));
+        assert_eq!(actual_id_for("acc_unknown", &links), None); // ambiguous → hold
+
+        let single = vec![AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "u1".into(),
+            ..Default::default()
+        }];
+        assert_eq!(actual_id_for("", &single).as_deref(), Some("u1")); // legacy fallback
     }
 
     #[test]
@@ -1078,6 +1185,34 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         )
     }
 
+    /// Like `fake_actual` but exposes TWO payees (Local Cafe + Bills Co) and
+    /// records each `import_transactions` call as one JSON line
+    /// `{"account_id":..,"transactions":[..]}` in `<dir>/routed.log`, so a test
+    /// can assert which Actual account each transaction was routed to.
+    fn fake_actual_routing(dir: &TempDir) -> ActualClient {
+        let script = r"
+let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
+  const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
+  const fs=require('fs'), path=require('path');
+  if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'},{id:'p_bills',name:'Bills Co'}]}); }
+  else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
+  else if(req.op==='create_payee'){ out({ok:true,data:{id:'p_new'}}); }
+  else if(req.op==='import_transactions'){
+    fs.appendFileSync(path.join(__dirname,'routed.log'), JSON.stringify({account_id:req.account_id,transactions:req.transactions})+'\n');
+    out({ok:true,data:{added:req.transactions.length,updated:0}});
+  } else { out({ok:false,error:'unknown op'}); }
+});
+";
+        std::fs::write(dir.path().join("index.js"), script).unwrap();
+        ActualClient::new(
+            dir.path().to_path_buf(),
+            false,
+            "http://t".into(),
+            "pw".into(),
+            "sync".into(),
+        )
+    }
+
     fn cfg_at(state_path: &std::path::Path) -> Config {
         Config::from_getter(|k| match k {
             "ANTHROPIC_API_KEY" => Some("ak".into()),
@@ -1109,6 +1244,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
 
         // ---- Run #1: one medium-confidence match -> held + prompted, NOT imported.
         let mut state = State::default();
+        // tx() tags source_monzo_id "acc_1"; map it so the eventual import routes.
+        state.monzo.accounts.push(crate::state::AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "acc".into(),
+            ..Default::default()
+        });
         let mut bank = FakeBank {
             txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
         };
@@ -1177,6 +1318,95 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             1,
             "no re-prompt (idempotent)"
         );
+    }
+
+    #[tokio::test]
+    async fn imports_route_to_per_source_actual_account() {
+        // Two mapped accounts (acc_1->u1, acc_2->u2). Two high-confidence txns,
+        // one from each Monzo account, must be imported into the matching Actual
+        // account via separate import_transactions calls.
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_routing(&shim);
+        let notifier = NullNotifier;
+
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "u1".into(),
+            ..Default::default()
+        });
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_2".into(),
+            actual_id: "u2".into(),
+            ..Default::default()
+        });
+
+        // tx() tags acc_1; build the acc_2 one explicitly.
+        let tx_cafe = tx("tx_cafe", "SQ *CAFE", -450); // source acc_1
+        let tx_bills = RawTransaction {
+            external_id: "tx_bills".into(),
+            date: NaiveDate::from_ymd_opt(2026, 5, 30).unwrap(),
+            amount_minor: -1200,
+            raw_merchant: "BILLS LTD".into(),
+            source_monzo_id: "acc_2".into(),
+        };
+        let mut bank = FakeBank {
+            txs: vec![tx_cafe, tx_bills],
+        };
+        let claude = FakeClaude {
+            out: vec![
+                PayeeMatch {
+                    raw: "SQ *CAFE".into(),
+                    payee: Some("Local Cafe".into()),
+                    confidence: Confidence::High,
+                },
+                PayeeMatch {
+                    raw: "BILLS LTD".into(),
+                    payee: Some("Bills Co".into()),
+                    confidence: Confidence::High,
+                },
+            ],
+        };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // One import call per account, each carrying only its own transaction.
+        let logged = std::fs::read_to_string(&routed_log).unwrap();
+        let mut calls: Vec<serde_json::Value> = logged
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(calls.len(), 2, "exactly one import call per account");
+        calls.sort_by(|a, b| a["account_id"]
+            .as_str()
+            .unwrap()
+            .cmp(b["account_id"].as_str().unwrap()));
+
+        assert_eq!(calls[0]["account_id"], "u1");
+        assert_eq!(calls[0]["transactions"].as_array().unwrap().len(), 1);
+        assert_eq!(calls[0]["transactions"][0]["imported_id"], "tx_cafe");
+        assert_eq!(calls[0]["transactions"][0]["payee"], "p_cafe");
+
+        assert_eq!(calls[1]["account_id"], "u2");
+        assert_eq!(calls[1]["transactions"].as_array().unwrap().len(), 1);
+        assert_eq!(calls[1]["transactions"][0]["imported_id"], "tx_bills");
+        assert_eq!(calls[1]["transactions"][0]["payee"], "p_bills");
     }
 
     #[tokio::test]
@@ -1508,11 +1738,15 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             monzo: crate::state::MonzoState {
                 refresh_token: String::new(),
                 account_id: "acc".into(),
-                accounts: Vec::new(),
+                accounts: vec![crate::state::AccountLink {
+                    monzo_id: "acc_1".into(),
+                    actual_id: "acc".into(),
+                    ..Default::default()
+                }],
             },
             pending_reviews: vec![PendingReview {
                 external_id: "tx_x".into(),
-                source_monzo_id: String::new(),
+                source_monzo_id: "acc_1".into(),
                 raw_merchant: "MyStore".into(),
                 amount: -500,
                 date: "2026-05-30".into(),
