@@ -8,6 +8,9 @@ pub enum ShimRequest {
     GetAccounts,
     GetPayees,
     GetScheduled,
+    // Used by ActualClient::get_categories (Task 2).
+    #[allow(dead_code)]
+    GetCategories,
     ImportTransactions {
         account_id: String,
         transactions: Vec<ImportTxn>,
@@ -23,6 +26,10 @@ pub struct ImportTxn {
     pub amount: i64,
     /// Existing Actual payee **id** (never a name — avoids auto-create).
     pub payee: String,
+    /// Existing Actual category **id**; omitted from the wire when `None`
+    /// (Actual leaves the transaction uncategorised).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     pub imported_id: String,
 }
 
@@ -34,6 +41,14 @@ pub struct Account {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Payee {
+    pub id: String,
+    pub name: String,
+}
+
+// Used by ActualClient::get_categories (Task 2).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Category {
     pub id: String,
     pub name: String,
 }
@@ -83,12 +98,57 @@ mod tests {
                 date: "2026-05-30".into(),
                 amount: -450,
                 payee: "payee_id_1".into(),
+                category: None,
                 imported_id: "tx_1".into(),
             }],
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["op"], "import_transactions");
         assert_eq!(v["transactions"][0]["payee"], "payee_id_1");
+    }
+
+    #[test]
+    fn get_categories_request_serialises_and_category_deserialises() {
+        let req = ShimRequest::GetCategories;
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"op":"get_categories"}"#
+        );
+
+        let cat: Category = serde_json::from_str(r#"{"id":"cat-1","name":"Groceries"}"#).unwrap();
+        assert_eq!(
+            cat,
+            Category {
+                id: "cat-1".into(),
+                name: "Groceries".into()
+            }
+        );
+    }
+
+    #[test]
+    fn import_txn_omits_category_when_none_and_includes_when_some() {
+        let none = ImportTxn {
+            date: "2026-05-30".into(),
+            amount: -450,
+            payee: "p1".into(),
+            category: None,
+            imported_id: "tx1".into(),
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(
+            v.get("category").is_none(),
+            "category must be omitted when None"
+        );
+
+        let some = ImportTxn {
+            date: "2026-05-30".into(),
+            amount: -450,
+            payee: "p1".into(),
+            category: Some("cat-1".into()),
+            imported_id: "tx1".into(),
+        };
+        let v2 = serde_json::to_value(&some).unwrap();
+        assert_eq!(v2["category"], "cat-1");
     }
 
     #[test]

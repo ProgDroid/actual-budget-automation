@@ -41,6 +41,14 @@ async function handle(req) {
       const payees = await api.getPayees();
       return payees.map((p) => ({ id: p.id, name: p.name }));
     }
+    case 'get_categories': {
+      const cats = await api.getCategories();
+      // Real categories carry a group_id; category *groups* do not — exclude
+      // groups so only assignable categories are offered.
+      return cats
+        .filter((c) => c && c.group_id)
+        .map((c) => ({ id: c.id, name: c.name }));
+    }
     case 'get_scheduled': {
       const { data } = await api.runQuery(
         api.q('schedules').select(['id', 'name', '_date', '_amount', '_payee'])

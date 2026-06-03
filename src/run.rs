@@ -489,6 +489,7 @@ pub async fn run(
         date: tx.date.format("%Y-%m-%d").to_string(),
         amount: tx.amount_minor,
         payee: payee_id.to_string(),
+        category: None,
         imported_id: tx.external_id.clone(),
     };
 
@@ -616,6 +617,7 @@ pub async fn run(
                 date: r.date.clone(),
                 amount: r.amount,
                 payee: pid,
+                category: None,
                 imported_id: if r.external_id.is_empty() {
                     format!("{}:{}", r.raw_merchant, r.date)
                 } else {
