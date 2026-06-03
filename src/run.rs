@@ -1079,6 +1079,10 @@ pub mod tests {
             create_new: false,
             suggestion: Some("Local Cafe".into()),
             confidence: Some("medium".into()),
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         };
         let p = build_prompt(&proposed, &payees);
@@ -1106,6 +1110,10 @@ pub mod tests {
             create_new: false,
             suggestion: None,
             confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         };
         let p2 = build_prompt(&unmatched, &payees);
@@ -1123,6 +1131,10 @@ pub mod tests {
             create_new: false,
             suggestion: Some("Sainsbury's".into()),
             confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         };
         let p3 = build_prompt(&failed, &payees);
@@ -1148,6 +1160,10 @@ pub mod tests {
             create_new: false,
             suggestion: Some("Local Cafe".into()),
             confidence: Some("medium".into()),
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         };
         let p = build_prompt(&entry, &payees);
@@ -1781,6 +1797,10 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                 create_new: false,
                 suggestion: None,
                 confidence: None,
+                category_suggestion: None,
+                category_confidence: None,
+                resolve_category_to: String::new(),
+                category_resolved: true,
                 telegram_message_id: None,
             }],
             ..State::default()
@@ -1914,6 +1934,10 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                 create_new: true,
                 suggestion: None,
                 confidence: None,
+                category_suggestion: None,
+                category_confidence: None,
+                resolve_category_to: String::new(),
+                category_resolved: true,
                 telegram_message_id: None,
             }],
             ..State::default()
@@ -2157,6 +2181,10 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             create_new: false,
             suggestion: None,
             confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         });
 

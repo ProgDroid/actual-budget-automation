@@ -14,6 +14,9 @@ pub struct State {
     /// raw merchant -> resolved Actual payee name.
     #[serde(default)]
     pub payee_cache: BTreeMap<String, String>,
+    /// raw merchant -> resolved Actual category name.
+    #[serde(default)]
+    pub category_cache: BTreeMap<String, String>,
     #[serde(default, rename = "pending_review")]
     pub pending_reviews: Vec<PendingReview>,
     #[serde(default)]
@@ -96,6 +99,22 @@ pub struct PendingReview {
     /// "medium" | "low" when this was a confidence-held proposal.
     #[serde(default)]
     pub confidence: Option<String>,
+    /// Claude's proposed category for a medium/low-confidence held category.
+    /// `None` = no category proposal (genuine no-match or not applicable).
+    #[serde(default)]
+    pub category_suggestion: Option<String>,
+    /// "medium" | "low" when this was a confidence-held category proposal.
+    #[serde(default)]
+    pub category_confidence: Option<String>,
+    /// Set to an existing category name to map to it. Empty = uncategorised.
+    #[serde(default)]
+    pub resolve_category_to: String,
+    /// `true` once the category dimension is settled (confirmed / remapped /
+    /// skipped) OR when no category question applies (set at construction). A
+    /// held entry awaiting a category decision has this `false`. The txn imports
+    /// only when this is true AND the payee dimension is settled.
+    #[serde(default)]
+    pub category_resolved: bool,
     /// `Some` once a Telegram prompt has been sent (idempotency guard).
     #[serde(default)]
     pub telegram_message_id: Option<i64>,
@@ -149,13 +168,15 @@ impl State {
         Ok(())
     }
 
-    /// Remove resolved pending reviews, fold their raw->payee mapping into the
-    /// cache, and return them for import. Unresolved entries are retained.
+    /// Remove fully-resolved pending reviews (both payee AND category dimensions
+    /// settled), fold their raw->payee and raw->category mappings into the caches,
+    /// and return them for import. Entries with either dimension unsettled remain.
     pub fn take_resolved(&mut self) -> Vec<ResolvedReview> {
         let mut resolved = Vec::new();
         let mut remaining = Vec::new();
         for pr in std::mem::take(&mut self.pending_reviews) {
-            let (payee_name, create_new) = if pr.create_new {
+            // Payee dimension (unchanged logic).
+            let payee = if pr.create_new {
                 let name = if !pr.resolve_to.is_empty() {
                     pr.resolve_to.clone()
                 } else if let Some(s) = &pr.suggestion {
@@ -163,15 +184,33 @@ impl State {
                 } else {
                     pr.raw_merchant.clone()
                 };
-                (name, true)
+                Some((name, true))
             } else if !pr.resolve_to.is_empty() {
-                (pr.resolve_to.clone(), false)
+                Some((pr.resolve_to.clone(), false))
             } else {
+                None
+            };
+            // Both dimensions must be settled to import.
+            let Some((payee_name, create_new)) = payee else {
                 remaining.push(pr);
                 continue;
             };
+            if !pr.category_resolved {
+                remaining.push(pr);
+                continue;
+            }
+            // Category name: empty resolve target = uncategorised (None).
+            let category_name = if pr.resolve_category_to.is_empty() {
+                None
+            } else {
+                Some(pr.resolve_category_to.clone())
+            };
             self.payee_cache
                 .insert(pr.raw_merchant.clone(), payee_name.clone());
+            if let Some(cat) = &category_name {
+                self.category_cache
+                    .insert(pr.raw_merchant.clone(), cat.clone());
+            }
             resolved.push(ResolvedReview {
                 external_id: pr.external_id,
                 raw_merchant: pr.raw_merchant,
@@ -179,6 +218,7 @@ impl State {
                 date: pr.date,
                 payee_name,
                 create_new,
+                category_name,
                 source_monzo_id: pr.source_monzo_id,
             });
         }
@@ -245,6 +285,10 @@ impl State {
             create_new: false,
             suggestion,
             confidence,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         });
         true
@@ -298,6 +342,59 @@ impl State {
             .retain(|p| p.external_id != external_id);
         self.pending_reviews.len() != before
     }
+
+    /// Confirm the held entry's suggested category (`category_suggestion` -> resolve target).
+    /// No-op returning `false` when there is no `category_suggestion` to confirm
+    /// (mirrors `confirm_pending`).
+    // Called from poll.rs (Task 6); suppress dead_code until that task lands.
+    #[allow(dead_code)]
+    pub fn confirm_category(&mut self, external_id: &str) -> bool {
+        if let Some(pr) = self
+            .pending_reviews
+            .iter_mut()
+            .find(|p| p.external_id == external_id)
+            && let Some(s) = pr.category_suggestion.clone()
+        {
+            pr.resolve_category_to = s;
+            pr.category_resolved = true;
+            return true;
+        }
+        false
+    }
+
+    /// Remap the held entry's category to a user-supplied name.
+    // Called from poll.rs (Task 6); suppress dead_code until that task lands.
+    #[allow(dead_code)]
+    pub fn remap_category(&mut self, external_id: &str, name: &str) -> bool {
+        if let Some(pr) = self
+            .pending_reviews
+            .iter_mut()
+            .find(|p| p.external_id == external_id)
+        {
+            pr.resolve_category_to = name.to_string();
+            pr.category_resolved = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Skip the category — import uncategorised (settles the dimension).
+    // Called from poll.rs (Task 6); suppress dead_code until that task lands.
+    #[allow(dead_code)]
+    pub fn skip_category(&mut self, external_id: &str) -> bool {
+        if let Some(pr) = self
+            .pending_reviews
+            .iter_mut()
+            .find(|p| p.external_id == external_id)
+        {
+            pr.resolve_category_to = String::new();
+            pr.category_resolved = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A pending review the user has resolved, ready to import.
@@ -311,6 +408,8 @@ pub struct ResolvedReview {
     pub payee_name: String,
     /// True if the payee must be created in Actual first.
     pub create_new: bool,
+    /// Final category name to use, or `None` for uncategorised.
+    pub category_name: Option<String>,
     /// Monzo account the resolved txn came from; routes its import.
     pub source_monzo_id: String,
 }
@@ -351,6 +450,10 @@ mod tests {
             create_new: false,
             suggestion: None,
             confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         });
         s.save(&path).unwrap();
@@ -372,6 +475,10 @@ mod tests {
             create_new: false,
             suggestion: None,
             confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         });
         // create new under explicit name
@@ -385,6 +492,10 @@ mod tests {
             create_new: true,
             suggestion: None,
             confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         });
         // unresolved -> stays
@@ -398,6 +509,10 @@ mod tests {
             create_new: false,
             suggestion: None,
             confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: None,
         });
 
@@ -446,6 +561,10 @@ mod tests {
             create_new: false,
             suggestion: Some("Transport for London".into()),
             confidence: Some("medium".into()),
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
             telegram_message_id: Some(1001),
         });
         s.save(&path).unwrap();
@@ -527,6 +646,104 @@ mod tests {
         let mut s = State::default();
         assert!(s.add_pending_full("ext1", "Cafe", -450, "2026-05-30", None, None, "acc_2"));
         assert_eq!(s.pending_reviews[0].source_monzo_id, "acc_2");
+    }
+
+    #[test]
+    fn take_resolved_waits_for_both_dimensions() {
+        let mut s = State::default();
+        // payee resolved, category NOT resolved -> must stay pending
+        s.pending_reviews.push(PendingReview {
+            external_id: "tx1".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "TESCO".into(),
+            amount: -500,
+            date: "2026-06-01".into(),
+            resolve_to: "Tesco".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Groceries".into()),
+            category_confidence: Some("medium".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+        });
+        let taken = s.take_resolved();
+        assert!(
+            taken.is_empty(),
+            "payee-only resolution must not import yet"
+        );
+        assert_eq!(s.pending_reviews.len(), 1);
+
+        // now settle the category dimension via confirm
+        assert!(s.confirm_category("tx1"));
+        let taken2 = s.take_resolved();
+        assert_eq!(taken2.len(), 1);
+        assert_eq!(taken2[0].payee_name, "Tesco");
+        assert_eq!(taken2[0].category_name.as_deref(), Some("Groceries"));
+        // category folded into the category cache
+        assert_eq!(
+            s.category_cache.get("TESCO").map(String::as_str),
+            Some("Groceries")
+        );
+    }
+
+    #[test]
+    fn skip_category_settles_as_uncategorised() {
+        let mut s = State::default();
+        s.pending_reviews.push(PendingReview {
+            external_id: "tx2".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "ODD SHOP".into(),
+            amount: -100,
+            date: "2026-06-01".into(),
+            resolve_to: "Odd Shop".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Groceries".into()),
+            category_confidence: Some("low".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+        });
+        assert!(s.skip_category("tx2"));
+        let taken = s.take_resolved();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            taken[0].category_name, None,
+            "skipped category imports uncategorised"
+        );
+        // a skipped (empty) category is NOT written to the cache
+        assert!(!s.category_cache.contains_key("ODD SHOP"));
+    }
+
+    #[test]
+    fn remap_category_sets_resolve_target() {
+        let mut s = State::default();
+        s.pending_reviews.push(PendingReview {
+            external_id: "tx3".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "X".into(),
+            amount: -10,
+            date: "2026-06-01".into(),
+            resolve_to: "X Payee".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Groceries".into()),
+            category_confidence: Some("low".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+        });
+        assert!(s.remap_category("tx3", "Dining Out"));
+        assert!(s.pending_reviews[0].category_resolved);
+        assert_eq!(s.pending_reviews[0].resolve_category_to, "Dining Out");
+        // end-to-end: both dimensions settled -> imports with the remapped category
+        let taken = s.take_resolved();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].category_name.as_deref(), Some("Dining Out"));
     }
 
     #[test]
