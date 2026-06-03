@@ -2700,4 +2700,144 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "two nonces must differ");
     }
+
+    // ---- Task 8: end-to-end category integration tests ----
+
+    #[tokio::test]
+    async fn high_confidence_imports_with_category() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim); // payees: Local Cafe; cats: Groceries, Dining
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        state.monzo.accounts.push(crate::state::AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "acc".into(),
+            ..Default::default()
+        });
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
+        };
+        let claude = FakeClaude {
+            out: vec![Classification {
+                raw: "SQ *CAFE".into(),
+                payee: Some("Local Cafe".into()),
+                payee_confidence: Confidence::High,
+                category: Some("Dining".into()),
+                category_confidence: Confidence::High,
+            }],
+        };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&imports_log).unwrap();
+        assert!(logged.contains("p_cafe"), "imported under Local Cafe id");
+        assert!(
+            logged.contains("c_din"),
+            "imported with the Dining category id"
+        );
+        assert!(state.pending_reviews.is_empty(), "nothing held");
+        assert_eq!(
+            state.category_cache.get("SQ *CAFE").map(String::as_str),
+            Some("Dining")
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_category_holds_then_imports_after_category_confirm() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        state.monzo.accounts.push(crate::state::AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "acc".into(),
+            ..Default::default()
+        });
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
+        };
+        let claude = FakeClaude {
+            out: vec![Classification {
+                raw: "SQ *CAFE".into(),
+                payee: Some("Local Cafe".into()),
+                payee_confidence: Confidence::High, // payee confident + exists
+                category: Some("Dining".into()),
+                category_confidence: Confidence::Low, // category uncertain -> held
+            }],
+        };
+        // Run #1: held (payee pre-settled), category prompt sent, nothing imported.
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !imports_log.exists(),
+            "must not import while category unsettled"
+        );
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert!(state.pending_reviews[0].category_suggestion.as_deref() == Some("Dining"));
+        // Bind the check inside the block so the MutexGuard drops at its last
+        // use (before the assert and any later await), satisfying clippy's
+        // significant_drop_tightening.
+        let category_prompt_sent = {
+            let sent = channel.sent.lock().unwrap();
+            sent[0].chat_text.to_lowercase().contains("category")
+        };
+        assert!(category_prompt_sent, "category prompt sent");
+
+        // User confirms the category (what poll would do).
+        assert!(state.confirm_category("tx_cafe"));
+
+        // Run #2: no new txs -> the held tx imports with the Dining category.
+        let mut bank2 = FakeBank { txs: vec![] };
+        let claude2 = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank2,
+            &actual,
+            &claude2,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+        let logged = std::fs::read_to_string(&imports_log).unwrap();
+        assert!(logged.contains("tx_cafe") && logged.contains("c_din"));
+        assert!(state.pending_reviews.is_empty());
+    }
 }
