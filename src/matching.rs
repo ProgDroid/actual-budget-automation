@@ -88,6 +88,7 @@ mod tests {
             date,
             amount_minor: amount,
             raw_merchant: merchant.into(),
+            source_monzo_id: "acc_1".into(),
         }
     }
 

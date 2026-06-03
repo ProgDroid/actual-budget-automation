@@ -231,6 +231,7 @@ impl BankSource for Monzo {
                     date: t.created.date_naive(),
                     amount_minor: t.amount,
                     raw_merchant,
+                    source_monzo_id: self.monzo.account_id.clone(),
                 }
             })
             .collect();

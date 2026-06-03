@@ -17,6 +17,8 @@ pub struct RawTransaction {
     pub amount_minor: i64,
     /// Best raw merchant string (merchant name, fallback description).
     pub raw_merchant: String,
+    /// Monzo account id this transaction was fetched from; routes the import.
+    pub source_monzo_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +56,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 5, 30).unwrap(),
             amount_minor: -450,
             raw_merchant: "SQ *SOME CAFE".into(),
+            source_monzo_id: "acc_1".into(),
         };
         assert_eq!(tx.amount_minor, -450);
         assert_eq!(tx.raw_merchant, "SQ *SOME CAFE");

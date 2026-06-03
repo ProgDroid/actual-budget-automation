@@ -683,6 +683,7 @@ pub mod tests {
             date: NaiveDate::from_ymd_opt(2026, 5, 30).unwrap(),
             amount_minor: amount,
             raw_merchant: merchant.into(),
+            source_monzo_id: "acc_1".into(),
         }
     }
 
