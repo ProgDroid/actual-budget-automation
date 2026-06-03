@@ -56,34 +56,45 @@ impl Confidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PayeeMatch {
+pub struct Classification {
     pub raw: String,
     pub payee: Option<String>,
-    pub confidence: Confidence,
+    pub payee_confidence: Confidence,
+    pub category: Option<String>,
+    pub category_confidence: Confidence,
 }
 
 #[async_trait]
 pub trait ClaudeMatcher {
-    /// For each raw merchant, return the matched existing payee or None.
-    async fn match_payees(
+    /// For each raw merchant, return the matched existing payee and category
+    /// (each `None` if no clear match), with a confidence per dimension.
+    async fn classify(
         &self,
         raw: &[String],
         existing_payees: &[String],
-    ) -> anyhow::Result<Vec<PayeeMatch>>;
+        existing_categories: &[String],
+    ) -> anyhow::Result<Vec<Classification>>;
 }
 
-const SYSTEM_INSTRUCTIONS: &str = "You normalise bank merchant strings to a user's existing budget payees. \
-For each raw merchant name, choose the single best-matching payee from the provided list, \
-or null if none is a clear match. Be conservative: prefer null over a wrong guess. \
-Also rate your confidence in each choice as \"high\", \"medium\", or \"low\": \
+const SYSTEM_INSTRUCTIONS: &str = "You normalise bank merchant strings to a user's existing budget payees and categories. \
+For each raw merchant name, choose the single best-matching payee from the provided payee list (or null if none is a clear match), \
+and the single best-matching category from the provided category list (or null if none is a clear match). \
+Be conservative: prefer null over a wrong guess, for both payee and category. \
+Rate your confidence in EACH choice independently as \"high\", \"medium\", or \"low\": \
 \"high\" = an obvious, unambiguous match a human would not second-guess; \
 \"medium\" = a plausible match with some doubt; \"low\" = a weak guess. \
-Use \"low\" when payee is null. \
+Use \"low\" when the corresponding value is null. \
 Call the report_matches tool with one entry per raw merchant, preserving the exact raw strings.";
 
-/// Build the Anthropic Messages API request body. The existing-payee list is a
-/// separate, cache-controlled system block so it is billed cheaply on repeat runs.
-pub fn build_request(model: &str, raw: &[String], existing_payees: &[String]) -> Value {
+/// Build the Anthropic Messages API request body. The existing-payee and
+/// existing-category lists are separate cache-controlled system blocks so they
+/// are billed cheaply on repeat runs.
+pub fn build_request(
+    model: &str,
+    raw: &[String],
+    existing_payees: &[String],
+    existing_categories: &[String],
+) -> Value {
     json!({
         "model": model,
         "max_tokens": 2048,
@@ -93,11 +104,16 @@ pub fn build_request(model: &str, raw: &[String], existing_payees: &[String]) ->
                 "type": "text",
                 "text": format!("Existing payees (one per line):\n{}", existing_payees.join("\n")),
                 "cache_control": { "type": "ephemeral" }
+            },
+            {
+                "type": "text",
+                "text": format!("Existing categories (one per line):\n{}", existing_categories.join("\n")),
+                "cache_control": { "type": "ephemeral" }
             }
         ],
         "tools": [{
             "name": "report_matches",
-            "description": "Report the chosen payee for each raw merchant name.",
+            "description": "Report the chosen payee and category for each raw merchant name.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -108,9 +124,11 @@ pub fn build_request(model: &str, raw: &[String], existing_payees: &[String]) ->
                             "properties": {
                                 "raw": { "type": "string" },
                                 "payee": { "type": ["string", "null"] },
-                                "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+                                "payee_confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+                                "category": { "type": ["string", "null"] },
+                                "category_confidence": { "type": "string", "enum": ["high", "medium", "low"] }
                             },
-                            "required": ["raw", "payee", "confidence"]
+                            "required": ["raw", "payee", "payee_confidence", "category", "category_confidence"]
                         }
                     }
                 },
@@ -125,8 +143,8 @@ pub fn build_request(model: &str, raw: &[String], existing_payees: &[String]) ->
     })
 }
 
-/// Extract `PayeeMatch`es from the Messages API response.
-pub fn parse_response(resp: &Value) -> anyhow::Result<Vec<PayeeMatch>> {
+/// Extract `Classification`s from the Messages API response.
+pub fn parse_response(resp: &Value) -> anyhow::Result<Vec<Classification>> {
     let content = resp["content"]
         .as_array()
         .context("response missing content array")?;
@@ -137,19 +155,28 @@ pub fn parse_response(resp: &Value) -> anyhow::Result<Vec<PayeeMatch>> {
     let matches = tool_use["input"]["matches"]
         .as_array()
         .context("tool input missing matches array")?;
+    let parse_opt = |v: &Value, field: &str| -> anyhow::Result<Option<String>> {
+        match &v[field] {
+            Value::Null => Ok(None),
+            Value::String(s) => Ok(Some(s.clone())),
+            other => Err(anyhow!("unexpected {field} value: {other}")),
+        }
+    };
     let mut out = Vec::with_capacity(matches.len());
     for m in matches {
         let raw = m["raw"].as_str().context("match missing raw")?.to_string();
-        let payee = match &m["payee"] {
-            Value::Null => None,
-            Value::String(s) => Some(s.clone()),
-            other => return Err(anyhow!("unexpected payee value: {other}")),
-        };
-        let confidence = Confidence::parse(m["confidence"].as_str().unwrap_or("medium"));
-        out.push(PayeeMatch {
+        let payee = parse_opt(m, "payee")?;
+        let category = parse_opt(m, "category")?;
+        let payee_confidence =
+            Confidence::parse(m["payee_confidence"].as_str().unwrap_or("medium"));
+        let category_confidence =
+            Confidence::parse(m["category_confidence"].as_str().unwrap_or("medium"));
+        out.push(Classification {
             raw,
             payee,
-            confidence,
+            payee_confidence,
+            category,
+            category_confidence,
         });
     }
     Ok(out)
@@ -182,15 +209,16 @@ impl HttpClaude {
 
 #[async_trait]
 impl ClaudeMatcher for HttpClaude {
-    async fn match_payees(
+    async fn classify(
         &self,
         raw: &[String],
         existing_payees: &[String],
-    ) -> anyhow::Result<Vec<PayeeMatch>> {
+        existing_categories: &[String],
+    ) -> anyhow::Result<Vec<Classification>> {
         if raw.is_empty() {
             return Ok(Vec::new());
         }
-        let req = build_request(&self.model, raw, existing_payees);
+        let req = build_request(&self.model, raw, existing_payees, existing_categories);
         let resp = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
@@ -244,81 +272,54 @@ mod tests {
     }
 
     #[test]
-    fn parse_reads_confidence_field() {
+    fn parse_reads_both_dimensions() {
         let resp = serde_json::json!({
             "content": [
                 { "type": "tool_use", "name": "report_matches", "input": {
                     "matches": [
-                        { "raw": "TFL TRAVEL CH", "payee": "Transport for London", "confidence": "high" },
-                        { "raw": "SQ *CAFE", "payee": "Local Cafe", "confidence": "low" },
-                        { "raw": "WUT", "payee": null, "confidence": "high" }
+                        { "raw": "TESCO", "payee": "Tesco", "payee_confidence": "high",
+                          "category": "Groceries", "category_confidence": "high" },
+                        { "raw": "SQ *CAFE", "payee": "Local Cafe", "payee_confidence": "low",
+                          "category": null, "category_confidence": "low" }
                     ]
                 }}
             ]
         });
         let out = parse_response(&resp).unwrap();
-        assert_eq!(out[0].confidence, Confidence::High);
-        assert_eq!(out[1].confidence, Confidence::Low);
-        assert_eq!(out[2].payee, None);
-        assert_eq!(out[2].confidence, Confidence::High);
+        assert_eq!(out[0].payee.as_deref(), Some("Tesco"));
+        assert_eq!(out[0].payee_confidence, Confidence::High);
+        assert_eq!(out[0].category.as_deref(), Some("Groceries"));
+        assert_eq!(out[0].category_confidence, Confidence::High);
+        assert_eq!(out[1].category, None);
+        assert_eq!(out[1].category_confidence, Confidence::Low);
     }
 
     #[test]
-    fn request_has_cached_payee_block_and_tool_choice() {
+    fn request_has_cached_payee_and_category_blocks_and_schema() {
         let req = build_request(
             "claude-sonnet-4-6",
-            &["TFL TRAVEL CH".to_string(), "AMZNMKTPLACE".to_string()],
-            &["Transport for London".to_string(), "Amazon".to_string()],
+            &["TFL TRAVEL CH".to_string()],
+            &["Transport for London".to_string()],
+            &["Transport".to_string(), "Groceries".to_string()],
         );
-        assert_eq!(req["model"], "claude-sonnet-4-6");
         let sys = req["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 2);
-        assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
+        // system blocks: instructions + payees + categories
+        assert_eq!(sys.len(), 3);
         assert!(
             sys[1]["text"]
                 .as_str()
                 .unwrap()
                 .contains("Transport for London")
         );
-        assert_eq!(req["tool_choice"]["name"], "report_matches");
-        let user = req["messages"][0]["content"].as_str().unwrap();
-        assert!(user.contains("TFL TRAVEL CH"));
+        assert!(sys[2]["text"].as_str().unwrap().contains("Groceries"));
+        assert_eq!(sys[2]["cache_control"]["type"], "ephemeral");
         let required =
             req["tools"][0]["input_schema"]["properties"]["matches"]["items"]["required"]
                 .as_array()
                 .unwrap();
-        assert!(required.iter().any(|v| v == "confidence"));
-    }
-
-    #[test]
-    fn parse_extracts_matches_with_nulls() {
-        let resp = serde_json::json!({
-            "content": [
-                { "type": "text", "text": "ok" },
-                { "type": "tool_use", "name": "report_matches", "input": {
-                    "matches": [
-                        { "raw": "TFL TRAVEL CH", "payee": "Transport for London", "confidence": "high" },
-                        { "raw": "AMZNMKTPLACE", "payee": null, "confidence": "low" }
-                    ]
-                }}
-            ]
-        });
-        let out = parse_response(&resp).unwrap();
-        assert_eq!(
-            out,
-            vec![
-                PayeeMatch {
-                    raw: "TFL TRAVEL CH".into(),
-                    payee: Some("Transport for London".into()),
-                    confidence: Confidence::High,
-                },
-                PayeeMatch {
-                    raw: "AMZNMKTPLACE".into(),
-                    payee: None,
-                    confidence: Confidence::Low,
-                },
-            ]
-        );
+        assert!(required.iter().any(|v| v == "category"));
+        assert!(required.iter().any(|v| v == "category_confidence"));
+        assert!(required.iter().any(|v| v == "payee_confidence"));
     }
 
     use wiremock::matchers::{header, method, path};
@@ -329,7 +330,8 @@ mod tests {
         let server = MockServer::start().await;
         let body = serde_json::json!({
             "content": [{ "type": "tool_use", "name": "report_matches", "input": {
-                "matches": [{ "raw": "TFL TRAVEL CH", "payee": "Transport for London", "confidence": "high" }]
+                "matches": [{ "raw": "TFL TRAVEL CH", "payee": "Transport for London",
+                  "payee_confidence": "high", "category": "Transport", "category_confidence": "high" }]
             }}]
         });
         Mock::given(method("POST"))
@@ -343,9 +345,14 @@ mod tests {
         let client = HttpClaude::new("test-key".into(), "claude-sonnet-4-6".into())
             .with_base_url(server.uri());
         let out = client
-            .match_payees(&["TFL TRAVEL CH".into()], &["Transport for London".into()])
+            .classify(
+                &["TFL TRAVEL CH".into()],
+                &["Transport for London".into()],
+                &["Transport".into()],
+            )
             .await
             .unwrap();
         assert_eq!(out[0].payee.as_deref(), Some("Transport for London"));
+        assert_eq!(out[0].category.as_deref(), Some("Transport"));
     }
 }

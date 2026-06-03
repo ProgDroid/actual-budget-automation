@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use crate::actual::ActualClient;
 use crate::actual::shim_protocol::{ImportTxn, Payee, ScheduleRow};
 use crate::banks::{BankError, BankSource, RawTransaction};
-use crate::claude::{ClaudeMatcher, Confidence, PayeeMatch};
+use crate::claude::{Classification, ClaudeMatcher, Confidence};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
 use crate::matching::{Schedule, best_payee_match, matches_scheduled};
 use crate::notify::Notifier;
@@ -81,11 +81,12 @@ pub struct MatchOutcome {
 #[allow(clippy::similar_names)]
 pub fn apply_matches(
     txs: &[RawTransaction],
-    matches: &[PayeeMatch],
+    matches: &[Classification],
     autoimport: Confidence,
     existing: &BTreeSet<&str>,
 ) -> MatchOutcome {
-    let lookup: BTreeMap<&str, &PayeeMatch> = matches.iter().map(|m| (m.raw.as_str(), m)).collect();
+    let lookup: BTreeMap<&str, &Classification> =
+        matches.iter().map(|m| (m.raw.as_str(), m)).collect();
     let mut matched = Vec::new();
     let mut proposed = Vec::new();
     let mut unmatched = Vec::new();
@@ -96,12 +97,12 @@ pub fn apply_matches(
                 // exists in Actual — otherwise it would be silently dropped at
                 // import (no payee id), so hold it for review instead.
                 Some(payee)
-                    if m.confidence.rank() >= autoimport.rank()
+                    if m.payee_confidence.rank() >= autoimport.rank()
                         && existing.contains(payee.as_str()) =>
                 {
                     matched.push((tx.external_id.clone(), payee.clone()));
                 }
-                Some(payee) => proposed.push((tx.clone(), payee.clone(), m.confidence)),
+                Some(payee) => proposed.push((tx.clone(), payee.clone(), m.payee_confidence)),
                 None => unmatched.push(tx.clone()),
             },
             None => unmatched.push(tx.clone()),
@@ -461,13 +462,14 @@ pub async fn run(
 
     // 5b. Cache split + Claude for the rest.
     let plan = plan_resolution(&candidates, &state.payee_cache);
-    let claude_matches: Vec<PayeeMatch> = if plan.needs_claude.is_empty() {
+    let category_names: Vec<String> = Vec::new(); // wired in Task 5
+    let claude_matches: Vec<Classification> = if plan.needs_claude.is_empty() {
         Vec::new()
     } else {
         claude
-            .match_payees(&plan.needs_claude, &payee_names)
+            .classify(&plan.needs_claude, &payee_names, &category_names)
             .await
-            .context("claude match")?
+            .context("claude classify")?
     };
     let unknown_txs: Vec<RawTransaction> = candidates
         .iter()
@@ -903,7 +905,7 @@ pub mod tests {
     use super::*;
     use crate::actual::ActualClient;
     use crate::banks::{BankError, BankSource, RawTransaction};
-    use crate::claude::{ClaudeMatcher, Confidence, PayeeMatch};
+    use crate::claude::{Classification, ClaudeMatcher, Confidence};
     use crate::notify::Notifier;
     use crate::state::PendingReview;
     use crate::telegram::{ConfirmChannel, Prompt, Reply};
@@ -1034,20 +1036,26 @@ pub mod tests {
             tx("3", "WEIRD XYZ", -100), // none -> unmatched/held
         ];
         let matches = vec![
-            PayeeMatch {
+            Classification {
                 raw: "TESCO".into(),
                 payee: Some("Tesco".into()),
-                confidence: Confidence::High,
+                payee_confidence: Confidence::High,
+                category: None,
+                category_confidence: Confidence::Low,
             },
-            PayeeMatch {
+            Classification {
                 raw: "SQ *CAFE".into(),
                 payee: Some("Local Cafe".into()),
-                confidence: Confidence::Medium,
+                payee_confidence: Confidence::Medium,
+                category: None,
+                category_confidence: Confidence::Low,
             },
-            PayeeMatch {
+            Classification {
                 raw: "WEIRD XYZ".into(),
                 payee: None,
-                confidence: Confidence::Low,
+                payee_confidence: Confidence::Low,
+                category: None,
+                category_confidence: Confidence::Low,
             },
         ];
         let existing: BTreeSet<&str> = ["Tesco", "Local Cafe"].iter().copied().collect();
@@ -1197,15 +1205,16 @@ pub mod tests {
     }
 
     struct FakeClaude {
-        out: Vec<PayeeMatch>,
+        out: Vec<Classification>,
     }
     #[async_trait]
     impl ClaudeMatcher for FakeClaude {
-        async fn match_payees(
+        async fn classify(
             &self,
             _raw: &[String],
             _p: &[String],
-        ) -> anyhow::Result<Vec<PayeeMatch>> {
+            _c: &[String],
+        ) -> anyhow::Result<Vec<Classification>> {
             Ok(self.out.clone())
         }
     }
@@ -1424,10 +1433,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
         };
         let claude = FakeClaude {
-            out: vec![PayeeMatch {
+            out: vec![Classification {
                 raw: "SQ *CAFE".into(),
                 payee: Some("Local Cafe".into()),
-                confidence: Confidence::Medium,
+                payee_confidence: Confidence::Medium,
+                category: None,
+                category_confidence: Confidence::Low,
             }],
         };
         run(
@@ -1529,15 +1540,19 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         };
         let claude = FakeClaude {
             out: vec![
-                PayeeMatch {
+                Classification {
                     raw: "SQ *CAFE".into(),
                     payee: Some("Local Cafe".into()),
-                    confidence: Confidence::High,
+                    payee_confidence: Confidence::High,
+                    category: None,
+                    category_confidence: Confidence::Low,
                 },
-                PayeeMatch {
+                Classification {
                     raw: "BILLS LTD".into(),
                     payee: Some("Bills Co".into()),
-                    confidence: Confidence::High,
+                    payee_confidence: Confidence::High,
+                    category: None,
+                    category_confidence: Confidence::Low,
                 },
             ],
         };
@@ -1597,10 +1612,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
         };
         let claude = FakeClaude {
-            out: vec![PayeeMatch {
+            out: vec![Classification {
                 raw: "SQ *CAFE".into(),
                 payee: Some("Local Cafe".into()),
-                confidence: Confidence::Medium,
+                payee_confidence: Confidence::Medium,
+                category: None,
+                category_confidence: Confidence::Low,
             }],
         };
         run(
@@ -1646,10 +1663,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
         };
         let claude = FakeClaude {
-            out: vec![PayeeMatch {
+            out: vec![Classification {
                 raw: "SQ *CAFE".into(),
                 payee: Some("Local Cafe".into()),
-                confidence: Confidence::Medium,
+                payee_confidence: Confidence::Medium,
+                category: None,
+                category_confidence: Confidence::Low,
             }],
         };
         run(
@@ -2101,10 +2120,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         };
         // Claude returns a HIGH-confidence payee that does NOT exist in Actual.
         let claude = FakeClaude {
-            out: vec![PayeeMatch {
+            out: vec![Classification {
                 raw: "SQ *GHOST".into(),
                 payee: Some("Ghost Payee".into()),
-                confidence: Confidence::High,
+                payee_confidence: Confidence::High,
+                category: None,
+                category_confidence: Confidence::Low,
             }],
         };
         run(
