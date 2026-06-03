@@ -90,6 +90,7 @@ mod tests {
             "2026-06-01",
             Some("Local Cafe".into()),
             Some("medium".into()),
+            "",
         );
         state.pending_reviews[0].telegram_message_id = Some(500);
 

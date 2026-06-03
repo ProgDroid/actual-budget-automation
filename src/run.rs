@@ -810,6 +810,7 @@ pub mod tests {
         // proposed, suggestion exists -> confirm/create/skip
         let proposed = PendingReview {
             external_id: "tx1".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "SQ *CAFE".into(),
             amount: -450,
             date: "2026-06-01".into(),
@@ -836,6 +837,7 @@ pub mod tests {
         // no-match -> create/skip only
         let unmatched = PendingReview {
             external_id: "tx2".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "MYSTERY".into(),
             amount: -10,
             date: "2026-06-01".into(),
@@ -852,6 +854,7 @@ pub mod tests {
         // failed remap: suggestion set but NOT in payees -> "create it?" flavor
         let failed = PendingReview {
             external_id: "tx3".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "X".into(),
             amount: -10,
             date: "2026-06-01".into(),
@@ -876,6 +879,7 @@ pub mod tests {
         let payees = vec!["Local Cafe".to_string()];
         let entry = PendingReview {
             external_id: long_id,
+            source_monzo_id: String::new(),
             raw_merchant: "SQ *CAFE".into(),
             amount: -450,
             date: "2026-06-01".into(),
@@ -1378,10 +1382,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             monzo: crate::state::MonzoState {
                 refresh_token: "old".into(),
                 account_id: "acc".into(),
+                accounts: Vec::new(),
             },
             payee_cache: BTreeMap::from([("KEPT".to_string(), "Kept Payee".to_string())]),
             pending_reviews: vec![PendingReview {
                 external_id: "p1".into(),
+                source_monzo_id: String::new(),
                 raw_merchant: "RESOLVE_ME".into(),
                 amount: -100,
                 date: "2026-06-01".into(),
@@ -1454,6 +1460,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             monzo: crate::state::MonzoState {
                 refresh_token: "old".into(),
                 account_id: "acc".into(),
+                accounts: Vec::new(),
             },
             ..State::default()
         };
@@ -1501,9 +1508,11 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             monzo: crate::state::MonzoState {
                 refresh_token: String::new(),
                 account_id: "acc".into(),
+                accounts: Vec::new(),
             },
             pending_reviews: vec![PendingReview {
                 external_id: "tx_x".into(),
+                source_monzo_id: String::new(),
                 raw_merchant: "MyStore".into(),
                 amount: -500,
                 date: "2026-05-30".into(),
@@ -1570,6 +1579,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             "2026-06-01",
             Some("Local Cafe".into()),
             Some("medium".into()),
+            "",
         );
         state.pending_reviews[0].telegram_message_id = Some(500);
         assert!(state.remap_pending("tx1", "Nonexistent Payee"));
@@ -1626,6 +1636,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             "2026-06-01",
             Some("Local Cafe".into()),
             Some("medium".into()),
+            "",
         );
         state.pending_reviews[0].telegram_message_id = Some(500);
         assert!(state.remap_pending("tx1", "Nonexistent Payee"));

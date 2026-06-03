@@ -24,8 +24,29 @@ pub struct State {
 pub struct MonzoState {
     #[serde(default)]
     pub refresh_token: String,
+    /// Legacy single Monzo account id. Retained ONLY so old state files still
+    /// deserialise; migrated into `accounts` by `State::load`. Do not read directly.
     #[serde(default)]
     pub account_id: String,
+    /// Monzo→Actual account links. Empty until `aba accounts` populates it.
+    #[serde(default)]
+    pub accounts: Vec<AccountLink>,
+}
+
+/// One Monzo account mapped to one Actual account.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLink {
+    /// Monzo account id (`acc_…`) — used for fetching.
+    pub monzo_id: String,
+    /// Monzo display name (suggest/review UX only).
+    #[serde(default)]
+    pub monzo_name: String,
+    /// Actual account UUID — the import target. Empty = unmapped.
+    #[serde(default)]
+    pub actual_id: String,
+    /// Actual account name (suggest/review UX only).
+    #[serde(default)]
+    pub actual_name: String,
 }
 
 impl std::fmt::Debug for MonzoState {
@@ -40,6 +61,7 @@ impl std::fmt::Debug for MonzoState {
                 },
             )
             .field("account_id", &self.account_id)
+            .field("accounts", &self.accounts)
             .finish()
     }
 }
@@ -55,6 +77,9 @@ pub struct TelegramState {
 pub struct PendingReview {
     #[serde(default)]
     pub external_id: String,
+    /// Monzo account this held txn came from; routes the import once resolved.
+    #[serde(default)]
+    pub source_monzo_id: String,
     pub raw_merchant: String,
     pub amount: i64,
     pub date: String,
@@ -81,9 +106,26 @@ impl State {
         // path comes from CLI config, not from untrusted user input
         let read_result = std::fs::read_to_string(path); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         match read_result {
-            Ok(s) => Ok(toml::from_str(&s)?),
+            Ok(s) => {
+                let mut state: Self = toml::from_str(&s)?;
+                state.migrate_legacy_account();
+                Ok(state)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// One-time migration: an old state file has a single `monzo.account_id`
+    /// (the Monzo id) and no `accounts`. Promote it to a single UNMAPPED link —
+    /// `actual_id` is left empty because the legacy value was the Monzo side
+    /// only; the user supplies the Actual side via `aba accounts`.
+    fn migrate_legacy_account(&mut self) {
+        if self.monzo.accounts.is_empty() && !self.monzo.account_id.is_empty() {
+            self.monzo.accounts.push(AccountLink {
+                monzo_id: std::mem::take(&mut self.monzo.account_id),
+                ..AccountLink::default()
+            });
         }
     }
 
@@ -137,6 +179,7 @@ impl State {
                 date: pr.date,
                 payee_name,
                 create_new,
+                source_monzo_id: pr.source_monzo_id,
             });
         }
         self.pending_reviews = remaining;
@@ -147,7 +190,8 @@ impl State {
     pub fn monzo_clone(&self) -> MonzoState {
         MonzoState {
             refresh_token: self.monzo.refresh_token.clone(),
-            account_id: self.monzo.account_id.clone(),
+            account_id: String::new(),
+            accounts: self.monzo.accounts.clone(),
         }
     }
 
@@ -159,11 +203,21 @@ impl State {
         raw_merchant: &str,
         amount: i64,
         date: &str,
+        source_monzo_id: &str,
     ) -> bool {
-        self.add_pending_full(external_id, raw_merchant, amount, date, None, None)
+        self.add_pending_full(
+            external_id,
+            raw_merchant,
+            amount,
+            date,
+            None,
+            None,
+            source_monzo_id,
+        )
     }
 
     /// Add a pending review with an optional Claude suggestion + confidence.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_pending_full(
         &mut self,
         external_id: &str,
@@ -172,6 +226,7 @@ impl State {
         date: &str,
         suggestion: Option<String>,
         confidence: Option<String>,
+        source_monzo_id: &str,
     ) -> bool {
         if self
             .pending_reviews
@@ -182,6 +237,7 @@ impl State {
         }
         self.pending_reviews.push(PendingReview {
             external_id: external_id.to_string(),
+            source_monzo_id: source_monzo_id.to_string(),
             raw_merchant: raw_merchant.to_string(),
             amount,
             date: date.to_string(),
@@ -255,6 +311,7 @@ pub struct ResolvedReview {
     pub payee_name: String,
     /// True if the payee must be created in Actual first.
     pub create_new: bool,
+    pub source_monzo_id: String,
 }
 
 #[cfg(test)]
@@ -276,11 +333,16 @@ mod tests {
         let path = dir.path().join("s.state.toml");
         let mut s = State::default();
         s.monzo.refresh_token = "rt_123".into();
-        s.monzo.account_id = "acc_1".into();
+        s.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "uuid-1".into(),
+            ..AccountLink::default()
+        });
         s.payee_cache
             .insert("TFL TRAVEL CH".into(), "Transport for London".into());
         s.pending_reviews.push(PendingReview {
             external_id: "tx_cafe_save".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "SQ *SOME CAFE".into(),
             amount: -450,
             date: "2026-05-30".into(),
@@ -301,6 +363,7 @@ mod tests {
         // resolved to existing payee
         s.pending_reviews.push(PendingReview {
             external_id: "tx_tfl".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "TFL TRAVEL CH".into(),
             amount: -275,
             date: "2026-05-30".into(),
@@ -313,6 +376,7 @@ mod tests {
         // create new under explicit name
         s.pending_reviews.push(PendingReview {
             external_id: "tx_cafe".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "SQ *SOME CAFE".into(),
             amount: -450,
             date: "2026-05-30".into(),
@@ -325,6 +389,7 @@ mod tests {
         // unresolved -> stays
         s.pending_reviews.push(PendingReview {
             external_id: "tx_amzn".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "AMZNMKTPLACE".into(),
             amount: -1999,
             date: "2026-05-31".into(),
@@ -357,8 +422,8 @@ mod tests {
     #[test]
     fn add_pending_dedupes_on_identity() {
         let mut s = State::default();
-        let added1 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31");
-        let added2 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31");
+        let added1 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31", "acc_1");
+        let added2 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31", "acc_1");
         assert!(added1);
         assert!(!added2);
         assert_eq!(s.pending_reviews.len(), 1);
@@ -372,6 +437,7 @@ mod tests {
         s.telegram.last_update_id = 42;
         s.pending_reviews.push(PendingReview {
             external_id: "tx1".into(),
+            source_monzo_id: String::new(),
             raw_merchant: "TFL TRAVEL CH".into(),
             amount: -275,
             date: "2026-05-30".into(),
@@ -396,6 +462,7 @@ mod tests {
             "2026-05-31",
             Some("Local Cafe".into()),
             Some("low".into()),
+            "",
         );
         assert!(added);
         let p = &s.pending_reviews[0];
@@ -409,6 +476,7 @@ mod tests {
         let m = MonzoState {
             refresh_token: "SECRET_RT".into(),
             account_id: "acc_1".into(),
+            accounts: Vec::new(),
         };
         let s = format!("{m:?}");
         assert!(
@@ -416,6 +484,47 @@ mod tests {
             "refresh_token must be redacted: {s}"
         );
         assert!(s.contains("acc_1"), "account_id is fine to show");
+    }
+
+    #[test]
+    fn legacy_account_id_migrates_to_unmapped_link() {
+        let toml = r#"
+            [monzo]
+            refresh_token = "rt"
+            account_id = "acc_legacy"
+        "#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), toml).unwrap();
+        let s = State::load(tmp.path()).unwrap();
+        assert_eq!(s.monzo.account_id, "", "legacy field cleared");
+        assert_eq!(s.monzo.accounts.len(), 1);
+        assert_eq!(s.monzo.accounts[0].monzo_id, "acc_legacy");
+        assert_eq!(
+            s.monzo.accounts[0].actual_id, "",
+            "unmapped until `aba accounts`"
+        );
+    }
+
+    #[test]
+    fn accounts_round_trip_and_no_double_migrate() {
+        let mut s = State::default();
+        s.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_1".into(),
+            monzo_name: "Personal".into(),
+            actual_id: "uuid-1".into(),
+            actual_name: "Monzo Personal".into(),
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        s.save(tmp.path()).unwrap();
+        let loaded = State::load(tmp.path()).unwrap();
+        assert_eq!(loaded.monzo.accounts, s.monzo.accounts);
+    }
+
+    #[test]
+    fn add_pending_stores_source_monzo_id() {
+        let mut s = State::default();
+        assert!(s.add_pending_full("ext1", "Cafe", -450, "2026-05-30", None, None, "acc_2"));
+        assert_eq!(s.pending_reviews[0].source_monzo_id, "acc_2");
     }
 
     #[test]
@@ -428,8 +537,9 @@ mod tests {
             "2026-06-01",
             Some("Aldi".into()),
             Some("medium".into()),
+            "",
         );
-        s.add_pending_full("b", "BBB", -2, "2026-06-01", None, None);
+        s.add_pending_full("b", "BBB", -2, "2026-06-01", None, None, "");
         s.add_pending_full(
             "c",
             "CCC",
@@ -437,10 +547,11 @@ mod tests {
             "2026-06-01",
             Some("Costa".into()),
             Some("low".into()),
+            "",
         );
-        s.add_pending_full("d", "DDD", -4, "2026-06-01", None, None);
+        s.add_pending_full("d", "DDD", -4, "2026-06-01", None, None, "");
         // dedicated no-suggestion entry: confirm must refuse to set resolve_to.
-        s.add_pending_full("e", "EEE", -5, "2026-06-01", None, None);
+        s.add_pending_full("e", "EEE", -5, "2026-06-01", None, None, "");
 
         // confirm on a None-suggestion entry is a no-op returning false.
         assert!(!s.confirm_pending("e"));

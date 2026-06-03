@@ -253,7 +253,12 @@ mod tests {
             base,
             crate::state::MonzoState {
                 refresh_token: "old_rt".into(),
-                account_id: "acc_1".into(),
+                account_id: String::new(),
+                accounts: vec![crate::state::AccountLink {
+                    monzo_id: "acc_1".into(),
+                    actual_id: "uuid-1".into(),
+                    ..Default::default()
+                }],
             },
         )
     }
@@ -344,6 +349,7 @@ mod tests {
             crate::state::MonzoState {
                 refresh_token: "rt".into(),
                 account_id: String::new(),
+                accounts: Vec::new(),
             },
         );
         m.set_access_token_for_test("at_x".into());
