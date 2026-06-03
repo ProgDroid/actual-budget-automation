@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use shim_protocol::{Account, ImportTxn, Payee, ScheduleRow, ShimRequest, ShimResponse};
+use shim_protocol::{Account, Category, ImportTxn, Payee, ScheduleRow, ShimRequest, ShimResponse};
 
 /// Spawns the Node shim once per operation, exchanging JSON over stdin/stdout.
 pub struct ActualClient {
@@ -121,6 +121,14 @@ impl ActualClient {
 
     /// # Errors
     /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
+    // Called from run.rs in Task 5; not yet wired into the binary.
+    #[allow(dead_code)]
+    pub async fn get_categories(&self) -> anyhow::Result<Vec<Category>> {
+        self.call(&ShimRequest::GetCategories).await
+    }
+
+    /// # Errors
+    /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
     pub async fn get_scheduled(&self) -> anyhow::Result<Vec<ScheduleRow>> {
         self.call(&ShimRequest::GetScheduled).await
     }
@@ -162,20 +170,23 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn fake_shim(dir: &tempfile::TempDir, script: &str) -> ActualClient {
+        std::fs::write(dir.path().join("index.js"), script).unwrap();
+        ActualClient::new(
+            dir.path().to_path_buf(),
+            true,
+            "http://t".into(),
+            "pw".into(),
+            "sync".into(),
+        )
+    }
+
     #[tokio::test]
     async fn get_payees_parses_data() {
         let dir = tempdir().unwrap();
         // Fake shim: ignore stdin content, print a canned ok envelope.
-        let fake = r"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'}]}));});";
-        std::fs::write(dir.path().join("index.js"), fake).unwrap();
-
-        let client = ActualClient::new(
-            dir.path().to_path_buf(),
-            false,
-            "http://test".into(),
-            "pw".into(),
-            "sync".into(),
-        );
+        let script = r"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'}]}));});";
+        let client = fake_shim(&dir, script);
         let payees = client.get_payees().await.unwrap();
         assert_eq!(
             payees,
@@ -184,5 +195,22 @@ mod tests {
                 name: "Amazon".into()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn get_categories_parses_id_and_name() {
+        let dir = tempdir().unwrap();
+        let script = r"
+let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
+  const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
+  if(req.op==='get_categories'){ out({ok:true,data:[{id:'c1',name:'Groceries'},{id:'c2',name:'Transport'}]}); }
+  else { out({ok:false,error:'unknown op'}); }
+});
+";
+        let client = fake_shim(&dir, script);
+        let cats = client.get_categories().await.unwrap();
+        assert_eq!(cats.len(), 2);
+        assert_eq!(cats[0].name, "Groceries");
+        assert_eq!(cats[1].id, "c2");
     }
 }

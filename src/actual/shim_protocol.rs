@@ -8,7 +8,7 @@ pub enum ShimRequest {
     GetAccounts,
     GetPayees,
     GetScheduled,
-    // Used by ActualClient::get_categories (Task 2).
+    // Used by ActualClient::get_categories; called from run.rs in Task 5.
     #[allow(dead_code)]
     GetCategories,
     ImportTransactions {
@@ -45,7 +45,7 @@ pub struct Payee {
     pub name: String,
 }
 
-// Used by ActualClient::get_categories (Task 2).
+// Used by ActualClient::get_categories; constructed from shim JSON in Task 5.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Category {
