@@ -120,6 +120,15 @@ pub struct PendingReview {
     pub telegram_message_id: Option<i64>,
 }
 
+impl PendingReview {
+    /// The payee dimension is settled once it maps to an existing payee or is
+    /// marked create-new.
+    #[must_use]
+    pub const fn payee_settled(&self) -> bool {
+        self.create_new || !self.resolve_to.is_empty()
+    }
+}
+
 impl State {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         // path comes from CLI config, not from untrusted user input
@@ -346,8 +355,6 @@ impl State {
     /// Confirm the held entry's suggested category (`category_suggestion` -> resolve target).
     /// No-op returning `false` when there is no `category_suggestion` to confirm
     /// (mirrors `confirm_pending`).
-    // Called from poll.rs (Task 6); suppress dead_code until that task lands.
-    #[allow(dead_code)]
     pub fn confirm_category(&mut self, external_id: &str) -> bool {
         if let Some(pr) = self
             .pending_reviews
@@ -363,8 +370,6 @@ impl State {
     }
 
     /// Remap the held entry's category to a user-supplied name.
-    // Called from poll.rs (Task 6); suppress dead_code until that task lands.
-    #[allow(dead_code)]
     pub fn remap_category(&mut self, external_id: &str, name: &str) -> bool {
         if let Some(pr) = self
             .pending_reviews
@@ -380,8 +385,6 @@ impl State {
     }
 
     /// Skip the category — import uncategorised (settles the dimension).
-    // Called from poll.rs (Task 6); suppress dead_code until that task lands.
-    #[allow(dead_code)]
     pub fn skip_category(&mut self, external_id: &str) -> bool {
         if let Some(pr) = self
             .pending_reviews

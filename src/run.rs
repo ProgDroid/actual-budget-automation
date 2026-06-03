@@ -330,7 +330,7 @@ fn build_prompt(
     };
 
     // Payee dimension is settled when create_new is set or resolve_to is non-empty.
-    let payee_settled = entry.create_new || !entry.resolve_to.is_empty();
+    let payee_settled = entry.payee_settled();
     if !payee_settled {
         // --- payee prompt (unchanged flavors) ---
         return match &entry.suggestion {
