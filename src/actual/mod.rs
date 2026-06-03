@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use shim_protocol::{ImportTxn, Payee, ScheduleRow, ShimRequest, ShimResponse};
+use shim_protocol::{Account, ImportTxn, Payee, ScheduleRow, ShimRequest, ShimResponse};
 
 /// Spawns the Node shim once per operation, exchanging JSON over stdin/stdout.
 pub struct ActualClient {
@@ -105,6 +105,13 @@ impl ActualClient {
                 Err(anyhow!("shim error: {safe}"))
             }
         }
+    }
+
+    #[allow(dead_code)] // wired into the `aba accounts` command in Task 6
+    /// # Errors
+    /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
+    pub async fn get_accounts(&self) -> anyhow::Result<Vec<Account>> {
+        self.call(&ShimRequest::GetAccounts).await
     }
 
     /// # Errors

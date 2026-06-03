@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ShimRequest {
+    GetAccounts,
     GetPayees,
     GetScheduled,
     ImportTransactions {
@@ -23,6 +24,12 @@ pub struct ImportTxn {
     /// Existing Actual payee **id** (never a name — avoids auto-create).
     pub payee: String,
     pub imported_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Account {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -50,6 +57,23 @@ pub enum ShimResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_accounts_request_serialises_and_account_deserialises() {
+        let req = ShimRequest::GetAccounts;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"op":"get_accounts"}"#);
+
+        let acct: Account =
+            serde_json::from_str(r#"{"id":"uuid-1","name":"Monzo Personal"}"#).unwrap();
+        assert_eq!(
+            acct,
+            Account {
+                id: "uuid-1".into(),
+                name: "Monzo Personal".into()
+            }
+        );
+    }
 
     #[test]
     fn import_request_serialises_with_op_tag() {

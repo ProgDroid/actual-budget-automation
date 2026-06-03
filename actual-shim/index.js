@@ -33,6 +33,10 @@ function readStdin() {
 
 async function handle(req) {
   switch (req.op) {
+    case 'get_accounts': {
+      const accounts = await api.getAccounts();
+      return accounts.map((a) => ({ id: a.id, name: a.name }));
+    }
     case 'get_payees': {
       const payees = await api.getPayees();
       return payees.map((p) => ({ id: p.id, name: p.name }));
