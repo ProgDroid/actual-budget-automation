@@ -216,16 +216,13 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
 /// token on every successful refresh, so the new one must reach disk before any
 /// fallible work; otherwise a later failure strands it and the next run replays
 /// a dead token (Monzo answers 401). Re-loads the on-disk state and copies just
-/// the token (and the account id, if not yet recorded) onto it.
+/// the token onto it.
 fn persist_rotated_token(cfg: &Config, state: &State) -> anyhow::Result<()> {
     let mut on_disk = State::load(&cfg.state_path)?;
     on_disk
         .monzo
         .refresh_token
         .clone_from(&state.monzo.refresh_token);
-    if on_disk.monzo.account_id.is_empty() {
-        on_disk.monzo.account_id.clone_from(&state.monzo.account_id);
-    }
     on_disk.save(&cfg.state_path)
 }
 
@@ -614,23 +611,38 @@ pub async fn run(
                 continue;
             }
         };
-        let row = ImportTxn {
-            date: r.date.clone(),
-            amount: r.amount,
-            payee: pid,
-            imported_id: if r.external_id.is_empty() {
-                format!("{}:{}", r.raw_merchant, r.date)
-            } else {
-                r.external_id.clone()
-            },
-        };
         if let Some(aid) = actual_id_for(&r.source_monzo_id, &account_links) {
-            grouped.entry(aid).or_default().push(row);
+            grouped.entry(aid).or_default().push(ImportTxn {
+                date: r.date.clone(),
+                amount: r.amount,
+                payee: pid,
+                imported_id: if r.external_id.is_empty() {
+                    format!("{}:{}", r.raw_merchant, r.date)
+                } else {
+                    r.external_id.clone()
+                },
+            });
         } else {
+            // Fail-loud: the user resolved this, but its source Monzo account is
+            // still unmapped, so we cannot route the import. Re-hold it (rather
+            // than dropping — take_resolved already removed it from pending) so
+            // it survives until `aba accounts` maps the account. Preserve the
+            // resolved payee as the suggestion so it can be confirmed next time.
             warn!(
-                "resolved review '{}' from unmapped Monzo account '{}' — skipping import (run `aba accounts`)",
+                "resolved review '{}' from unmapped Monzo account '{}' — re-holding until mapped (run `aba accounts`)",
                 r.raw_merchant, r.source_monzo_id
             );
+            if state.add_pending_full(
+                &r.external_id,
+                &r.raw_merchant,
+                r.amount,
+                &r.date,
+                Some(r.payee_name.clone()),
+                None,
+                &r.source_monzo_id,
+            ) {
+                held += 1;
+            }
         }
     }
 
@@ -862,7 +874,9 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     println!("or the API will only return the last 5 minutes of transactions.\n");
     println!("Paste this into the server's state file under [monzo]:\n");
     println!("refresh_token = \"{refresh}\"");
-    println!("\nAlso set [monzo].account_id to the Monzo account id you want to import.");
+    println!(
+        "\nThen run `aba accounts` on a machine that can reach Actual to map your Monzo accounts to Actual accounts."
+    );
     Ok(())
 }
 
@@ -1790,10 +1804,14 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         .await
         .unwrap();
 
-        // Sanity: the in-memory state DID diverge (review resolved away) -> assertions are non-vacuous.
+        // Sanity: the in-memory state DID diverge (take_resolved folded the
+        // resolved raw->payee into the cache) -> assertions are non-vacuous.
+        // The review's source account is unmapped, so it is RE-HELD in memory
+        // (fail-loud) rather than imported; either way the on-disk state below
+        // must reflect ONLY the rotated token, never these in-memory changes.
         assert!(
-            state.pending_reviews.is_empty(),
-            "in-memory review was resolved; test is non-vacuous"
+            state.payee_cache.contains_key("RESOLVE_ME"),
+            "in-memory cache gained the resolved mapping; test is non-vacuous"
         );
 
         let on_disk = State::load(&state_path).unwrap();
@@ -2091,6 +2109,101 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         );
         // ...and last_run still advanced (the tx is safely held, not lost).
         assert!(state.last_run.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolved_review_from_unmapped_account_is_reheld_not_dropped() {
+        // Fail-loud regression: a user-resolved review whose source Monzo account
+        // is still unmapped must be RE-HELD (not silently dropped). take_resolved
+        // removes it from pending before the import loop; if actual_id_for returns
+        // None and we merely warn+skip, the successful save persists the removal
+        // and the transaction is lost forever.
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim); // get_payees -> [Local Cafe]
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        // TWO mapped links (acc_1->u1, acc_2->u2): >1 mapped so actual_id_for has
+        // no sole-fallback, and the resolved item's source (acc_unmapped) matches
+        // neither -> actual_id_for returns None -> must re-hold.
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "u1".into(),
+            ..Default::default()
+        });
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_2".into(),
+            actual_id: "u2".into(),
+            ..Default::default()
+        });
+
+        // An already-RESOLVED pending review (resolve_to an existing payee) whose
+        // source account is unmapped. take_resolved will turn it into a
+        // ResolvedReview routed by source_monzo_id = "acc_unmapped".
+        state.pending_reviews.push(PendingReview {
+            external_id: "tx_unmapped".into(),
+            source_monzo_id: "acc_unmapped".into(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-05-30".into(),
+            resolve_to: "Local Cafe".into(), // exists in fake_actual
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            telegram_message_id: None,
+        });
+
+        let mut bank = FakeBank { txs: vec![] };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // NOT imported (no routable account).
+        assert!(
+            !imports_log.exists(),
+            "unmapped-source resolved review must NOT be imported"
+        );
+        // RE-HELD: the entry is back in pending_reviews under its external_id,
+        // not dropped, so it survives until `aba accounts` maps the account.
+        let reheld = state
+            .pending_reviews
+            .iter()
+            .find(|p| p.external_id == "tx_unmapped")
+            .expect("resolved-but-unmapped review must be re-held, not dropped");
+        assert_eq!(
+            reheld.source_monzo_id, "acc_unmapped",
+            "source preserved for re-routing once mapped"
+        );
+        assert_eq!(
+            reheld.suggestion.as_deref(),
+            Some("Local Cafe"),
+            "resolved payee preserved as the suggestion for next confirmation"
+        );
+        // And it persisted to disk (the run saved on success).
+        let on_disk = State::load(&state_path).unwrap();
+        assert!(
+            on_disk
+                .pending_reviews
+                .iter()
+                .any(|p| p.external_id == "tx_unmapped"),
+            "re-hold must survive the successful run's save"
+        );
     }
 
     #[test]
