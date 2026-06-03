@@ -8,8 +8,6 @@ pub enum ShimRequest {
     GetAccounts,
     GetPayees,
     GetScheduled,
-    // Used by ActualClient::get_categories; called from run.rs in Task 5.
-    #[allow(dead_code)]
     GetCategories,
     ImportTransactions {
         account_id: String,
@@ -45,8 +43,8 @@ pub struct Payee {
     pub name: String,
 }
 
-// Used by ActualClient::get_categories; constructed from shim JSON in Task 5.
-#[allow(dead_code)]
+/// An assignable Actual category (real categories carry a `group_id`; the shim
+/// filters out category *groups*).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Category {
     pub id: String,

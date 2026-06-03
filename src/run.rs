@@ -237,23 +237,6 @@ fn hold_unmapped(state: &mut State, tx: &RawTransaction, held: &mut usize) {
     }
 }
 
-/// Hold a transaction whose cached payee (or category) no longer resolves in
-/// Actual. Preserves the cached payee name as the suggestion for re-confirmation.
-fn hold_cached_missing(state: &mut State, tx: &RawTransaction, payee_name: &str, held: &mut usize) {
-    let date = tx.date.format("%Y-%m-%d").to_string();
-    if state.add_pending_full(
-        &tx.external_id,
-        &tx.raw_merchant,
-        tx.amount_minor,
-        &date,
-        Some(payee_name.to_string()),
-        None,
-        &tx.source_monzo_id,
-    ) {
-        *held += 1;
-    }
-}
-
 /// Build `Schedule`s for matching by resolving each row's payee id to a name.
 fn schedules_from_rows(rows: Vec<ScheduleRow>, payees: &[Payee]) -> Vec<Schedule> {
     let by_id: BTreeMap<&str, &str> = payees
@@ -716,30 +699,74 @@ pub async fn run(
         match (
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
-            cat_id,
         ) {
-            (Some(tx), Some(pid), Some(cat)) => {
-                if let Some(aid) = actual_id_for(&tx.source_monzo_id, &account_links) {
-                    grouped.entry(aid).or_default().push(make_row(tx, pid, cat));
+            (Some(tx), Some(pid)) => {
+                if let Some(cat) = &cat_id {
+                    if let Some(aid) = actual_id_for(&tx.source_monzo_id, &account_links) {
+                        grouped
+                            .entry(aid)
+                            .or_default()
+                            .push(make_row(tx, pid, cat.clone()));
+                    } else {
+                        warn!(
+                            "tx {ext_id} from unmapped Monzo account '{}' — holding (run `aba accounts`)",
+                            tx.source_monzo_id
+                        );
+                        hold_unmapped(state, tx, &mut held);
+                    }
                 } else {
+                    // Category stale, payee OK -> pre-settle payee, re-prompt
+                    // category (fail-loud: never silently import uncategorised).
                     warn!(
-                        "tx {ext_id} from unmapped Monzo account '{}' — holding (run `aba accounts`)",
-                        tx.source_monzo_id
+                        "cached category '{category_name}' for tx {ext_id} no longer exists in Actual; re-prompting category"
                     );
-                    hold_unmapped(state, tx, &mut held);
+                    let date = tx.date.format("%Y-%m-%d").to_string();
+                    if state.add_pending_classified(
+                        &tx.external_id,
+                        &tx.raw_merchant,
+                        tx.amount_minor,
+                        &date,
+                        &tx.source_monzo_id,
+                        ClassifiedHold {
+                            payee_resolved: Some(payee_name.clone()),
+                            // Stale name; off-list -> build_prompt offers free-remap/Skip.
+                            category_suggestion: Some(category_name.clone()),
+                            ..Default::default()
+                        },
+                    ) {
+                        held += 1;
+                    }
                 }
             }
-            (Some(tx), None, _) => {
+            (Some(tx), None) => {
+                // Payee stale -> re-prompt payee; preserve the category if it
+                // still resolves, else re-prompt it too. `cat_id` is the
+                // resolved value: Some(_) resolves (an id, or empty=uncategorised
+                // sentinel) -> pre-settle to the cached name; None -> also stale.
                 warn!(
-                    "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; holding for review"
+                    "cached payee '{payee_name}' for tx {ext_id} no longer exists in Actual; re-prompting payee"
                 );
-                hold_cached_missing(state, tx, payee_name, &mut held);
-            }
-            (Some(tx), Some(_), None) => {
-                warn!(
-                    "cached category '{category_name}' for tx {ext_id} no longer exists in Actual; holding for review"
-                );
-                hold_cached_missing(state, tx, payee_name, &mut held);
+                let (category_resolved, category_suggestion) = match &cat_id {
+                    Some(_) => (Some(category_name.clone()), None),
+                    None => (None, Some(category_name.clone())),
+                };
+                let date = tx.date.format("%Y-%m-%d").to_string();
+                if state.add_pending_classified(
+                    &tx.external_id,
+                    &tx.raw_merchant,
+                    tx.amount_minor,
+                    &date,
+                    &tx.source_monzo_id,
+                    ClassifiedHold {
+                        // Stale payee -> "create it?" flavor on the next prompt.
+                        payee_suggestion: Some(payee_name.clone()),
+                        category_resolved,
+                        category_suggestion,
+                        ..Default::default()
+                    },
+                ) {
+                    held += 1;
+                }
             }
             _ => {}
         }
@@ -751,9 +778,9 @@ pub async fn run(
         match (
             by_id.get(ext_id.as_str()),
             payee_id_for(&payees, payee_name),
-            cat_id,
         ) {
-            (Some(tx), Some(pid), Some(cat)) => {
+            (Some(tx), Some(pid)) if cat_id.is_some() => {
+                let cat = cat_id.unwrap();
                 if let Some(aid) = actual_id_for(&tx.source_monzo_id, &account_links) {
                     grouped.entry(aid).or_default().push(make_row(tx, pid, cat));
                     if !state.payee_cache.contains_key(&tx.raw_merchant) {
@@ -776,13 +803,41 @@ pub async fn run(
                     hold_unmapped(state, tx, &mut held);
                 }
             }
-            (Some(tx), None, _) | (Some(tx), Some(_), None) => {
+            (Some(tx), payee_id) => {
                 // Defensive: apply_matches guarantees matched payee+category
-                // exist. If this ever fires, hold rather than drop (fail-loud).
+                // exist. If this ever fires (a concurrent delete in Actual), hold
+                // rather than drop, re-prompting only the stale dimension(s).
                 warn!(
                     "matched payee/category for tx {ext_id} unexpectedly missing; holding for review"
                 );
-                hold_cached_missing(state, tx, payee_name, &mut held);
+                // Payee resolves -> pre-settle it; else suggest it for review.
+                let (payee_resolved, payee_suggestion) = if payee_id.is_some() {
+                    (Some(payee_name.clone()), None)
+                } else {
+                    (None, Some(payee_name.clone()))
+                };
+                // Category resolves (or empty sentinel) -> pre-settle; else suggest.
+                let (category_resolved, category_suggestion) = match &cat_id {
+                    Some(_) => (Some(category_name.clone()), None),
+                    None => (None, Some(category_name.clone())),
+                };
+                let date = tx.date.format("%Y-%m-%d").to_string();
+                if state.add_pending_classified(
+                    &tx.external_id,
+                    &tx.raw_merchant,
+                    tx.amount_minor,
+                    &date,
+                    &tx.source_monzo_id,
+                    ClassifiedHold {
+                        payee_resolved,
+                        payee_suggestion,
+                        category_resolved,
+                        category_suggestion,
+                        ..Default::default()
+                    },
+                ) {
+                    held += 1;
+                }
             }
             _ => {}
         }
@@ -807,19 +862,24 @@ pub async fn run(
                 if let Some(id) = category_id_for(&categories, name) {
                     Some(id.to_string())
                 } else {
-                    // Fail-loud: resolved category no longer exists -> re-hold.
+                    // Fail-loud: resolved category no longer exists -> pre-settle
+                    // the payee, re-prompt ONLY the category (never collapse it to
+                    // uncategorised, and never re-ask the already-resolved payee).
                     warn!(
-                        "resolved category '{name}' for '{}' no longer exists; re-holding",
+                        "resolved category '{name}' for '{}' no longer exists; re-prompting category",
                         r.raw_merchant
                     );
-                    if state.add_pending_full(
+                    if state.add_pending_classified(
                         &r.external_id,
                         &r.raw_merchant,
                         r.amount,
                         &r.date,
-                        Some(r.payee_name.clone()),
-                        None,
                         &r.source_monzo_id,
+                        ClassifiedHold {
+                            payee_resolved: Some(r.payee_name.clone()),
+                            category_suggestion: Some(name.clone()),
+                            ..Default::default()
+                        },
                     ) {
                         held += 1;
                     }
@@ -2519,6 +2579,74 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         );
         // ...and last_run still advanced (the tx is safely held, not lost).
         assert!(state.last_run.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_cached_category_reprompts_category_not_payee() {
+        // Fail-loud regression: a merchant cached with a payee that STILL exists
+        // but a category that no longer does must NOT silently import
+        // uncategorised, and must NOT re-ask the (still-valid) payee. It must
+        // pre-settle the payee and re-prompt ONLY the category.
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        // fake_actual: payees [Local Cafe]; categories [Groceries, Dining].
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: "acc".into(),
+            ..Default::default()
+        });
+        // Cached: payee exists in the shim; category "Utilities" does NOT.
+        state
+            .payee_cache
+            .insert("SQ *CAFE".into(), "Local Cafe".into());
+        state
+            .category_cache
+            .insert("SQ *CAFE".into(), "Utilities".into());
+
+        // The tx is a full cache hit -> no Claude classification needed.
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
+        };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Nothing imported (must not collapse to uncategorised).
+        assert!(
+            !imports_log.exists(),
+            "stale category must NOT import uncategorised"
+        );
+        assert_eq!(state.pending_reviews.len(), 1);
+        let pr = &state.pending_reviews[0];
+        assert_eq!(pr.external_id, "tx_cafe");
+        // Payee dimension PRE-SETTLED to the still-valid cached payee.
+        assert!(pr.payee_settled(), "payee must be pre-settled");
+        assert_eq!(pr.resolve_to, "Local Cafe");
+        // Category dimension UNSETTLED -> it will prompt for the category.
+        assert!(
+            !pr.category_resolved,
+            "category must be unsettled (re-prompted), not collapsed to uncategorised"
+        );
+        assert_eq!(pr.category_suggestion.as_deref(), Some("Utilities"));
     }
 
     #[tokio::test]

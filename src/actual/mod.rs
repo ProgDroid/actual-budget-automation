@@ -121,8 +121,6 @@ impl ActualClient {
 
     /// # Errors
     /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
-    // Called from run.rs in Task 5; not yet wired into the binary.
-    #[allow(dead_code)]
     pub async fn get_categories(&self) -> anyhow::Result<Vec<Category>> {
         self.call(&ShimRequest::GetCategories).await
     }
