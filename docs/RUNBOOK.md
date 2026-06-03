@@ -107,6 +107,32 @@ file as usual. Edit `[[pending_review]]` entries directly:
 
 The next `aba run` imports them. Nothing breaks if Telegram is unreachable.
 
+> **Note (categories):** a held entry now imports only once **both** its payee
+> **and** its category are settled (see *Categories* below). When resolving by
+> hand, also set the category dimension if it is open: `resolve_category_to`
+> to an existing category name (empty = leave uncategorised) **and**
+> `category_resolved = true`. An entry whose category is still unsettled
+> (`category_resolved = false`) stays held even after the payee is resolved.
+
+## Categories (Phase 2)
+
+`aba run` asks Claude to classify each new merchant into one of your **existing
+Actual categories**, in the same call that picks the payee. A transaction is
+imported automatically only when **both** the payee and the category are
+confident matches to things that exist in Actual. If either is uncertain, the
+whole transaction is **held** and you are asked via Telegram — first for the
+payee (if that is the uncertain part), then for the category.
+
+- **Confirm** accepts the suggested category. **Skip** leaves the transaction
+  uncategorised (it still imports). Reply with a different category name to remap.
+- Categories are cached per merchant (like payees), so each merchant is normally
+  only asked once.
+- **No "create new category" via Telegram.** Actual categories must belong to a
+  category group, so create new categories in the Actual UI, then reply with the
+  new category's name (or let the next run re-suggest it).
+- If you have **no categories** in Actual at all, categorisation is skipped
+  entirely and transactions import uncategorised (Phase-1 behavior).
+
 ## Operational notes
 
 - **Prompt caching gives no benefit at the nightly cadence.** Anthropic prompt
