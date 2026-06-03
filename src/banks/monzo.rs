@@ -52,13 +52,11 @@ struct Merchant {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
 struct AccountList {
     accounts: Vec<MonzoAccount>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
 struct MonzoAccount {
     id: String,
     #[serde(default)]
@@ -68,13 +66,11 @@ struct MonzoAccount {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
 struct PotList {
     pots: Vec<MonzoPot>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // wired into the `aba accounts` command in Task 6
 struct MonzoPot {
     id: String,
     #[serde(default)]
@@ -201,7 +197,6 @@ impl Monzo {
     }
 
     /// List open Monzo accounts as (id, name). Requires a prior `ensure_auth`.
-    #[allow(dead_code)] // wired into the `aba accounts` command in Task 6
     pub async fn list_accounts(&self) -> Result<Vec<(String, String)>, BankError> {
         let token = self
             .access_token
@@ -228,7 +223,6 @@ impl Monzo {
     }
 
     /// List active pots for a current account as (id, name). Informational only.
-    #[allow(dead_code)] // wired into the `aba accounts` command in Task 6
     pub async fn list_pots(
         &self,
         current_account_id: &str,

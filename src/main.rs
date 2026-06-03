@@ -124,5 +124,6 @@ async fn main() -> Result<()> {
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("run timed out after 600s")))
         }
+        Command::Accounts { write } => run::map_accounts(&cfg, write).await,
     }
 }

@@ -17,6 +17,10 @@ use crate::notify::Notifier;
 use crate::state::{AccountLink, PendingReview, State};
 use crate::telegram::{ConfirmChannel, Prompt};
 
+/// Minimum normalised-name similarity for `aba accounts` to auto-link a Monzo
+/// account to an Actual account; below this the row is left unmapped.
+const ACCOUNT_MATCH_THRESHOLD: f64 = 0.6;
+
 /// Resolve the Actual account id for a source Monzo account.
 /// Falls back to the sole mapped account when there's exactly one (covers
 /// single-account users and legacy held items with an empty source). Returns
@@ -223,6 +227,140 @@ fn persist_rotated_token(cfg: &Config, state: &State) -> anyhow::Result<()> {
         on_disk.monzo.account_id.clone_from(&state.monzo.account_id);
     }
     on_disk.save(&cfg.state_path)
+}
+
+/// Auto-suggest Monzo→Actual links by normalised-name similarity. Each Monzo
+/// account is linked to its best Actual match above `threshold`; below it the
+/// link is left unmapped (`actual_id` empty) for the user to fill in.
+fn suggest_links(
+    monzo: &[(String, String)],
+    actual: &[(String, String)],
+    threshold: f64,
+) -> Vec<AccountLink> {
+    monzo
+        .iter()
+        .map(|(mid, mname)| {
+            let best = actual
+                .iter()
+                .map(|(aid, aname)| (aid, aname, crate::matching::payee_similarity(mname, aname)))
+                .filter(|(_, _, score)| *score >= threshold)
+                .max_by(|a, b| a.2.total_cmp(&b.2));
+            match best {
+                Some((aid, aname, _)) => AccountLink {
+                    monzo_id: mid.clone(),
+                    monzo_name: mname.clone(),
+                    actual_id: aid.clone(),
+                    actual_name: aname.clone(),
+                },
+                None => AccountLink {
+                    monzo_id: mid.clone(),
+                    monzo_name: mname.clone(),
+                    ..AccountLink::default()
+                },
+            }
+        })
+        .collect()
+}
+
+/// `aba accounts [--write]`: fetch Monzo accounts/pots + Actual accounts,
+/// auto-suggest a mapping, print it, and (with `--write`) persist to state.
+/// Run where it can reach Monzo + the Actual shim; review the printed mapping
+/// and override by editing `[[monzo.accounts]]` in the state file.
+#[allow(clippy::future_not_send)]
+pub async fn map_accounts(cfg: &Config, write: bool) -> anyhow::Result<()> {
+    let _lock = crate::lock::lock_blocking(&cfg.lock_path)?;
+    let mut state = State::load(&cfg.state_path)?;
+
+    let mut bank = crate::banks::monzo::Monzo::new(
+        cfg.monzo_client_id.clone(),
+        cfg.monzo_client_secret.clone(),
+        cfg.monzo_base_url.clone(),
+        state.monzo_clone(),
+    );
+    match bank.ensure_auth(&mut state).await {
+        Ok(()) => persist_rotated_token(cfg, &state)?,
+        Err(BankError::AuthExpired(m)) => {
+            return Err(anyhow::anyhow!(
+                "Monzo auth expired: {m}. Run `aba auth monzo` first."
+            ));
+        }
+        Err(BankError::Other(e)) => return Err(e),
+    }
+
+    let monzo_accounts = bank.list_accounts().await.map_err(map_bank_err)?;
+    let actual = ActualClient::new(
+        cfg.shim_dir.clone(),
+        true, // read-only: we only call get_accounts
+        cfg.actual_server_url.clone(),
+        cfg.actual_password.clone(),
+        cfg.actual_sync_id.clone(),
+    );
+    let actual_accounts: Vec<(String, String)> = actual
+        .get_accounts()
+        .await
+        .context("get_accounts")?
+        .into_iter()
+        .map(|a| (a.id, a.name))
+        .collect();
+
+    let links = suggest_links(&monzo_accounts, &actual_accounts, ACCOUNT_MATCH_THRESHOLD);
+
+    println!("Suggested Monzo → Actual account mapping:");
+    for l in &links {
+        if l.actual_id.is_empty() {
+            println!(
+                "  {} ({})  →  [UNMAPPED — edit state file]",
+                l.monzo_name, l.monzo_id
+            );
+        } else {
+            println!(
+                "  {} ({})  →  {} ({})",
+                l.monzo_name, l.monzo_id, l.actual_name, l.actual_id
+            );
+        }
+    }
+
+    // Informational: pots are Phase 3 (transfers), not linked here.
+    for (mid, _) in &monzo_accounts {
+        match bank.list_pots(mid).await {
+            Ok(pots) if !pots.is_empty() => {
+                println!("Pots under {mid} (Phase 3 — not linked yet):");
+                for (pid, pname) in pots {
+                    println!("  {pname} ({pid})");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("could not list pots for {mid}: {}", bank_err_text(&e)),
+        }
+    }
+
+    if write {
+        state.monzo.accounts = links;
+        state.save(&cfg.state_path)?;
+        println!(
+            "\nWrote {} link(s) to {}.",
+            state.monzo.accounts.len(),
+            cfg.state_path.display()
+        );
+        println!("Review/override any UNMAPPED or wrong rows by editing [[monzo.accounts]] there.");
+    } else {
+        println!("\n(dry run — re-run with `aba accounts --write` to persist)");
+    }
+    Ok(())
+}
+
+fn map_bank_err(e: BankError) -> anyhow::Error {
+    match e {
+        BankError::Other(e) => e,
+        BankError::AuthExpired(m) => anyhow::anyhow!("Monzo auth expired: {m}"),
+    }
+}
+
+fn bank_err_text(e: &BankError) -> String {
+    match e {
+        BankError::Other(e) => e.to_string(),
+        BankError::AuthExpired(m) => format!("auth expired: {m}"),
+    }
 }
 
 // Top-level orchestration: deliberately long and wired to many collaborators.
@@ -1951,6 +2089,26 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         );
         // ...and last_run still advanced (the tx is safely held, not lost).
         assert!(state.last_run.is_some());
+    }
+
+    #[test]
+    fn suggest_links_matches_by_name_and_leaves_unmatched_unmapped() {
+        let monzo = vec![
+            ("acc_1".to_string(), "Personal".to_string()),
+            ("acc_2".to_string(), "Joint Account".to_string()),
+            ("acc_x".to_string(), "Nothing Like It".to_string()),
+        ];
+        let actual = vec![
+            ("u1".to_string(), "Monzo Personal".to_string()),
+            ("u2".to_string(), "Monzo Joint".to_string()),
+        ];
+        let links = suggest_links(&monzo, &actual, 0.6);
+        let p = links.iter().find(|l| l.monzo_id == "acc_1").unwrap();
+        assert_eq!(p.actual_id, "u1");
+        let j = links.iter().find(|l| l.monzo_id == "acc_2").unwrap();
+        assert_eq!(j.actual_id, "u2");
+        let x = links.iter().find(|l| l.monzo_id == "acc_x").unwrap();
+        assert_eq!(x.actual_id, "", "no confident match → unmapped");
     }
 
     #[test]

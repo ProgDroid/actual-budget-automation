@@ -107,7 +107,6 @@ impl ActualClient {
         }
     }
 
-    #[allow(dead_code)] // wired into the `aba accounts` command in Task 6
     /// # Errors
     /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
     pub async fn get_accounts(&self) -> anyhow::Result<Vec<Account>> {

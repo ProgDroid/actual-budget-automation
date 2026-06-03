@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
@@ -31,6 +31,13 @@ pub enum Command {
     },
     /// Drain Telegram replies into the state file (run frequently; write-free re: Actual).
     Poll,
+    /// Discover Monzo accounts + Actual accounts and auto-suggest a mapping.
+    /// Prints the suggestion; `--write` persists it to the state file.
+    Accounts {
+        /// Persist the suggested mapping into the state file.
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
