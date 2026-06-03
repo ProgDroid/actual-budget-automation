@@ -297,17 +297,24 @@ fn payee_id_for<'a>(payees: &'a [Payee], name: &str) -> Option<&'a str> {
         .map(|p| p.id.as_str())
 }
 
-/// Build the Telegram prompt for a held entry. Flavor is chosen by whether a
-/// suggestion exists and whether it is a real payee:
-/// - suggestion in payee list  -> "raw → suggestion?"  [Confirm][Create new][Skip]
-/// - suggestion NOT in payees   -> "No payee 'x'. Create it?" [Create][Skip]
-/// - no suggestion              -> "New merchant raw — which payee?" [Create new][Skip]
+/// Build the Telegram prompt for a held entry, choosing the dimension to prompt:
+/// - If the payee dimension is unsettled → payee prompt (3 flavors, unchanged):
+///   - suggestion in payee list  -> "raw → suggestion?"  [Confirm][Create new][Skip]
+///   - suggestion NOT in payees   -> "No payee 'x'. Create it?" [Create][Skip]
+///   - no suggestion              -> "New merchant raw — which payee?" [Create new][Skip]
+/// - If payee is settled but category is unsettled → category prompt (2 flavors):
+///   - suggestion in category list -> "Category for raw → suggestion?" [Confirm][Skip]
+///   - otherwise                   -> "Which category for raw?" [Skip]
 ///
 /// If the entry's `external_id` is too long to fit Telegram's 64-byte
 /// `callback_data` cap, the keyboard is dropped entirely (every button shares
 /// the same key, so it is all-or-nothing); the user resolves via a free-text
 /// reply, which is correlated by `telegram_message_id` instead.
-fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
+fn build_prompt(
+    entry: &PendingReview,
+    payee_names: &[String],
+    category_names: &[String],
+) -> Prompt {
     use crate::telegram::encode_callback;
     let key = &entry.external_id;
     // Encode every (label, action) spec; if any key is too long they all are,
@@ -321,31 +328,66 @@ fn build_prompt(entry: &PendingReview, payee_names: &[String]) -> Prompt {
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
     };
-    match &entry.suggestion {
-        Some(s) if payee_names.iter().any(|p| p == s) => {
-            let conf = entry.confidence.as_deref().unwrap_or("medium");
+
+    // Payee dimension is settled when create_new is set or resolve_to is non-empty.
+    let payee_settled = entry.create_new || !entry.resolve_to.is_empty();
+    if !payee_settled {
+        // --- payee prompt (unchanged flavors) ---
+        return match &entry.suggestion {
+            Some(s) if payee_names.iter().any(|p| p == s) => {
+                let conf = entry.confidence.as_deref().unwrap_or("medium");
+                Prompt {
+                    chat_text: format!(
+                        "'{}' -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
+                        entry.raw_merchant, s, conf
+                    ),
+                    buttons: buttons(&[
+                        ("✅ Confirm", "cf"),
+                        ("🆕 Create new", "nw"),
+                        ("❌ Skip", "sk"),
+                    ]),
+                }
+            }
+            Some(s) => Prompt {
+                chat_text: format!(
+                    "No existing payee '{s}'. Create it?\nOr reply with a payee name."
+                ),
+                buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
+            },
+            None => Prompt {
+                chat_text: format!(
+                    "New merchant '{}' — which payee?\nReply with a payee name, or:",
+                    entry.raw_merchant
+                ),
+                buttons: buttons(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")]),
+            },
+        };
+    }
+
+    // --- category prompt (payee already settled) ---
+    match &entry.category_suggestion {
+        Some(s) if category_names.iter().any(|c| c == s) => {
+            let conf = entry.category_confidence.as_deref().unwrap_or("medium");
             Prompt {
                 chat_text: format!(
-                    "'{}' -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
+                    "Category for '{}' -> '{}'?  ({} confidence)\n\
+                     Reply with a different category, or Skip to leave it uncategorised.",
                     entry.raw_merchant, s, conf
                 ),
-                buttons: buttons(&[
-                    ("✅ Confirm", "cf"),
-                    ("🆕 Create new", "nw"),
-                    ("❌ Skip", "sk"),
-                ]),
+                buttons: buttons(&[("✅ Confirm", "cc"), ("❌ Skip", "xc")]),
             }
         }
-        Some(s) => Prompt {
-            chat_text: format!("No existing payee '{s}'. Create it?\nOr reply with a payee name."),
-            buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
-        },
-        None => Prompt {
+        // A category suggestion that isn't in the live category list can't be
+        // confirmed (no "create category" in Phase 2 — confirming a non-existent
+        // category would fail-loud at import), so fall through to the free-remap /
+        // Skip prompt, dropping the stale hint. Reachable if Claude returns an
+        // off-list category or the category was deleted after this entry was held.
+        Some(_) | None => Prompt {
             chat_text: format!(
-                "New merchant '{}' — which payee?\nReply with a payee name, or:",
+                "Which category for '{}'?\nReply with a category name, or Skip to leave it uncategorised.",
                 entry.raw_merchant
             ),
-            buttons: buttons(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")]),
+            buttons: buttons(&[("❌ Skip", "xc")]),
         },
     }
 }
@@ -921,7 +963,7 @@ pub async fn run(
             .map(|(i, _)| i)
             .collect();
         for i in to_prompt {
-            let prompt = build_prompt(&state.pending_reviews[i], &payee_names);
+            let prompt = build_prompt(&state.pending_reviews[i], &payee_names, &category_names);
             match ch.send_prompt(&prompt).await {
                 Ok(message_id) => {
                     state.pending_reviews[i].telegram_message_id = Some(message_id);
@@ -1348,7 +1390,7 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p = build_prompt(&proposed, &payees);
+        let p = build_prompt(&proposed, &payees, &[]);
         assert!(
             p.chat_text.contains("'Local Cafe'"),
             "expected plain-text quoting: {}",
@@ -1379,7 +1421,7 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p2 = build_prompt(&unmatched, &payees);
+        let p2 = build_prompt(&unmatched, &payees, &[]);
         assert_eq!(p2.buttons.len(), 2);
         assert_eq!(p2.buttons[0].1, "nw:tx2");
 
@@ -1400,7 +1442,7 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p3 = build_prompt(&failed, &payees);
+        let p3 = build_prompt(&failed, &payees, &[]);
         assert!(p3.chat_text.contains("Sainsbury's"));
         assert_eq!(p3.buttons.len(), 2);
         assert_eq!(p3.buttons[0].1, "nw:tx3"); // create
@@ -1429,13 +1471,72 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p = build_prompt(&entry, &payees);
+        let p = build_prompt(&entry, &payees, &[]);
         assert!(
             p.buttons.is_empty(),
             "over-long external_id must yield no buttons, got: {:?}",
             p.buttons
         );
         assert!(!p.chat_text.is_empty(), "chat text must still be present");
+    }
+
+    #[test]
+    fn build_prompt_category_flavor_when_payee_settled() {
+        let payees = vec!["Local Cafe".to_string()];
+        let cats = vec!["Dining".to_string(), "Groceries".to_string()];
+        let entry = PendingReview {
+            external_id: "tx1".into(),
+            source_monzo_id: String::new(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: "Local Cafe".into(), // payee settled
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Dining".into()),
+            category_confidence: Some("medium".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false, // category unsettled -> category prompt
+            telegram_message_id: None,
+        };
+        let p = build_prompt(&entry, &payees, &cats);
+        assert!(
+            p.chat_text.to_lowercase().contains("category"),
+            "category prompt: {}",
+            p.chat_text
+        );
+        assert!(p.chat_text.contains("'Dining'"));
+        // confirm-category + skip-category buttons
+        assert_eq!(p.buttons.len(), 2);
+        assert_eq!(p.buttons[0].1, "cc:tx1");
+        assert_eq!(p.buttons[1].1, "xc:tx1");
+    }
+
+    #[test]
+    fn build_prompt_payee_first_when_payee_unsettled() {
+        let payees = vec!["Local Cafe".to_string()];
+        let cats = vec!["Dining".to_string()];
+        let entry = PendingReview {
+            external_id: "tx2".into(),
+            source_monzo_id: String::new(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some("Local Cafe".into()),
+            confidence: Some("medium".into()),
+            category_suggestion: Some("Dining".into()),
+            category_confidence: Some("low".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+        };
+        let p = build_prompt(&entry, &payees, &cats);
+        // payee prompt first (unchanged flavor): confirm/create/skip
+        assert_eq!(p.buttons.len(), 3);
+        assert_eq!(p.buttons[0].1, "cf:tx2");
     }
 
     // ---- Task 10: in-process doubles ----

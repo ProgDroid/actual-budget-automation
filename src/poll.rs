@@ -40,6 +40,8 @@ pub async fn poll(
             ReplyAction::Confirm => state.confirm_pending(&r.entry_key),
             ReplyAction::CreateNew => state.create_pending(&r.entry_key),
             ReplyAction::Skip => state.skip_pending(&r.entry_key),
+            // Category actions wired in Task 7.
+            ReplyAction::ConfirmCategory | ReplyAction::SkipCategory => false,
             ReplyAction::Remap(text) => state.remap_pending(&r.entry_key, text),
         };
         if ok {

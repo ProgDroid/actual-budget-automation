@@ -12,6 +12,10 @@ pub enum ReplyAction {
     Confirm,
     CreateNew,
     Skip,
+    /// Confirm the suggested category.
+    ConfirmCategory,
+    /// Skip the category (import uncategorised).
+    SkipCategory,
     Remap(String),
 }
 
@@ -80,6 +84,8 @@ fn action_from_code(code: &str) -> Option<ReplyAction> {
         "cf" => Some(ReplyAction::Confirm),
         "nw" => Some(ReplyAction::CreateNew),
         "sk" => Some(ReplyAction::Skip),
+        "cc" => Some(ReplyAction::ConfirmCategory),
+        "xc" => Some(ReplyAction::SkipCategory),
         _ => None,
     }
 }
