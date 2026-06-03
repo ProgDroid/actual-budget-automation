@@ -564,7 +564,7 @@ pub async fn run(
                     }
                 } else {
                     warn!(
-                        "matched tx {ext_id} from unmapped Monzo account '{}' — holding",
+                        "matched tx {ext_id} from unmapped Monzo account '{}' — holding (run `aba accounts`)",
                         tx.source_monzo_id
                     );
                     let date = tx.date.format("%Y-%m-%d").to_string();
@@ -1531,10 +1531,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(calls.len(), 2, "exactly one import call per account");
-        calls.sort_by(|a, b| a["account_id"]
-            .as_str()
-            .unwrap()
-            .cmp(b["account_id"].as_str().unwrap()));
+        calls.sort_by(|a, b| {
+            a["account_id"]
+                .as_str()
+                .unwrap()
+                .cmp(b["account_id"].as_str().unwrap())
+        });
 
         assert_eq!(calls[0]["account_id"], "u1");
         assert_eq!(calls[0]["transactions"].as_array().unwrap().len(), 1);

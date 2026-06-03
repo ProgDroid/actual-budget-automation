@@ -311,6 +311,7 @@ pub struct ResolvedReview {
     pub payee_name: String,
     /// True if the payee must be created in Actual first.
     pub create_new: bool,
+    /// Monzo account the resolved txn came from; routes its import.
     pub source_monzo_id: String,
 }
 
@@ -514,9 +515,10 @@ mod tests {
             actual_id: "uuid-1".into(),
             actual_name: "Monzo Personal".into(),
         });
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        s.save(tmp.path()).unwrap();
-        let loaded = State::load(tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        s.save(&path).unwrap();
+        let loaded = State::load(&path).unwrap();
         assert_eq!(loaded.monzo.accounts, s.monzo.accounts);
     }
 

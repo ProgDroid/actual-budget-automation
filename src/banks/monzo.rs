@@ -129,6 +129,10 @@ impl Monzo {
             .as_ref()
             .ok_or_else(|| BankError::Other(anyhow::anyhow!("ensure_auth not called")))?;
 
+        // Walk every page via Monzo's cursor: the first page uses the window-start
+        // timestamp; each later page uses the previous page's last raw id. The
+        // page-size check and the cursor both use the RAW count/id (before decline
+        // filtering) so filtered-out declines can never falsely end the walk.
         let mut all: Vec<MonzoTx> = Vec::new();
         let mut cursor = since.to_rfc3339();
         for page in 0.. {
@@ -159,7 +163,9 @@ impl Monzo {
             }
             if !resp.status().is_success() {
                 let s = resp.status();
-                return Err(BankError::Other(anyhow::anyhow!("Monzo transactions error {s}")));
+                return Err(BankError::Other(anyhow::anyhow!(
+                    "Monzo transactions error {s}"
+                )));
             }
             let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
             let raw_len = list.transactions.len();
@@ -211,7 +217,9 @@ impl Monzo {
             .map_err(|e| BankError::Other(e.into()))?;
         if !resp.status().is_success() {
             let s = resp.status();
-            return Err(BankError::Other(anyhow::anyhow!("Monzo accounts error {s}")));
+            return Err(BankError::Other(anyhow::anyhow!(
+                "Monzo accounts error {s}"
+            )));
         }
         let list: AccountList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
         Ok(list
@@ -324,6 +332,7 @@ impl BankSource for Monzo {
         }
         let mut out = Vec::new();
         for link in &self.monzo.accounts {
+            // Empty monzo_id is not expected post-migration; defensive skip.
             if link.monzo_id.is_empty() {
                 warn!("skipping account link with empty monzo_id");
                 continue;
