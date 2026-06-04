@@ -112,7 +112,7 @@ transactions in a run, you receive a **single** prompt for that merchant
 showing the transaction count (e.g. "'TFL TRAVEL CH' (3 txns) -> ..."). Your one
 reply — button or free-text — resolves **all** of that merchant's held
 transactions at once. A new transaction for a merchant that already has an
-outstanding prompt joins it silently (no duplicate prompt).
+outstanding prompt joins it silently (no duplicate prompt). (For a transaction whose category is still in question, a second prompt follows once the payee is settled.)
 
 ### New environment variables
 

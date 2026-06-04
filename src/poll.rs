@@ -296,8 +296,17 @@ mod tests {
             88,
         );
         let applied = poll(&cfg, &mut state, &channel).await.unwrap();
-        assert_eq!(applied, 1);
+        assert_eq!(applied, 1, "one group applied");
         assert_eq!(state.pending_reviews[0].resolve_to, "Local Cafe");
+        // Member B was already payee-settled; Confirm must leave its payee untouched.
+        assert_eq!(state.pending_reviews[1].resolve_to, "Local Cafe");
+        // Member B has an open category, so the payee-settling Confirm must clear its
+        // prompt id — that is the heterogeneous-group payoff: run() re-prompts the
+        // group for the category dimension next run.
+        assert!(
+            state.pending_reviews[1].telegram_message_id.is_none(),
+            "payee-settled/category-open member's message_id must be cleared for category re-prompt"
+        );
     }
 
     #[tokio::test]
