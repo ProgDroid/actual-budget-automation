@@ -245,6 +245,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heterogeneous_group_payee_confirm_is_safe() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        let mut state = State::default();
+
+        // Member A: payee unsettled (Claude suggestion pending).
+        // add_pending_full 7th arg is source_monzo_id, not resolve_to;
+        // resolve_to is always initialised to "". We pass "" for monzo_id here.
+        state.add_pending_full(
+            "txA",
+            "SQ *CAFE",
+            -100,
+            "2026-06-01",
+            Some("Local Cafe".into()),
+            Some("medium".into()),
+            "",
+        );
+
+        // Member B: same merchant but payee already settled, category open.
+        // Must be a struct literal because add_pending_full cannot set resolve_to.
+        state.pending_reviews.push(crate::state::PendingReview {
+            external_id: "txB".into(),
+            source_monzo_id: String::new(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -200,
+            date: "2026-06-02".into(),
+            resolve_to: "Local Cafe".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+        });
+
+        for p in &mut state.pending_reviews {
+            p.telegram_message_id = Some(910);
+        }
+
+        let gk = crate::telegram::group_key("SQ *CAFE");
+        let channel = crate::run::tests::FakeChannel::new(
+            vec![Reply {
+                entry_key: gk,
+                action: ReplyAction::Confirm,
+            }],
+            88,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(state.pending_reviews[0].resolve_to, "Local Cafe");
+    }
+
+    #[tokio::test]
     async fn confirm_fans_out_to_all_members_of_a_merchant() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("s.toml");

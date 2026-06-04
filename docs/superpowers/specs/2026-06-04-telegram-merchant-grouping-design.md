@@ -1,7 +1,7 @@
 # Telegram Prompts Grouped Per Merchant — Design (Phase 4)
 
 **Date:** 2026-06-04
-**Status:** Approved (brainstorming) — pending written-spec review
+**Status:** Implemented
 
 ## Background
 

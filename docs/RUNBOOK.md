@@ -107,6 +107,13 @@ confirm or correct from your phone. Use two cron jobs instead of one:
 file; it never touches Actual. `run` (nightly) imports everything resolved during
 the day and sends prompts for any newly held items.
 
+**Grouped prompts (Phase 4):** when one merchant produces several held
+transactions in a run, you receive a **single** prompt for that merchant
+showing the transaction count (e.g. "'TFL TRAVEL CH' (3 txns) -> ..."). Your one
+reply — button or free-text — resolves **all** of that merchant's held
+transactions at once. A new transaction for a merchant that already has an
+outstanding prompt joins it silently (no duplicate prompt).
+
 ### New environment variables
 
 | Variable | Default | Description |
