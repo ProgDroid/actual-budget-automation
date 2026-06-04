@@ -32,12 +32,10 @@ pub async fn poll(
         .poll_replies(state.telegram.last_update_id, &msg_map)
         .await?;
 
-    // Valid group keys currently held.
-    let valid: BTreeSet<String> = state
-        .pending_reviews
-        .iter()
-        .map(|p| group_key(&p.raw_merchant))
-        .collect();
+    // Only groups we actually prompted are resolvable; msg_map's values are
+    // exactly those group keys. (A new member that joined an outstanding group
+    // shares its key, so fan-out still reaches it.)
+    let valid: BTreeSet<String> = msg_map.values().cloned().collect();
 
     let mut applied = 0usize;
     for r in &replies {
@@ -53,6 +51,8 @@ pub async fn poll(
             .collect();
         // Members share raw_merchant, hence the same dimension/suggestion; the
         // first member decides whether a free-text remap targets payee or category.
+        // Hoisted out of the action match: Remap needs it, and computing it here avoids
+        // a second immutable borrow inside the loop where `state` is mutably borrowed.
         let payee_settled = state
             .pending_reviews
             .iter()
@@ -60,6 +60,7 @@ pub async fn poll(
             .is_some_and(crate::state::PendingReview::payee_settled);
 
         let mut any = false;
+        // `members` is collected before any mutation, so skip_pending's retain() is safe.
         for ext in &members {
             let ok = match &r.action {
                 ReplyAction::Confirm => state.confirm_pending(ext),
