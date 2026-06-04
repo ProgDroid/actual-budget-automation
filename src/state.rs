@@ -34,6 +34,9 @@ pub struct MonzoState {
     /// Monzo→Actual account links. Empty until `aba accounts` populates it.
     #[serde(default)]
     pub accounts: Vec<AccountLink>,
+    /// Monzo pot → Actual account links. Empty until `aba accounts` populates it.
+    #[serde(default)]
+    pub pots: Vec<PotLink>,
 }
 
 /// One Monzo account mapped to one Actual account.
@@ -52,6 +55,21 @@ pub struct AccountLink {
     pub actual_name: String,
 }
 
+/// One Monzo pot mapped to one Actual account. Pot moves become Actual transfers
+/// into this account. Empty `actual_id` = unmapped (its moves are held).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PotLink {
+    /// Monzo pot id (`pot_…`) — matches `metadata.pot_id` in the feed and `GET /pots[].id`.
+    pub monzo_pot_id: String,
+    #[serde(default)]
+    pub monzo_pot_name: String,
+    /// Actual account UUID — the transfer target. Empty = unmapped.
+    #[serde(default)]
+    pub actual_id: String,
+    #[serde(default)]
+    pub actual_name: String,
+}
+
 impl std::fmt::Debug for MonzoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MonzoState")
@@ -65,6 +83,7 @@ impl std::fmt::Debug for MonzoState {
             )
             .field("account_id", &self.account_id)
             .field("accounts", &self.accounts)
+            .field("pots", &self.pots)
             .finish()
     }
 }
@@ -241,6 +260,7 @@ impl State {
             refresh_token: self.monzo.refresh_token.clone(),
             account_id: String::new(),
             accounts: self.monzo.accounts.clone(),
+            pots: self.monzo.pots.clone(),
         }
     }
 
@@ -668,6 +688,7 @@ mod tests {
             refresh_token: "SECRET_RT".into(),
             account_id: "acc_1".into(),
             accounts: Vec::new(),
+            pots: Vec::new(),
         };
         let s = format!("{m:?}");
         assert!(
@@ -815,6 +836,24 @@ mod tests {
         let taken = s.take_resolved();
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].category_name.as_deref(), Some("Dining Out"));
+    }
+
+    #[test]
+    fn pots_round_trip_through_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut s = State::default();
+        s.monzo.pots.push(PotLink {
+            monzo_pot_id: "pot_123".into(),
+            monzo_pot_name: "Savings".into(),
+            actual_id: "act-uuid".into(),
+            actual_name: "Savings (Actual)".into(),
+        });
+        s.save(&path).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.monzo.pots.len(), 1);
+        assert_eq!(loaded.monzo.pots[0].monzo_pot_id, "pot_123");
+        assert_eq!(loaded.monzo.pots[0].actual_id, "act-uuid");
     }
 
     #[test]

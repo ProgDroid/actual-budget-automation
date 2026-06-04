@@ -2229,6 +2229,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                 refresh_token: "old".into(),
                 account_id: "acc".into(),
                 accounts: Vec::new(),
+                pots: Vec::new(),
             },
             payee_cache: BTreeMap::from([("KEPT".to_string(), "Kept Payee".to_string())]),
             pending_reviews: vec![PendingReview {
@@ -2315,6 +2316,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                 refresh_token: "old".into(),
                 account_id: "acc".into(),
                 accounts: Vec::new(),
+                pots: Vec::new(),
             },
             ..State::default()
         };
@@ -2367,6 +2369,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                     actual_id: "acc".into(),
                     ..Default::default()
                 }],
+                pots: Vec::new(),
             },
             pending_reviews: vec![PendingReview {
                 external_id: "tx_x".into(),

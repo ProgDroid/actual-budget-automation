@@ -367,6 +367,7 @@ mod tests {
                     actual_id: "uuid-1".into(),
                     ..Default::default()
                 }],
+                pots: Vec::new(),
             },
         )
     }
@@ -455,6 +456,7 @@ mod tests {
                 refresh_token: "rt".into(),
                 account_id: String::new(),
                 accounts: Vec::new(),
+                pots: Vec::new(),
             },
         );
         m.set_access_token_for_test("at_x".into());
@@ -769,6 +771,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                pots: Vec::new(),
             },
         );
         m.set_access_token_for_test("at_x".into());
