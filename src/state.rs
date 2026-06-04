@@ -56,6 +56,12 @@ pub struct AccountLink {
     /// Actual account name (suggest/review UX only).
     #[serde(default)]
     pub actual_name: String,
+    /// True when this is the user's Monzo Flex account (auto-detected by the
+    /// `monzoflex_` description prefix at `aba accounts` time; overridable).
+    /// `monzo_flex` lines from a NON-flex account become transfers TO this
+    /// account; lines from this account are the suppressible mirror side.
+    #[serde(default)]
+    pub is_flex: bool,
 }
 
 /// One Monzo pot mapped to one Actual account. Pot moves become Actual transfers
@@ -803,6 +809,7 @@ mod tests {
             monzo_name: "Personal".into(),
             actual_id: "uuid-1".into(),
             actual_name: "Monzo Personal".into(),
+            is_flex: false,
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
@@ -1020,6 +1027,29 @@ mod tests {
         s.save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
         assert_eq!(loaded.held_transfers, vec![expected]);
+    }
+
+    #[test]
+    fn account_link_is_flex_round_trips_and_defaults_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut s = State::default();
+        s.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_flex".into(),
+            monzo_name: "monzoflex_0000".into(),
+            actual_id: "act-flex".into(),
+            actual_name: "Flex".into(),
+            is_flex: true,
+        });
+        // A normal account via ..Default::default() must default is_flex=false.
+        let normal = AccountLink {
+            monzo_id: "acc_cur".into(),
+            ..Default::default()
+        };
+        assert!(!normal.is_flex);
+        s.save(&path).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert!(loaded.monzo.accounts[0].is_flex);
     }
 
     #[test]

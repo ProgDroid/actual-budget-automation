@@ -442,6 +442,7 @@ fn suggest_links(
                     monzo_name: mname.clone(),
                     actual_id: aid.clone(),
                     actual_name: aname.clone(),
+                    is_flex: false,
                 },
                 None => AccountLink {
                     monzo_id: mid.clone(),
@@ -3505,6 +3506,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             monzo_name: "Joint".into(),
             actual_id: "act-joint".into(),
             actual_name: "Joint".into(),
+            is_flex: false,
         }];
         assert_eq!(
             resolve_transfer_dest(&TransferTarget::Pot("pot_abc".into()), &pots, &accts),
