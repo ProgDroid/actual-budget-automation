@@ -255,7 +255,7 @@ impl Monzo {
         Ok(list
             .accounts
             .into_iter()
-            .filter(|a| !a.closed)
+            .filter(|a| !a.closed && is_mappable_account(&a.description))
             .map(|a| (a.id, a.description))
             .collect())
     }
@@ -289,6 +289,13 @@ impl Monzo {
             .map(|p| (p.id, p.name))
             .collect())
     }
+}
+
+/// Whether a Monzo account (by its `description`) should be offered for mapping.
+/// Excludes the internal Flex backing-loan account, which 403s on /transactions
+/// and would fail-loud the whole run if mapped.
+fn is_mappable_account(description: &str) -> bool {
+    !description.starts_with("monzoflexbackingloan_")
 }
 
 #[async_trait]
@@ -881,6 +888,13 @@ mod tests {
             metadata: TxMetadata { pot_id: None },
         };
         assert_eq!(tx.transfer_target(), None);
+    }
+
+    #[test]
+    fn backing_loan_account_is_not_mappable() {
+        assert!(!is_mappable_account("monzoflexbackingloan_0000X"));
+        assert!(is_mappable_account("monzoflex_0000X")); // the real Flex account IS mappable
+        assert!(is_mappable_account("user_0000X"));
     }
 
     #[tokio::test]

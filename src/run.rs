@@ -454,6 +454,24 @@ fn suggest_links(
         .collect()
 }
 
+/// `suggest_links` plus Flex auto-detection: flag any link whose Monzo
+/// description (stored in `monzo_name`) starts with `monzoflex_`.
+fn suggest_links_with_flex(
+    monzo: &[(String, String)],
+    actual: &[(String, String)],
+    threshold: f64,
+) -> Vec<AccountLink> {
+    let mut links = suggest_links(monzo, actual, threshold);
+    for l in &mut links {
+        if l.monzo_name.starts_with("monzoflex_")
+            && !l.monzo_name.starts_with("monzoflexbackingloan_")
+        {
+            l.is_flex = true;
+        }
+    }
+    links
+}
+
 /// Auto-suggest Monzo-pot → Actual-account links by normalised-name similarity.
 /// Same policy as `suggest_links`: best match above `threshold`, else unmapped.
 fn suggest_pot_links(
@@ -526,19 +544,20 @@ pub async fn map_accounts(cfg: &Config, write: bool) -> anyhow::Result<()> {
         .map(|a| (a.id, a.name))
         .collect();
 
-    let links = suggest_links(&monzo_accounts, &actual_accounts, ACCOUNT_MATCH_THRESHOLD);
+    let links = suggest_links_with_flex(&monzo_accounts, &actual_accounts, ACCOUNT_MATCH_THRESHOLD);
 
     println!("Suggested Monzo → Actual account mapping:");
     for l in &links {
+        let flex = if l.is_flex { "  [FLEX]" } else { "" };
         if l.actual_id.is_empty() {
             println!(
-                "  {} ({})  →  [UNMAPPED — edit state file]",
-                l.monzo_name, l.monzo_id
+                "  {} ({})  →  [UNMAPPED — edit state file]{}",
+                l.monzo_name, l.monzo_id, flex
             );
         } else {
             println!(
-                "  {} ({})  →  {} ({})",
-                l.monzo_name, l.monzo_id, l.actual_name, l.actual_id
+                "  {} ({})  →  {} ({}){}",
+                l.monzo_name, l.monzo_id, l.actual_name, l.actual_id, flex
             );
         }
     }
@@ -3532,6 +3551,23 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             resolve_transfer_dest(&TransferTarget::Pot("pot_x".into()), &pots_empty, &accts),
             None
         );
+    }
+
+    #[test]
+    fn map_accounts_flags_flex_account_by_description_prefix() {
+        let monzo = vec![
+            ("acc_cur".to_string(), "user_0000".to_string()),
+            ("acc_flex".to_string(), "monzoflex_0000".to_string()),
+        ];
+        let actual = vec![
+            ("u-cur".to_string(), "Current".to_string()),
+            ("u-flex".to_string(), "Flex".to_string()),
+        ];
+        let links = suggest_links_with_flex(&monzo, &actual, ACCOUNT_MATCH_THRESHOLD);
+        let flex = links.iter().find(|l| l.monzo_id == "acc_flex").unwrap();
+        assert!(flex.is_flex);
+        let cur = links.iter().find(|l| l.monzo_id == "acc_cur").unwrap();
+        assert!(!cur.is_flex);
     }
 
     #[test]
