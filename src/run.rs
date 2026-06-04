@@ -330,8 +330,8 @@ fn build_prompt(
     category_names: &[String],
 ) -> Prompt {
     use crate::telegram::{encode_callback, group_key};
-    let key = group_key(&entry.raw_merchant);
-    let key = key.as_str();
+    let key_owned = group_key(&entry.raw_merchant);
+    let key = key_owned.as_str();
     // ` (N txns)` only when the group has more than one held transaction.
     let count = if member_count > 1 {
         format!(" ({member_count} txns)")
@@ -357,7 +357,7 @@ fn build_prompt(
                 let conf = entry.confidence.as_deref().unwrap_or("medium");
                 Prompt {
                     chat_text: format!(
-                        "'{}'{}  -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
+                        "'{}'{} -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
                         entry.raw_merchant, count, s, conf
                     ),
                     buttons: buttons(&[
@@ -369,7 +369,7 @@ fn build_prompt(
             }
             Some(s) => Prompt {
                 chat_text: format!(
-                    "No existing payee '{s}'.{count} Create it?\nOr reply with a payee name."
+                    "No existing payee '{s}'{count}. Create it?\nOr reply with a payee name."
                 ),
                 buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
             },
@@ -441,6 +441,8 @@ async fn send_group_prompts(
             }
             continue;
         }
+        // Prefer an unsettled-payee member so the prompt covers the payee dimension
+        // first; fall back to the first member if every entry is already payee-settled.
         let rep = members
             .iter()
             .copied()
@@ -1986,7 +1988,15 @@ pub mod tests {
         let channel = FakeChannel::new(vec![], 0);
         let payees = vec!["Transport for London".to_string()];
         send_group_prompts(&mut state, &channel, &payees, &[], &path).await;
-        assert_eq!(channel.sent.lock().unwrap().len(), 2);
+        let sent = channel.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        for p in sent.iter() {
+            assert!(
+                !p.chat_text.contains("txns"),
+                "single-member prompt must show no count suffix: {}",
+                p.chat_text
+            );
+        }
     }
 
     #[tokio::test]
