@@ -2286,6 +2286,187 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         );
     }
 
+    /// Held transfer is retried and imported once the pot is mapped on a
+    /// subsequent run.  The second `run()` uses an empty `FakeBank` so the import
+    /// can ONLY originate from the held queue, proving durable retry works.
+    #[tokio::test]
+    async fn held_transfer_imports_after_pot_is_mapped() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        // Source account mapped; pot NOT yet mapped.
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+
+        // Run 1: fetch the pot-deposit tx.  Pot is unmapped -> held.
+        let mut bank1 = FakeBank {
+            txs: vec![pot_deposit("tx_pot")],
+        };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank1,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state.held_transfers.len(),
+            1,
+            "run 1 must hold the transfer"
+        );
+        // routed.log must not contain a transfer import yet.
+        if routed_log.exists() {
+            let logged = std::fs::read_to_string(&routed_log).unwrap();
+            assert!(
+                !logged.contains("p_xfer_pot"),
+                "no transfer import before pot is mapped, got: {logged}"
+            );
+        }
+
+        // Now map the pot.
+        state.monzo.pots.push(PotLink {
+            monzo_pot_id: "pot_abc".into(),
+            actual_id: "act-pot".into(),
+            ..Default::default()
+        });
+
+        // Run 2: empty bank (no new fetch rows) -> held entry must be retried.
+        let mut bank2 = FakeBank { txs: vec![] };
+        let claude2 = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank2,
+            &actual,
+            &claude2,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state.held_transfers.is_empty(),
+            "after mapping the pot the held transfer must be cleared"
+        );
+        let logged = std::fs::read_to_string(&routed_log).unwrap();
+        let calls: Vec<serde_json::Value> = logged
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly one import call on run 2");
+        assert_eq!(
+            calls[0]["account_id"], "act-cur",
+            "import routed to source account"
+        );
+        let txns = calls[0]["transactions"].as_array().unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(
+            txns[0]["payee"], "p_xfer_pot",
+            "payee must be the pot transfer payee"
+        );
+        assert!(
+            txns[0].get("category").is_none(),
+            "transfers carry no category"
+        );
+    }
+
+    /// A re-fetched duplicate of a held transfer (same `external_id`) must NOT
+    /// double-queue the entry.  After two runs with the same unmapped tx the
+    /// held list must still have length 1.
+    #[tokio::test]
+    async fn held_transfer_not_double_queued_when_refetched() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        // Source mapped; pot stays unmapped for the whole test.
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+
+        // Run 1: pot-deposit tx fetched, unmapped -> held (len == 1).
+        let mut bank1 = FakeBank {
+            txs: vec![pot_deposit("tx_pot")],
+        };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank1,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.held_transfers.len(), 1, "run 1: tx held");
+
+        // Run 2: the overlap window re-fetches the SAME tx again (still unmapped).
+        let mut bank2 = FakeBank {
+            txs: vec![pot_deposit("tx_pot")],
+        };
+        let claude2 = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank2,
+            &actual,
+            &claude2,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state.held_transfers.len(),
+            1,
+            "duplicate external_id must not double-queue held transfers"
+        );
+        // Still no import.
+        if routed_log.exists() {
+            let logged = std::fs::read_to_string(&routed_log).unwrap();
+            assert!(
+                !logged.contains("p_xfer_pot"),
+                "unmapped pot must never import, got: {logged}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dry_run_sends_no_prompts_and_no_writes() {
         let shim = tempfile::tempdir().unwrap();
