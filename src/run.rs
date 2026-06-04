@@ -9,12 +9,12 @@ use tracing::{info, warn};
 
 use crate::actual::ActualClient;
 use crate::actual::shim_protocol::{Category, ImportTxn, Payee, ScheduleRow};
-use crate::banks::{BankError, BankSource, RawTransaction};
+use crate::banks::{BankError, BankSource, RawTransaction, TransferTarget};
 use crate::claude::{Classification, ClaudeMatcher, Confidence};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
 use crate::matching::{Schedule, best_payee_match, matches_scheduled};
 use crate::notify::Notifier;
-use crate::state::{AccountLink, ClassifiedHold, PendingReview, State};
+use crate::state::{AccountLink, ClassifiedHold, PendingReview, PotLink, State};
 use crate::telegram::{ConfirmChannel, Prompt};
 
 /// Minimum normalised-name similarity for `aba accounts` to auto-link a Monzo
@@ -37,6 +37,40 @@ fn actual_id_for(source_monzo_id: &str, links: &[AccountLink]) -> Option<String>
         Some(only.actual_id.clone())
     } else {
         None
+    }
+}
+
+/// Find the transfer payee id for an Actual account (a payee whose
+/// `transfer_acct` equals `actual_id`). Actual auto-creates one per account.
+#[allow(dead_code)] // wired into run() in Task 7
+fn transfer_payee_id<'a>(
+    payees: &'a [crate::actual::shim_protocol::Payee],
+    actual_id: &str,
+) -> Option<&'a str> {
+    payees
+        .iter()
+        .find(|p| p.transfer_acct.as_deref() == Some(actual_id))
+        .map(|p| p.id.as_str())
+}
+
+/// Resolve a transfer's destination to an Actual account id. `Pot` looks up
+/// `[[monzo.pots]]`; `Account` looks up `[[monzo.accounts]]`. Empty `actual_id`
+/// (present but unmapped) and a missing entry both yield `None` (caller holds).
+#[allow(dead_code)] // wired into run() in Task 7
+fn resolve_transfer_dest(
+    target: &TransferTarget,
+    pots: &[PotLink],
+    accounts: &[AccountLink],
+) -> Option<String> {
+    match target {
+        TransferTarget::Pot(pot_id) => pots
+            .iter()
+            .find(|p| &p.monzo_pot_id == pot_id && !p.actual_id.is_empty())
+            .map(|p| p.actual_id.clone()),
+        TransferTarget::Account(acc_id) => accounts
+            .iter()
+            .find(|a| &a.monzo_id == acc_id && !a.actual_id.is_empty())
+            .map(|a| a.actual_id.clone()),
     }
 }
 
@@ -2973,5 +3007,65 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let logged = std::fs::read_to_string(&imports_log).unwrap();
         assert!(logged.contains("tx_cafe") && logged.contains("c_din"));
         assert!(state.pending_reviews.is_empty());
+    }
+
+    #[test]
+    fn transfer_payee_id_finds_the_account_transfer_payee() {
+        use crate::actual::shim_protocol::Payee;
+        let payees = vec![
+            Payee {
+                id: "p1".into(),
+                name: "Tesco".into(),
+                transfer_acct: None,
+            },
+            Payee {
+                id: "p2".into(),
+                name: "Transfer: Savings".into(),
+                transfer_acct: Some("act-pot".into()),
+            },
+        ];
+        assert_eq!(transfer_payee_id(&payees, "act-pot"), Some("p2"));
+        assert_eq!(transfer_payee_id(&payees, "act-missing"), None);
+    }
+
+    #[test]
+    fn resolve_transfer_dest_maps_pot_then_account() {
+        use crate::banks::TransferTarget;
+        let pots = vec![PotLink {
+            monzo_pot_id: "pot_abc".into(),
+            monzo_pot_name: "Savings".into(),
+            actual_id: "act-pot".into(),
+            actual_name: "Savings".into(),
+        }];
+        let accts = vec![AccountLink {
+            monzo_id: "acc_joint".into(),
+            monzo_name: "Joint".into(),
+            actual_id: "act-joint".into(),
+            actual_name: "Joint".into(),
+        }];
+        assert_eq!(
+            resolve_transfer_dest(&TransferTarget::Pot("pot_abc".into()), &pots, &accts),
+            Some("act-pot".to_string())
+        );
+        assert_eq!(
+            resolve_transfer_dest(&TransferTarget::Account("acc_joint".into()), &pots, &accts),
+            Some("act-joint".to_string())
+        );
+        // unmapped pot -> None
+        assert_eq!(
+            resolve_transfer_dest(&TransferTarget::Pot("pot_unmapped".into()), &pots, &accts),
+            None
+        );
+        // a pot present but with empty actual_id is treated as unmapped -> None
+        let pots_empty = vec![PotLink {
+            monzo_pot_id: "pot_x".into(),
+            monzo_pot_name: "X".into(),
+            actual_id: String::new(),
+            actual_name: String::new(),
+        }];
+        assert_eq!(
+            resolve_transfer_dest(&TransferTarget::Pot("pot_x".into()), &pots_empty, &accts),
+            None
+        );
     }
 }
