@@ -81,7 +81,6 @@ pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
 /// `<action>:` prefix stays far under Telegram's 64-byte cap, so grouped prompts
 /// never lose their keyboard to length.
 #[must_use]
-#[allow(dead_code)] // used in the forthcoming grouping phase; no callers yet
 pub fn group_key(raw_merchant: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
     for byte in raw_merchant.as_bytes() {
