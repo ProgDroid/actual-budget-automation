@@ -190,9 +190,30 @@ mod tests {
             payees,
             vec![Payee {
                 id: "p1".into(),
-                name: "Amazon".into()
+                name: "Amazon".into(),
+                transfer_acct: None,
             }]
         );
+    }
+
+    #[test]
+    fn payee_deserializes_transfer_acct() {
+        use crate::actual::shim_protocol::Payee;
+        let json = r#"[
+            {"id":"p1","name":"Tesco","transfer_acct":null},
+            {"id":"p2","name":"Transfer: Savings","transfer_acct":"act-uuid"}
+        ]"#;
+        let payees: Vec<Payee> = serde_json::from_str(json).unwrap();
+        assert_eq!(payees[0].transfer_acct, None);
+        assert_eq!(payees[1].transfer_acct.as_deref(), Some("act-uuid"));
+    }
+
+    #[test]
+    fn payee_deserializes_without_transfer_acct_field() {
+        use crate::actual::shim_protocol::Payee;
+        let json = r#"[{"id":"p1","name":"Tesco"}]"#;
+        let payees: Vec<Payee> = serde_json::from_str(json).unwrap();
+        assert_eq!(payees[0].transfer_acct, None);
     }
 
     #[tokio::test]

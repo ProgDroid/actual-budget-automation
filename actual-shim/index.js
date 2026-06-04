@@ -39,7 +39,11 @@ async function handle(req) {
     }
     case 'get_payees': {
       const payees = await api.getPayees();
-      return payees.map((p) => ({ id: p.id, name: p.name }));
+      return payees.map((p) => ({
+        id: p.id,
+        name: p.name,
+        transfer_acct: p.transfer_acct ?? null,
+      }));
     }
     case 'get_categories': {
       const cats = await api.getCategories();

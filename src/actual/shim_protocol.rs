@@ -41,6 +41,11 @@ pub struct Account {
 pub struct Payee {
     pub id: String,
     pub name: String,
+    /// Set (an account id) when this payee is a *transfer payee* — importing a
+    /// transaction with this payee creates a linked transfer into that account.
+    /// `None`/absent for ordinary payees.
+    #[serde(default)]
+    pub transfer_acct: Option<String>,
 }
 
 /// An assignable Actual category (real categories carry a `group_id`; the shim

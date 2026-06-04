@@ -2778,6 +2778,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         let payees = vec![Payee {
             id: "p1".into(),
             name: "Rent Co".into(),
+            transfer_acct: None,
         }];
         let rows = vec![
             // good
