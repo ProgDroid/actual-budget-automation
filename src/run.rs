@@ -703,6 +703,9 @@ pub async fn run(
         .map(|a| a.monzo_id.clone());
 
     // Keys of main-side Flex transfers THIS run: (abs amount, "YYYY-MM-DD").
+    // (abs amount, date) is imprecise for same-amount same-day duplicates: it
+    // suppresses rather than double-imports (the main side fully represents the
+    // movement), so this is the safe direction. Rare in practice.
     let main_flex_keys: std::collections::BTreeSet<(i64, String)> = transfer_rows
         .iter()
         .filter(|t| match (&t.transfer, &flex_account_id) {
@@ -729,6 +732,7 @@ pub async fn run(
         .retain(|h| h.target_kind != "flex_mirror");
 
     let mut flex_mirrors_suppressed = 0usize;
+    // from_row is infallible here: every mirror_rows entry carries Some(FlexMirror).
     let new_mirror_hts = mirror_rows.iter().filter_map(HeldTransfer::from_row);
     for ht in prior_held_mirrors.into_iter().chain(new_mirror_hts) {
         let key = (ht.amount.abs(), ht.date.clone());
@@ -832,6 +836,9 @@ pub async fn run(
     // into the SOURCE account's group (Actual auto-creates the linked counterpart).
     let pot_links = state.monzo.pots.clone();
     // Work list: previously-held transfers (retry) + newly fetched, deduped by external_id.
+    // NOTE: flex_mirror HeldTransfers enqueued by the Flex mirror block above are
+    // deliberately re-cloned here and re-held via FlexMirror -> resolve_transfer_dest
+    // None -> still_held. Do NOT move the mirror block below this clone.
     let mut transfer_intents: Vec<HeldTransfer> = state.held_transfers.clone();
     for row in &transfer_rows {
         if let Some(ht) = HeldTransfer::from_row(row)
@@ -2729,6 +2736,102 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert!(
             state.pending_reviews.is_empty(),
             "transfers never use the Telegram review path"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_flex_mirror_suppressed_when_twin_arrives_next_run() {
+        // A mirror held in run 1 must be SUPPRESSED in run 2 once its main-side
+        // twin (same abs amount + date) finally arrives — the only F5 path the
+        // two single-run tests don't exercise.
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+        let date = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_flex".into(),
+            actual_id: "act-flex".into(),
+            is_flex: true,
+            ..Default::default()
+        });
+
+        // Run 1: only the flex-side mirror -> held.
+        let mirror = RawTransaction {
+            external_id: "tx_m".into(),
+            date,
+            amount_minor: 500,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_flex".into(),
+            transfer: Some(TransferTarget::FlexMirror),
+        };
+        let mut bank1 = FakeBank { txs: vec![mirror] };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank1,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.held_transfers.len(), 1, "run 1: unpaired mirror held");
+        assert_eq!(state.held_transfers[0].target_kind, "flex_mirror");
+
+        // Run 2: a FRESH bank returns ONLY the main-side twin (same date + abs amount).
+        let main = RawTransaction {
+            external_id: "tx_main".into(),
+            date,
+            amount_minor: -500,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_cur".into(),
+            transfer: Some(TransferTarget::Account("acc_flex".into())),
+        };
+        let mut bank2 = FakeBank { txs: vec![main] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank2,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // The previously-held mirror is now suppressed; exactly one main-side import.
+        assert!(
+            state.held_transfers.is_empty(),
+            "run 2: twin arrival suppresses the held mirror"
+        );
+        let logged = std::fs::read_to_string(&routed_log).expect("routed.log must exist");
+        let lines: Vec<&str> = logged.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one import call (main side only)");
+        assert!(
+            lines[0].contains("act-cur"),
+            "imported into the main account"
+        );
+        assert!(
+            lines[0].contains("p_xfer_flex"),
+            "via the Flex transfer payee"
         );
     }
 
