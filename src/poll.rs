@@ -16,64 +16,84 @@ pub async fn poll(
     state: &mut State,
     channel: &dyn ConfirmChannel,
 ) -> anyhow::Result<usize> {
+    use crate::telegram::group_key;
+
+    // A prompt's message_id maps to the merchant group it was sent for, so a
+    // free-text reply correlates to the whole group.
     let msg_map: BTreeMap<i64, String> = state
         .pending_reviews
         .iter()
-        .filter_map(|p| p.telegram_message_id.map(|m| (m, p.external_id.clone())))
+        .filter_map(|p| {
+            p.telegram_message_id
+                .map(|m| (m, group_key(&p.raw_merchant)))
+        })
         .collect();
     let (replies, new_offset) = channel
         .poll_replies(state.telegram.last_update_id, &msg_map)
         .await?;
 
+    // Valid group keys currently held.
     let valid: BTreeSet<String> = state
         .pending_reviews
         .iter()
-        .map(|p| p.external_id.clone())
+        .map(|p| group_key(&p.raw_merchant))
         .collect();
 
     let mut applied = 0usize;
     for r in &replies {
         if !valid.contains(&r.entry_key) {
-            continue; // stale / spoofed entry key
+            continue; // stale / spoofed group key
         }
-        let ok = match &r.action {
-            ReplyAction::Confirm => state.confirm_pending(&r.entry_key),
-            ReplyAction::CreateNew => state.create_pending(&r.entry_key),
-            ReplyAction::Skip => state.skip_pending(&r.entry_key),
-            ReplyAction::ConfirmCategory => state.confirm_category(&r.entry_key),
-            ReplyAction::SkipCategory => state.skip_category(&r.entry_key),
-            ReplyAction::Remap(text) => {
-                // A free-text remap targets the currently-prompted dimension:
-                // payee if the payee dimension is still unsettled, else category.
-                let payee_settled = state
-                    .pending_reviews
-                    .iter()
-                    .find(|p| p.external_id == r.entry_key)
-                    .is_some_and(crate::state::PendingReview::payee_settled);
-                if payee_settled {
-                    state.remap_category(&r.entry_key, text)
-                } else {
-                    state.remap_pending(&r.entry_key, text)
+        // All member external_ids for this merchant group.
+        let members: Vec<String> = state
+            .pending_reviews
+            .iter()
+            .filter(|p| group_key(&p.raw_merchant) == r.entry_key)
+            .map(|p| p.external_id.clone())
+            .collect();
+        // Members share raw_merchant, hence the same dimension/suggestion; the
+        // first member decides whether a free-text remap targets payee or category.
+        let payee_settled = state
+            .pending_reviews
+            .iter()
+            .find(|p| group_key(&p.raw_merchant) == r.entry_key)
+            .is_some_and(crate::state::PendingReview::payee_settled);
+
+        let mut any = false;
+        for ext in &members {
+            let ok = match &r.action {
+                ReplyAction::Confirm => state.confirm_pending(ext),
+                ReplyAction::CreateNew => state.create_pending(ext),
+                ReplyAction::Skip => state.skip_pending(ext),
+                ReplyAction::ConfirmCategory => state.confirm_category(ext),
+                ReplyAction::SkipCategory => state.skip_category(ext),
+                ReplyAction::Remap(text) => {
+                    if payee_settled {
+                        state.remap_category(ext, text)
+                    } else {
+                        state.remap_pending(ext, text)
+                    }
                 }
-            }
-        };
-        if ok {
-            // A payee-settling action can transition the payee dimension from
-            // unsettled to settled while the category dimension is still open.
-            // When that happens, clear the prompt id so run() re-prompts (now for
-            // the category). Scope this to payee actions: category actions can
-            // never trigger this transition, and Skip removes the entry entirely.
+            };
+            any |= ok;
+        }
+        if any {
+            // A payee-settling action with the category still open clears the
+            // group's prompt id (all members) so run() re-prompts the whole group
+            // for the category dimension next run.
             if matches!(
                 &r.action,
                 ReplyAction::Confirm | ReplyAction::CreateNew | ReplyAction::Remap(_)
-            ) && let Some(pr) = state
-                .pending_reviews
-                .iter_mut()
-                .find(|p| p.external_id == r.entry_key)
-                && pr.payee_settled()
-                && !pr.category_resolved
-            {
-                pr.telegram_message_id = None;
+            ) {
+                for p in state
+                    .pending_reviews
+                    .iter_mut()
+                    .filter(|p| group_key(&p.raw_merchant) == r.entry_key)
+                {
+                    if p.payee_settled() && !p.category_resolved {
+                        p.telegram_message_id = None;
+                    }
+                }
             }
             applied += 1;
         }
@@ -81,7 +101,7 @@ pub async fn poll(
 
     state.telegram.last_update_id = new_offset;
     state.save(&cfg.state_path)?;
-    info!("poll applied {applied} repl(ies); offset now {new_offset}");
+    info!("poll applied {applied} group(s); offset now {new_offset}");
     Ok(applied)
 }
 
@@ -134,7 +154,7 @@ mod tests {
 
         let channel = FakeChannel::new(
             vec![Reply {
-                entry_key: "tx1".into(),
+                entry_key: crate::telegram::group_key("SQ *CAFE"),
                 action: ReplyAction::ConfirmCategory,
             }],
             55,
@@ -169,7 +189,7 @@ mod tests {
         });
         let channel = FakeChannel::new(
             vec![Reply {
-                entry_key: "tx2".into(),
+                entry_key: crate::telegram::group_key("X"),
                 action: ReplyAction::Remap("Groceries".into()),
             }],
             60,
@@ -201,7 +221,7 @@ mod tests {
         let channel = FakeChannel::new(
             vec![
                 Reply {
-                    entry_key: "tx1".into(),
+                    entry_key: crate::telegram::group_key("SQ *CAFE"),
                     action: ReplyAction::Confirm,
                 },
                 Reply {
@@ -221,5 +241,46 @@ mod tests {
         let reloaded = State::load(&path).unwrap();
         assert_eq!(reloaded.telegram.last_update_id, 123);
         assert_eq!(reloaded.pending_reviews[0].resolve_to, "Local Cafe");
+    }
+
+    #[tokio::test]
+    async fn confirm_fans_out_to_all_members_of_a_merchant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+
+        let mut state = State::default();
+        for ext in ["tx1", "tx2"] {
+            state.add_pending_full(
+                ext,
+                "TFL TRAVEL CH",
+                -250,
+                "2026-06-01",
+                Some("Transport for London".into()),
+                Some("medium".into()),
+                "",
+            );
+        }
+        for p in &mut state.pending_reviews {
+            p.telegram_message_id = Some(900);
+        }
+
+        let gk = crate::telegram::group_key("TFL TRAVEL CH");
+        let channel = crate::run::tests::FakeChannel::new(
+            vec![Reply {
+                entry_key: gk,
+                action: ReplyAction::Confirm,
+            }],
+            77,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+        assert_eq!(applied, 1, "one group applied");
+        assert!(
+            state
+                .pending_reviews
+                .iter()
+                .all(|p| p.resolve_to == "Transport for London"),
+            "both members resolved"
+        );
     }
 }
