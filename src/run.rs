@@ -551,7 +551,9 @@ pub async fn map_accounts(cfg: &Config, write: bool) -> anyhow::Result<()> {
         }
     }
     let pot_links = suggest_pot_links(&all_pots, &actual_accounts, ACCOUNT_MATCH_THRESHOLD);
-    if !pot_links.is_empty() {
+    if pot_links.is_empty() {
+        println!("\nNo Monzo pots found to map.");
+    } else {
         println!("\nSuggested Monzo pot → Actual account mapping:");
         for l in &pot_links {
             if l.actual_id.is_empty() {

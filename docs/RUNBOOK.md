@@ -24,7 +24,8 @@ state file (`monzo_id` → `actual_id`). Bootstrap them once:
 **Pot links (`[[monzo.pots]]`):** `aba accounts` also suggests a Monzo pot →
 Actual account mapping and `--write` persists it alongside the account links. For
 each pot you want to track as a transfer target, create a matching Actual account
-(on- or off-budget — aba only needs its id), then confirm or fix the mapping by
+(if one doesn't already exist; on- or off-budget — aba only needs its id), then
+confirm or fix the mapping by
 editing `[[monzo.pots]]` in the state file. Pot-move transactions whose pot is
 unmapped are HELD and retried every run (surfaced in the run summary as
 "transfer(s) awaiting account mapping"); they import automatically once you map the
