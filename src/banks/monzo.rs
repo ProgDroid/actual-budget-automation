@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::banks::{BankError, BankSource, RawTransaction};
+use crate::banks::{BankError, BankSource, RawTransaction, TransferTarget};
 use crate::state::{MonzoState, State};
 
 // `monzo` holds this bank's persisted MonzoState; the name mirrors the domain and
@@ -63,11 +63,11 @@ struct TxMetadata {
 impl MonzoTx {
     /// Classify this row as a transfer, if it is one. Pots only in this slice;
     /// inter-account (`p2p_payment`) is added in the inter-account slice.
-    fn transfer_target(&self) -> Option<crate::banks::TransferTarget> {
+    fn transfer_target(&self) -> Option<TransferTarget> {
         if self.scheme == "uk_retail_pot"
-            && let Some(pot_id) = self.metadata.pot_id.clone()
+            && let Some(pot_id) = self.metadata.pot_id.as_deref()
         {
-            return Some(crate::banks::TransferTarget::Pot(pot_id));
+            return Some(TransferTarget::Pot(pot_id.to_owned()));
         }
         None
     }
@@ -378,7 +378,6 @@ impl BankSource for Monzo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::banks::TransferTarget;
     use crate::state::State;
     use chrono::TimeZone;
     use wiremock::matchers::{method, path, query_param};
@@ -864,6 +863,21 @@ mod tests {
             decline_reason: None,
             merchant: None,
             scheme: "mastercard".into(),
+            metadata: TxMetadata { pot_id: None },
+        };
+        assert_eq!(tx.transfer_target(), None);
+    }
+
+    #[test]
+    fn pot_scheme_without_pot_id_returns_none() {
+        let tx = MonzoTx {
+            id: "tx_x".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: -5000,
+            description: String::new(),
+            decline_reason: None,
+            merchant: None,
+            scheme: "uk_retail_pot".into(),
             metadata: TxMetadata { pot_id: None },
         };
         assert_eq!(tx.transfer_target(), None);
