@@ -43,6 +43,11 @@ struct MonzoTx {
     decline_reason: Option<String>,
     #[serde(default)]
     merchant: Option<Merchant>,
+    /// Present on transfers and bank payments (P2P, faster payments). For an
+    /// incoming transfer there is no `merchant`, so `counterparty.name` is the
+    /// only place the sender's name appears.
+    #[serde(default)]
+    counterparty: Option<Counterparty>,
     /// Monzo settlement scheme: `uk_retail_pot` (pot move), `p2p_payment`
     /// (Monzo→Monzo), `payport_faster_payments`, card schemes, etc.
     #[serde(default)]
@@ -101,6 +106,12 @@ impl MonzoTx {
 
 #[derive(Debug, Deserialize)]
 struct Merchant {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Counterparty {
     #[serde(default)]
     name: String,
 }
@@ -248,9 +259,15 @@ impl Monzo {
             .into_iter()
             .filter(|t| t.decline_reason.is_none())
             .map(|t| {
+                // Merchant first (card purchases), then counterparty (incoming
+                // transfers carry the sender's name only here), then the raw
+                // description as a last resort.
                 let raw_merchant = match &t.merchant {
                     Some(m) if !m.name.is_empty() => m.name.clone(),
-                    _ => t.description.clone(),
+                    _ => match &t.counterparty {
+                        Some(c) if !c.name.is_empty() => c.name.clone(),
+                        _ => t.description.clone(),
+                    },
                 };
                 let transfer = t.transfer_target_flex(monzo_id, flex);
                 RawTransaction {
@@ -513,6 +530,50 @@ mod tests {
         assert_eq!(txs[0].raw_merchant, "Some Cafe");
         assert_eq!(txs[1].raw_merchant, "AMZNMKTPLACE");
         assert_eq!(txs[1].amount_minor, -1999);
+    }
+
+    #[tokio::test]
+    async fn fetch_uses_counterparty_name_for_incoming_transfers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "transactions": [
+                    // Incoming P2P: no merchant, but a counterparty -> use its name.
+                    {
+                        "id": "tx_p2p", "created": "2026-05-30T08:15:00Z", "amount": 1500,
+                        "description": "MONZO-ABC123 Settle up", "decline_reason": null,
+                        "merchant": null,
+                        "counterparty": { "name": "Jane Roommate" }
+                    },
+                    // Merchant present -> merchant wins over counterparty.
+                    {
+                        "id": "tx_card", "created": "2026-05-30T09:15:00Z", "amount": -450,
+                        "description": "SQ *SOME CAFE", "decline_reason": null,
+                        "merchant": { "name": "Some Cafe" },
+                        "counterparty": { "name": "Square Inc" }
+                    },
+                    // Neither merchant nor a named counterparty -> description fallback.
+                    {
+                        "id": "tx_bare", "created": "2026-05-30T10:15:00Z", "amount": -999,
+                        "description": "AMZNMKTPLACE", "decline_reason": null,
+                        "merchant": null,
+                        "counterparty": { "name": "" }
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut m = client(server.uri());
+        m.set_access_token_for_test("at_x".into());
+        let since = Utc.with_ymd_and_hms(2026, 5, 29, 0, 0, 0).unwrap();
+        let txs = m.fetch_since(since).await.unwrap();
+
+        assert_eq!(txs.len(), 3);
+        assert_eq!(txs[0].raw_merchant, "Jane Roommate");
+        assert_eq!(txs[1].raw_merchant, "Some Cafe");
+        assert_eq!(txs[2].raw_merchant, "AMZNMKTPLACE");
     }
 
     #[tokio::test]
@@ -882,6 +943,7 @@ mod tests {
             description: "pot_…".into(),
             decline_reason: None,
             merchant: None,
+            counterparty: None,
             scheme: "uk_retail_pot".into(),
             metadata: TxMetadata {
                 pot_id: Some("pot_abc".into()),
@@ -902,6 +964,7 @@ mod tests {
             description: "Coffee".into(),
             decline_reason: None,
             merchant: None,
+            counterparty: None,
             scheme: "mastercard".into(),
             metadata: TxMetadata { pot_id: None },
         };
@@ -917,6 +980,7 @@ mod tests {
             description: String::new(),
             decline_reason: None,
             merchant: None,
+            counterparty: None,
             scheme: "uk_retail_pot".into(),
             metadata: TxMetadata { pot_id: None },
         };
@@ -939,6 +1003,7 @@ mod tests {
             description: "Flex".into(),
             decline_reason: None,
             merchant: None,
+            counterparty: None,
             scheme: "monzo_flex".into(),
             metadata: TxMetadata { pot_id: None },
         };
@@ -957,6 +1022,7 @@ mod tests {
             description: "Flex".into(),
             decline_reason: None,
             merchant: None,
+            counterparty: None,
             scheme: "monzo_flex".into(),
             metadata: TxMetadata { pot_id: None },
         };
@@ -975,6 +1041,7 @@ mod tests {
             description: "Flex".into(),
             decline_reason: None,
             merchant: None,
+            counterparty: None,
             scheme: "monzo_flex".into(),
             metadata: TxMetadata { pot_id: None },
         };
@@ -995,6 +1062,7 @@ mod tests {
             merchant: Some(Merchant {
                 name: "Shop".into(),
             }),
+            counterparty: None,
             scheme: "mastercard".into(),
             metadata: TxMetadata { pot_id: None },
         };
@@ -1010,6 +1078,7 @@ mod tests {
             description: "pot".into(),
             decline_reason: None,
             merchant: None,
+            counterparty: None,
             scheme: "uk_retail_pot".into(),
             metadata: TxMetadata {
                 pot_id: Some("pot_abc".into()),
