@@ -61,11 +61,13 @@ pub struct AccountLink {
 pub struct PotLink {
     /// Monzo pot id (`pot_…`) — matches `metadata.pot_id` in the feed and `GET /pots[].id`.
     pub monzo_pot_id: String,
+    /// Monzo pot display name — suggest/review UX only.
     #[serde(default)]
     pub monzo_pot_name: String,
     /// Actual account UUID — the transfer target. Empty = unmapped.
     #[serde(default)]
     pub actual_id: String,
+    /// Actual account name — suggest/review UX only.
     #[serde(default)]
     pub actual_name: String,
 }
@@ -843,17 +845,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         let mut s = State::default();
-        s.monzo.pots.push(PotLink {
+        let expected = PotLink {
             monzo_pot_id: "pot_123".into(),
             monzo_pot_name: "Savings".into(),
             actual_id: "act-uuid".into(),
             actual_name: "Savings (Actual)".into(),
-        });
+        };
+        s.monzo.pots.push(expected.clone());
         s.save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
         assert_eq!(loaded.monzo.pots.len(), 1);
-        assert_eq!(loaded.monzo.pots[0].monzo_pot_id, "pot_123");
-        assert_eq!(loaded.monzo.pots[0].actual_id, "act-uuid");
+        assert_eq!(loaded.monzo.pots[0], expected);
     }
 
     #[test]
