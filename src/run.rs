@@ -411,6 +411,38 @@ fn build_prompt(
     }
 }
 
+/// Normalise free-text remap replies against the live payee list. A remap that
+/// matches an existing payee is canonicalised; one that doesn't is re-held as a
+/// "create it?" suggestion and re-prompted next run. The stale inline keyboard
+/// is edited away first — once per group message, since a merchant's members
+/// share one `telegram_message_id`.
+async fn rehold_failed_remaps(
+    state: &mut State,
+    channel: Option<&dyn ConfirmChannel>,
+    payee_names: &[String],
+) {
+    use std::collections::BTreeSet;
+    let mut edited: BTreeSet<i64> = BTreeSet::new();
+    for pr in &mut state.pending_reviews {
+        if !pr.create_new && !pr.resolve_to.is_empty() {
+            if let Some(canon) = best_payee_match(&pr.resolve_to, payee_names, PAYEE_THRESHOLD) {
+                pr.resolve_to = canon;
+            } else {
+                if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id)
+                    && edited.insert(old_id)
+                {
+                    let text = format!("↪️ Couldn't match '{}' — re-asking below.", pr.resolve_to);
+                    if let Err(e) = ch.edit_message_text(old_id, &text).await {
+                        warn!("telegram edit_message_text failed (stale prompt left in chat): {e}");
+                    }
+                }
+                pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
+                pr.telegram_message_id = None;
+            }
+        }
+    }
+}
+
 /// Send one Telegram prompt per merchant group (exact `raw_merchant`). A reply
 /// to that prompt resolves every held transaction of the merchant. A new
 /// transaction joining a merchant that already has a live prompt adopts its
@@ -828,27 +860,9 @@ pub async fn run(
     // Normalise any free-text remap replies against the live payee list, so
     // `take_resolved` only ever folds a real existing payee into the cache.
     // A remap that doesn't match becomes a "create it?" hold (suggestion set,
-    // resolve_to cleared, prompt re-sent next run).
-    for pr in &mut state.pending_reviews {
-        if !pr.create_new && !pr.resolve_to.is_empty() {
-            if let Some(canon) = best_payee_match(&pr.resolve_to, &payee_names, PAYEE_THRESHOLD) {
-                pr.resolve_to = canon;
-            } else {
-                // Free-text remap didn't match a real payee: re-hold as a
-                // "create it?" suggestion and re-prompt next. Edit the stale
-                // inline-keyboard message first so its old buttons can't be
-                // tapped (best-effort; failure must not abort the run).
-                if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id) {
-                    let text = format!("↪️ Couldn't match '{}' — re-asking below.", pr.resolve_to);
-                    if let Err(e) = ch.edit_message_text(old_id, &text).await {
-                        warn!("telegram edit_message_text failed (stale prompt left in chat): {e}");
-                    }
-                }
-                pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
-                pr.telegram_message_id = None;
-            }
-        }
-    }
+    // resolve_to cleared, prompt re-sent next run). Edits the stale inline-keyboard
+    // message once per group (shared message_id) before re-holding.
+    rehold_failed_remaps(state, channel, &payee_names).await;
 
     // 5a. Apply already-resolved pending reviews from previous runs.
     let resolved = state.take_resolved();
@@ -1496,6 +1510,11 @@ pub mod tests {
         pub fn with_failing_edit(mut self) -> Self {
             self.edit_should_fail = true;
             self
+        }
+
+        /// Number of `edit_message_text` calls recorded so far.
+        pub fn edits(&self) -> usize {
+            self.edited.lock().unwrap().len()
         }
     }
     #[async_trait]
@@ -4246,6 +4265,41 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert!(
             state.held_transfers.is_empty(),
             "not a transfer, nothing held"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remap_edits_group_message_once() {
+        let _dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        // Two members of one merchant, both free-text-remapped to a non-existent payee.
+        for ext in ["tx1", "tx2"] {
+            let mut p = held(ext, "SQ *NEWCAFE");
+            p.suggestion = None;
+            p.resolve_to = "Nonexistent Payee".into();
+            p.telegram_message_id = Some(500); // shared group message
+            state.pending_reviews.push(p);
+        }
+        let channel = FakeChannel::new(vec![], 0);
+        let payees = vec!["Tesco".to_string()];
+        rehold_failed_remaps(&mut state, Some(&channel as &dyn ConfirmChannel), &payees).await;
+
+        assert_eq!(
+            channel.edits(),
+            1,
+            "edit the shared group message exactly once"
+        );
+        assert!(
+            state
+                .pending_reviews
+                .iter()
+                .all(|p| p.telegram_message_id.is_none())
+        );
+        assert!(
+            state
+                .pending_reviews
+                .iter()
+                .all(|p| p.suggestion.as_deref() == Some("Nonexistent Payee"))
         );
     }
 }
