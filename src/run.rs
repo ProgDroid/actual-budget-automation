@@ -2836,6 +2836,89 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
     }
 
     #[tokio::test]
+    async fn flex_flagged_but_unmapped_holds_main_and_suppresses_mirror() {
+        // acc_cur -> act-cur (mapped). acc_flex is FLAGGED is_flex but has NO actual_id
+        // (flagged-as-flex, not yet mapped to an Actual account).
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+        // is_flex = true but actual_id empty (unmapped):
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_flex".into(),
+            is_flex: true,
+            ..Default::default()
+        });
+
+        // Repayment: both sides, same date + abs amount.
+        let main = RawTransaction {
+            external_id: "tx_main".into(),
+            date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+            amount_minor: -82822,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_cur".into(),
+            transfer: Some(TransferTarget::Account("acc_flex".into())),
+        };
+        let mirror = RawTransaction {
+            external_id: "tx_mirror".into(),
+            date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+            amount_minor: 82822,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_flex".into(),
+            transfer: Some(TransferTarget::FlexMirror),
+        };
+        let mut bank = FakeBank {
+            txs: vec![main, mirror],
+        };
+        let claude = FakeClaude { out: vec![] };
+
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Nothing imported (Flex unmapped -> main side can't resolve a dest).
+        let imported = std::fs::read_to_string(&routed_log)
+            .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count());
+        assert_eq!(imported, 0, "nothing imported while Flex is unmapped");
+
+        // Movement preserved: exactly ONE held entry — the MAIN side (target_kind "account"),
+        // NOT the mirror (which was suppressed by amount+date pairing keyed on monzo_id).
+        assert_eq!(state.held_transfers.len(), 1, "only the main side is held");
+        assert_eq!(
+            state.held_transfers[0].target_kind, "account",
+            "held entry is the main transfer, not the mirror"
+        );
+        assert!(
+            state
+                .held_transfers
+                .iter()
+                .all(|h| h.target_kind != "flex_mirror"),
+            "mirror was suppressed, not held"
+        );
+        assert!(state.pending_reviews.is_empty());
+    }
+
+    #[tokio::test]
     async fn dry_run_sends_no_prompts_and_no_writes() {
         let shim = tempfile::tempdir().unwrap();
         let statedir = tempfile::tempdir().unwrap();
