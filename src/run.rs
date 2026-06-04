@@ -321,19 +321,23 @@ fn payee_id_for<'a>(payees: &'a [Payee], name: &str) -> Option<&'a str> {
 ///   - suggestion in category list -> "Category for raw → suggestion?" [Confirm][Skip]
 ///   - otherwise                   -> "Which category for raw?" [Skip]
 ///
-/// If the entry's `external_id` is too long to fit Telegram's 64-byte
-/// `callback_data` cap, the keyboard is dropped entirely (every button shares
-/// the same key, so it is all-or-nothing); the user resolves via a free-text
-/// reply, which is correlated by `telegram_message_id` instead.
+/// The callback key is `group_key(raw_merchant)`; one prompt covers every held
+/// transaction of that merchant, and one reply (button or free text) resolves all.
 fn build_prompt(
     entry: &PendingReview,
+    member_count: usize,
     payee_names: &[String],
     category_names: &[String],
 ) -> Prompt {
-    use crate::telegram::encode_callback;
-    let key = &entry.external_id;
-    // Encode every (label, action) spec; if any key is too long they all are,
-    // so collect into Option<Vec<_>> and fall back to no buttons.
+    use crate::telegram::{encode_callback, group_key};
+    let key_owned = group_key(&entry.raw_merchant);
+    let key = key_owned.as_str();
+    // ` (N txns)` only when the group has more than one held transaction.
+    let count = if member_count > 1 {
+        format!(" ({member_count} txns)")
+    } else {
+        String::new()
+    };
     let buttons = |specs: &[(&str, &str)]| -> Vec<(String, String)> {
         specs
             .iter()
@@ -353,8 +357,8 @@ fn build_prompt(
                 let conf = entry.confidence.as_deref().unwrap_or("medium");
                 Prompt {
                     chat_text: format!(
-                        "'{}' -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
-                        entry.raw_merchant, s, conf
+                        "'{}'{} -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
+                        entry.raw_merchant, count, s, conf
                     ),
                     buttons: buttons(&[
                         ("✅ Confirm", "cf"),
@@ -365,14 +369,14 @@ fn build_prompt(
             }
             Some(s) => Prompt {
                 chat_text: format!(
-                    "No existing payee '{s}'. Create it?\nOr reply with a payee name."
+                    "No existing payee '{s}'{count}. Create it?\nOr reply with a payee name."
                 ),
                 buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
             },
             None => Prompt {
                 chat_text: format!(
-                    "New merchant '{}' — which payee?\nReply with a payee name, or:",
-                    entry.raw_merchant
+                    "New merchant '{}'{} — which payee?\nReply with a payee name, or:",
+                    entry.raw_merchant, count
                 ),
                 buttons: buttons(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")]),
             },
@@ -385,9 +389,9 @@ fn build_prompt(
             let conf = entry.category_confidence.as_deref().unwrap_or("medium");
             Prompt {
                 chat_text: format!(
-                    "Category for '{}' -> '{}'?  ({} confidence)\n\
+                    "Category for '{}'{} -> '{}'?  ({} confidence)\n\
                      Reply with a different category, or Skip to leave it uncategorised.",
-                    entry.raw_merchant, s, conf
+                    entry.raw_merchant, count, s, conf
                 ),
                 buttons: buttons(&[("✅ Confirm", "cc"), ("❌ Skip", "xc")]),
             }
@@ -399,11 +403,100 @@ fn build_prompt(
         // off-list category or the category was deleted after this entry was held.
         Some(_) | None => Prompt {
             chat_text: format!(
-                "Which category for '{}'?\nReply with a category name, or Skip to leave it uncategorised.",
-                entry.raw_merchant
+                "Which category for '{}'{}?\nReply with a category name, or Skip to leave it uncategorised.",
+                entry.raw_merchant, count
             ),
             buttons: buttons(&[("❌ Skip", "xc")]),
         },
+    }
+}
+
+/// Normalise free-text remap replies against the live payee list. A remap that
+/// matches an existing payee is canonicalised; one that doesn't is re-held as a
+/// "create it?" suggestion and re-prompted next run. The stale inline keyboard
+/// is edited away first — once per group message, since a merchant's members
+/// share one `telegram_message_id`.
+async fn rehold_failed_remaps(
+    state: &mut State,
+    channel: Option<&dyn ConfirmChannel>,
+    payee_names: &[String],
+) {
+    use std::collections::BTreeSet;
+    let mut edited: BTreeSet<i64> = BTreeSet::new();
+    for pr in &mut state.pending_reviews {
+        if !pr.create_new && !pr.resolve_to.is_empty() {
+            if let Some(canon) = best_payee_match(&pr.resolve_to, payee_names, PAYEE_THRESHOLD) {
+                pr.resolve_to = canon;
+            } else {
+                if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id)
+                    && edited.insert(old_id)
+                {
+                    let text = format!("↪️ Couldn't match '{}' — re-asking below.", pr.resolve_to);
+                    if let Err(e) = ch.edit_message_text(old_id, &text).await {
+                        warn!("telegram edit_message_text failed (stale prompt left in chat): {e}");
+                    }
+                }
+                pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
+                pr.telegram_message_id = None;
+            }
+        }
+    }
+}
+
+/// Send one Telegram prompt per merchant group (exact `raw_merchant`). A reply
+/// to that prompt resolves every held transaction of the merchant. A new
+/// transaction joining a merchant that already has a live prompt adopts its
+/// `message_id` instead of triggering a second prompt ("adopt, don't resend").
+async fn send_group_prompts(
+    state: &mut State,
+    channel: &dyn ConfirmChannel,
+    payee_names: &[String],
+    category_names: &[String],
+    state_path: &std::path::Path,
+) {
+    let mut order: Vec<String> = Vec::new();
+    let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, p) in state.pending_reviews.iter().enumerate() {
+        if !buckets.contains_key(&p.raw_merchant) {
+            order.push(p.raw_merchant.clone());
+        }
+        buckets.entry(p.raw_merchant.clone()).or_default().push(i);
+    }
+    for merchant in order {
+        let members = buckets[&merchant].clone();
+        if let Some(id) = members
+            .iter()
+            .find_map(|&i| state.pending_reviews[i].telegram_message_id)
+        {
+            for &i in &members {
+                state.pending_reviews[i].telegram_message_id = Some(id);
+            }
+            continue;
+        }
+        // Prefer an unsettled-payee member so the prompt covers the payee dimension
+        // first; fall back to the first member if every entry is already payee-settled.
+        let rep = members
+            .iter()
+            .copied()
+            .find(|&i| !state.pending_reviews[i].payee_settled())
+            .unwrap_or(members[0]);
+        let prompt = build_prompt(
+            &state.pending_reviews[rep],
+            members.len(),
+            payee_names,
+            category_names,
+        );
+        match channel.send_prompt(&prompt).await {
+            Ok(message_id) => {
+                for &i in &members {
+                    state.pending_reviews[i].telegram_message_id = Some(message_id);
+                }
+                if let Err(e) = state.save(state_path) {
+                    warn!("failed to persist telegram_message_id (may re-prompt next run): {e}");
+                }
+            }
+            Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
+        }
     }
 }
 
@@ -767,27 +860,9 @@ pub async fn run(
     // Normalise any free-text remap replies against the live payee list, so
     // `take_resolved` only ever folds a real existing payee into the cache.
     // A remap that doesn't match becomes a "create it?" hold (suggestion set,
-    // resolve_to cleared, prompt re-sent next run).
-    for pr in &mut state.pending_reviews {
-        if !pr.create_new && !pr.resolve_to.is_empty() {
-            if let Some(canon) = best_payee_match(&pr.resolve_to, &payee_names, PAYEE_THRESHOLD) {
-                pr.resolve_to = canon;
-            } else {
-                // Free-text remap didn't match a real payee: re-hold as a
-                // "create it?" suggestion and re-prompt next. Edit the stale
-                // inline-keyboard message first so its old buttons can't be
-                // tapped (best-effort; failure must not abort the run).
-                if let (Some(ch), Some(old_id)) = (channel, pr.telegram_message_id) {
-                    let text = format!("↪️ Couldn't match '{}' — re-asking below.", pr.resolve_to);
-                    if let Err(e) = ch.edit_message_text(old_id, &text).await {
-                        warn!("telegram edit_message_text failed (stale prompt left in chat): {e}");
-                    }
-                }
-                pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
-                pr.telegram_message_id = None;
-            }
-        }
-    }
+    // resolve_to cleared, prompt re-sent next run). Edits the stale inline-keyboard
+    // message once per group (shared message_id) before re-holding.
+    rehold_failed_remaps(state, channel, &payee_names).await;
 
     // 5a. Apply already-resolved pending reviews from previous runs.
     let resolved = state.take_resolved();
@@ -1233,36 +1308,19 @@ pub async fn run(
 
     state.last_run = Some(fetch_start);
 
-    // Send a prompt for every held entry that hasn't been prompted yet.
+    // Send one prompt per merchant group for everything still held.
     if let Some(ch) = channel {
-        // collect indices to avoid borrow conflicts while sending
-        let to_prompt: Vec<usize> = state
-            .pending_reviews
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.telegram_message_id.is_none())
-            .map(|(i, _)| i)
-            .collect();
-        for i in to_prompt {
-            let prompt = build_prompt(&state.pending_reviews[i], &payee_names, &category_names);
-            match ch.send_prompt(&prompt).await {
-                Ok(message_id) => {
-                    state.pending_reviews[i].telegram_message_id = Some(message_id);
-                    // Persist now so a later failure can't strand this id (M6).
-                    if let Err(e) = state.save(&cfg.state_path) {
-                        warn!(
-                            "failed to persist telegram_message_id (may re-prompt next run): {e}"
-                        );
-                    }
-                }
-                Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
-            }
-        }
+        send_group_prompts(state, ch, &payee_names, &category_names, &cfg.state_path).await;
     }
 
     state.save(&cfg.state_path)?;
 
-    let awaiting = state.pending_reviews.len();
+    let awaiting = state
+        .pending_reviews
+        .iter()
+        .map(|p| p.raw_merchant.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     let mut body = format!(
         "Added {}, updated {}, held {} for review.",
         summary.added, summary.updated, held
@@ -1274,7 +1332,7 @@ pub async fn run(
         }
     }
     if awaiting > 0 {
-        let _ = write!(body, "\n{awaiting} item(s) awaiting your confirmation.");
+        let _ = write!(body, "\n{awaiting} merchant(s) awaiting your confirmation.");
     }
     if transfers_imported > 0 {
         let _ = write!(body, "\nImported {transfers_imported} transfer(s).");
@@ -1457,6 +1515,11 @@ pub mod tests {
         pub fn with_failing_edit(mut self) -> Self {
             self.edit_should_fail = true;
             self
+        }
+
+        /// Number of `edit_message_text` calls recorded so far.
+        pub fn edits(&self) -> usize {
+            self.edited.lock().unwrap().len()
         }
     }
     #[async_trait]
@@ -1682,7 +1745,7 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p = build_prompt(&proposed, &payees, &[]);
+        let p = build_prompt(&proposed, 1, &payees, &[]);
         assert!(
             p.chat_text.contains("'Local Cafe'"),
             "expected plain-text quoting: {}",
@@ -1694,7 +1757,10 @@ pub mod tests {
             p.chat_text
         );
         assert_eq!(p.buttons.len(), 3);
-        assert_eq!(p.buttons[0].1, "cf:tx1");
+        assert_eq!(
+            p.buttons[0].1,
+            format!("cf:{}", crate::telegram::group_key(&proposed.raw_merchant))
+        );
 
         // no-match -> create/skip only
         let unmatched = PendingReview {
@@ -1713,9 +1779,12 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p2 = build_prompt(&unmatched, &payees, &[]);
+        let p2 = build_prompt(&unmatched, 1, &payees, &[]);
         assert_eq!(p2.buttons.len(), 2);
-        assert_eq!(p2.buttons[0].1, "nw:tx2");
+        assert_eq!(
+            p2.buttons[0].1,
+            format!("nw:{}", crate::telegram::group_key(&unmatched.raw_merchant))
+        );
 
         // failed remap: suggestion set but NOT in payees -> "create it?" flavor
         let failed = PendingReview {
@@ -1734,42 +1803,46 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p3 = build_prompt(&failed, &payees, &[]);
+        let p3 = build_prompt(&failed, 1, &payees, &[]);
         assert!(p3.chat_text.contains("Sainsbury's"));
         assert_eq!(p3.buttons.len(), 2);
-        assert_eq!(p3.buttons[0].1, "nw:tx3"); // create
-        assert_eq!(p3.buttons[1].1, "sk:tx3"); // skip
+        assert_eq!(
+            p3.buttons[0].1,
+            format!("nw:{}", crate::telegram::group_key(&failed.raw_merchant))
+        ); // create
+        assert_eq!(
+            p3.buttons[1].1,
+            format!("sk:{}", crate::telegram::group_key(&failed.raw_merchant))
+        ); // skip
     }
 
     #[test]
-    fn build_prompt_drops_buttons_when_external_id_too_long() {
-        // 80-char external_id + "cf:" overflows Telegram's 64-byte callback cap,
-        // so the prompt must carry no buttons (free-text reply still works).
-        let long_id = "z".repeat(80);
-        let payees = vec!["Local Cafe".to_string()];
+    fn build_prompt_keeps_buttons_regardless_of_external_id_length() {
+        // The callback key is now group_key(raw_merchant) (16 hex chars), so even a
+        // pathologically long external_id no longer drops the inline keyboard.
+        let payees = vec!["Tesco".to_string()];
         let entry = PendingReview {
-            external_id: long_id,
-            source_monzo_id: String::new(),
+            external_id: "z".repeat(200),
+            source_monzo_id: "acc_1".into(),
             raw_merchant: "SQ *CAFE".into(),
-            amount: -450,
+            amount: -100,
             date: "2026-06-01".into(),
             resolve_to: String::new(),
             create_new: false,
-            suggestion: Some("Local Cafe".into()),
-            confidence: Some("medium".into()),
+            suggestion: None,
+            confidence: None,
             category_suggestion: None,
             category_confidence: None,
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
         };
-        let p = build_prompt(&entry, &payees, &[]);
-        assert!(
-            p.buttons.is_empty(),
-            "over-long external_id must yield no buttons, got: {:?}",
-            p.buttons
+        let p = build_prompt(&entry, 1, &payees, &[]);
+        assert_eq!(p.buttons.len(), 2, "create/skip buttons present");
+        assert_eq!(
+            p.buttons[0].1,
+            format!("nw:{}", crate::telegram::group_key("SQ *CAFE"))
         );
-        assert!(!p.chat_text.is_empty(), "chat text must still be present");
     }
 
     #[test]
@@ -1792,7 +1865,7 @@ pub mod tests {
             category_resolved: false, // category unsettled -> category prompt
             telegram_message_id: None,
         };
-        let p = build_prompt(&entry, &payees, &cats);
+        let p = build_prompt(&entry, 1, &payees, &cats);
         assert!(
             p.chat_text.to_lowercase().contains("category"),
             "category prompt: {}",
@@ -1801,8 +1874,14 @@ pub mod tests {
         assert!(p.chat_text.contains("'Dining'"));
         // confirm-category + skip-category buttons
         assert_eq!(p.buttons.len(), 2);
-        assert_eq!(p.buttons[0].1, "cc:tx1");
-        assert_eq!(p.buttons[1].1, "xc:tx1");
+        assert_eq!(
+            p.buttons[0].1,
+            format!("cc:{}", crate::telegram::group_key(&entry.raw_merchant))
+        );
+        assert_eq!(
+            p.buttons[1].1,
+            format!("xc:{}", crate::telegram::group_key(&entry.raw_merchant))
+        );
     }
 
     #[test]
@@ -1825,10 +1904,164 @@ pub mod tests {
             category_resolved: false,
             telegram_message_id: None,
         };
-        let p = build_prompt(&entry, &payees, &cats);
+        let p = build_prompt(&entry, 1, &payees, &cats);
         // payee prompt first (unchanged flavor): confirm/create/skip
         assert_eq!(p.buttons.len(), 3);
-        assert_eq!(p.buttons[0].1, "cf:tx2");
+        assert_eq!(
+            p.buttons[0].1,
+            format!("cf:{}", crate::telegram::group_key(&entry.raw_merchant))
+        );
+    }
+
+    #[test]
+    fn build_prompt_shows_txn_count_when_grouped() {
+        let payees = vec!["Transport for London".to_string()];
+        let entry = PendingReview {
+            external_id: "tx_a".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "TFL TRAVEL CH".into(),
+            amount: -250,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some("Transport for London".into()),
+            confidence: Some("medium".into()),
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
+            telegram_message_id: None,
+        };
+        let multi = build_prompt(&entry, 3, &payees, &[]);
+        assert!(
+            multi.chat_text.contains("(3 txns)"),
+            "grouped count: {}",
+            multi.chat_text
+        );
+        let single = build_prompt(&entry, 1, &payees, &[]);
+        assert!(
+            !single.chat_text.contains("txns"),
+            "single member shows no count: {}",
+            single.chat_text
+        );
+    }
+
+    fn held(external_id: &str, raw_merchant: &str) -> PendingReview {
+        PendingReview {
+            external_id: external_id.into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: raw_merchant.into(),
+            amount: -100,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some("Transport for London".into()),
+            confidence: Some("medium".into()),
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true,
+            telegram_message_id: None,
+        }
+    }
+
+    #[test]
+    fn awaiting_count_is_per_merchant() {
+        use std::collections::BTreeSet;
+        let reviews = [
+            held("tx1", "TFL TRAVEL CH"),
+            held("tx2", "TFL TRAVEL CH"),
+            held("tx3", "TESCO 1234"),
+        ];
+        let merchants = reviews
+            .iter()
+            .map(|p| p.raw_merchant.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert_eq!(merchants, 2, "three txns across two merchants");
+    }
+
+    #[tokio::test]
+    async fn send_collapses_same_merchant_into_one_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut state = State {
+            pending_reviews: vec![
+                held("tx1", "TFL TRAVEL CH"),
+                held("tx2", "TFL TRAVEL CH"),
+                held("tx3", "TFL TRAVEL CH"),
+            ],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+        let payees = vec!["Transport for London".to_string()];
+        send_group_prompts(&mut state, &channel, &payees, &[], &path).await;
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "one prompt for the merchant"
+        );
+        let ids: Vec<_> = state
+            .pending_reviews
+            .iter()
+            .map(|p| p.telegram_message_id)
+            .collect();
+        assert!(
+            ids.iter().all(Option::is_some) && ids[0] == ids[1] && ids[1] == ids[2],
+            "all members share one message_id: {ids:?}"
+        );
+        assert!(
+            channel.sent.lock().unwrap()[0]
+                .chat_text
+                .contains("(3 txns)")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_distinct_merchants_sends_two_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut state = State {
+            pending_reviews: vec![held("tx1", "TFL TRAVEL CH"), held("tx2", "TESCO 1234")],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+        let payees = vec!["Transport for London".to_string()];
+        send_group_prompts(&mut state, &channel, &payees, &[], &path).await;
+        let sent = channel.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        for p in sent.iter() {
+            assert!(
+                !p.chat_text.contains("txns"),
+                "single-member prompt must show no count suffix: {}",
+                p.chat_text
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_adopts_existing_prompt_without_resending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut a = held("tx1", "TFL TRAVEL CH");
+        a.telegram_message_id = Some(777);
+        let mut state = State {
+            pending_reviews: vec![a, held("tx2", "TFL TRAVEL CH")],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+        let payees = vec!["Transport for London".to_string()];
+        send_group_prompts(&mut state, &channel, &payees, &[], &path).await;
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            0,
+            "no resend for an outstanding group"
+        );
+        assert_eq!(
+            state.pending_reviews[1].telegram_message_id,
+            Some(777),
+            "new member adopts the id"
+        );
     }
 
     // ---- Task 10: in-process doubles ----
@@ -4053,6 +4286,41 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert!(
             state.held_transfers.is_empty(),
             "not a transfer, nothing held"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remap_edits_group_message_once() {
+        let _dir = tempfile::tempdir().unwrap();
+        let mut state = State::default();
+        // Two members of one merchant, both free-text-remapped to a non-existent payee.
+        for ext in ["tx1", "tx2"] {
+            let mut p = held(ext, "SQ *NEWCAFE");
+            p.suggestion = None;
+            p.resolve_to = "Nonexistent Payee".into();
+            p.telegram_message_id = Some(500); // shared group message
+            state.pending_reviews.push(p);
+        }
+        let channel = FakeChannel::new(vec![], 0);
+        let payees = vec!["Tesco".to_string()];
+        rehold_failed_remaps(&mut state, Some(&channel as &dyn ConfirmChannel), &payees).await;
+
+        assert_eq!(
+            channel.edits(),
+            1,
+            "edit the shared group message exactly once"
+        );
+        assert!(
+            state
+                .pending_reviews
+                .iter()
+                .all(|p| p.telegram_message_id.is_none())
+        );
+        assert!(
+            state
+                .pending_reviews
+                .iter()
+                .all(|p| p.suggestion.as_deref() == Some("Nonexistent Payee"))
         );
     }
 }
