@@ -159,14 +159,21 @@ impl PendingReview {
 /// (not a `TransferTarget` enum) to keep the TOML state file clean.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldTransfer {
+    #[serde(default)]
     pub external_id: String,
+    #[serde(default)]
     pub source_monzo_id: String,
+    #[serde(default)]
     pub date: String,
+    #[serde(default)]
     pub amount: i64,
-    /// "pot" or "account".
+    /// Discriminator: "pot" or "account" — selects which map resolves `target_id`.
+    #[serde(default)]
     pub target_kind: String,
-    /// `pot_…` (pot) or `acc_…` (account).
+    /// The destination id: a Monzo pot id (`pot_…`) or account id (`acc_…`).
+    #[serde(default)]
     pub target_id: String,
+    #[serde(default)]
     pub raw_merchant: String,
 }
 
