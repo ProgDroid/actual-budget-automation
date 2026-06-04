@@ -43,6 +43,34 @@ struct MonzoTx {
     decline_reason: Option<String>,
     #[serde(default)]
     merchant: Option<Merchant>,
+    /// Monzo settlement scheme: `uk_retail_pot` (pot move), `p2p_payment`
+    /// (Monzo→Monzo), `payport_faster_payments`, card schemes, etc.
+    #[serde(default)]
+    scheme: String,
+    #[serde(default)]
+    metadata: TxMetadata,
+}
+
+/// Subset of Monzo's `metadata` we use to classify transfers. Monzo sends many
+/// more keys; serde ignores the rest.
+#[derive(Debug, Default, Deserialize)]
+struct TxMetadata {
+    /// Present (a `pot_…` id) on pot deposits/withdrawals; matches `GET /pots[].id`.
+    #[serde(default)]
+    pot_id: Option<String>,
+}
+
+impl MonzoTx {
+    /// Classify this row as a transfer, if it is one. Pots only in this slice;
+    /// inter-account (`p2p_payment`) is added in the inter-account slice.
+    fn transfer_target(&self) -> Option<crate::banks::TransferTarget> {
+        if self.scheme == "uk_retail_pot"
+            && let Some(pot_id) = self.metadata.pot_id.clone()
+        {
+            return Some(crate::banks::TransferTarget::Pot(pot_id));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,13 +219,14 @@ impl Monzo {
                     Some(m) if !m.name.is_empty() => m.name.clone(),
                     _ => t.description.clone(),
                 };
+                let transfer = t.transfer_target();
                 RawTransaction {
                     external_id: t.id,
                     date: t.created.date_naive(),
                     amount_minor: t.amount,
                     raw_merchant,
                     source_monzo_id: monzo_id.to_string(),
-                    transfer: None,
+                    transfer,
                 }
             })
             .collect())
@@ -349,6 +378,7 @@ impl BankSource for Monzo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::banks::TransferTarget;
     use crate::state::State;
     use chrono::TimeZone;
     use wiremock::matchers::{method, path, query_param};
@@ -802,6 +832,41 @@ mod tests {
         m.set_access_token_for_test("at_x".into());
         let accts = m.list_accounts().await.unwrap();
         assert_eq!(accts, vec![("acc_1".to_string(), "Personal".to_string())]);
+    }
+
+    #[test]
+    fn classifies_pot_deposit_as_transfer() {
+        let tx = MonzoTx {
+            id: "tx_1".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: -5000,
+            description: "pot_…".into(),
+            decline_reason: None,
+            merchant: None,
+            scheme: "uk_retail_pot".into(),
+            metadata: TxMetadata {
+                pot_id: Some("pot_abc".into()),
+            },
+        };
+        assert_eq!(
+            tx.transfer_target(),
+            Some(TransferTarget::Pot("pot_abc".into()))
+        );
+    }
+
+    #[test]
+    fn ordinary_purchase_has_no_transfer_target() {
+        let tx = MonzoTx {
+            id: "tx_2".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: -300,
+            description: "Coffee".into(),
+            decline_reason: None,
+            merchant: None,
+            scheme: "mastercard".into(),
+            metadata: TxMetadata { pot_id: None },
+        };
+        assert_eq!(tx.transfer_target(), None);
     }
 
     #[tokio::test]
