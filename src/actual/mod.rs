@@ -183,22 +183,34 @@ mod tests {
     async fn get_payees_parses_data() {
         let dir = tempdir().unwrap();
         // Fake shim: ignore stdin content, print a canned ok envelope.
-        let script = r"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'}]}));});";
+        // One payee carries transfer_acct (transfer payee), one omits the key
+        // (ordinary payee) — exercises both the populated and absent paths through
+        // the full subprocess -> deserialize pipeline.
+        let script = r"let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:true,data:[{id:'p1',name:'Amazon'},{id:'p2',name:'Transfer: Savings',transfer_acct:'act-123'}]}));});";
         let client = fake_shim(&dir, script);
         let payees = client.get_payees().await.unwrap();
         assert_eq!(
             payees,
-            vec![Payee {
-                id: "p1".into(),
-                name: "Amazon".into(),
-                transfer_acct: None,
-            }]
+            vec![
+                Payee {
+                    id: "p1".into(),
+                    name: "Amazon".into(),
+                    transfer_acct: None,
+                },
+                Payee {
+                    id: "p2".into(),
+                    name: "Transfer: Savings".into(),
+                    transfer_acct: Some("act-123".into()),
+                }
+            ]
         );
+        // Explicitly assert each path survived the round-trip.
+        assert_eq!(payees[0].transfer_acct, None);
+        assert_eq!(payees[1].transfer_acct.as_deref(), Some("act-123"));
     }
 
     #[test]
     fn payee_deserializes_transfer_acct() {
-        use crate::actual::shim_protocol::Payee;
         let json = r#"[
             {"id":"p1","name":"Tesco","transfer_acct":null},
             {"id":"p2","name":"Transfer: Savings","transfer_acct":"act-uuid"}
@@ -210,7 +222,6 @@ mod tests {
 
     #[test]
     fn payee_deserializes_without_transfer_acct_field() {
-        use crate::actual::shim_protocol::Payee;
         let json = r#"[{"id":"p1","name":"Tesco"}]"#;
         let payees: Vec<Payee> = serde_json::from_str(json).unwrap();
         assert_eq!(payees[0].transfer_acct, None);
