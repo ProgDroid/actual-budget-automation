@@ -2368,7 +2368,9 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             state.held_transfers.is_empty(),
             "after mapping the pot the held transfer must be cleared"
         );
-        let logged = std::fs::read_to_string(&routed_log).unwrap();
+        // file must exist: an absent log means the retry never fired
+        let logged = std::fs::read_to_string(&routed_log)
+            .expect("routed.log must exist — retry path never fired");
         let calls: Vec<serde_json::Value> = logged
             .lines()
             .filter(|l| !l.trim().is_empty())
