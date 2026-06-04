@@ -19,6 +19,9 @@ pub struct State {
     pub category_cache: BTreeMap<String, String>,
     #[serde(default, rename = "pending_review")]
     pub pending_reviews: Vec<PendingReview>,
+    /// Transfers awaiting account/pot mapping; retried every run (see [`HeldTransfer`]).
+    #[serde(default)]
+    pub held_transfers: Vec<HeldTransfer>,
     #[serde(default)]
     pub telegram: TelegramState,
 }
@@ -147,6 +150,57 @@ impl PendingReview {
     #[must_use]
     pub const fn payee_settled(&self) -> bool {
         self.create_new || !self.resolve_to.is_empty()
+    }
+}
+
+/// A transfer whose source and/or destination account is not yet mapped. Held
+/// durably and retried every run — never imported into the wrong place, never
+/// dropped (fail-loud). `target_kind`/`target_id` are stored as plain strings
+/// (not a `TransferTarget` enum) to keep the TOML state file clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldTransfer {
+    pub external_id: String,
+    pub source_monzo_id: String,
+    pub date: String,
+    pub amount: i64,
+    /// "pot" or "account".
+    pub target_kind: String,
+    /// `pot_…` (pot) or `acc_…` (account).
+    pub target_id: String,
+    pub raw_merchant: String,
+}
+
+// Methods are constructed in Task 7 (transfer routing); allow dead_code until then.
+#[allow(dead_code)]
+impl HeldTransfer {
+    /// Reconstruct the typed target. Unknown `target_kind` → `None` (defensive).
+    #[must_use]
+    pub fn target(&self) -> Option<crate::banks::TransferTarget> {
+        match self.target_kind.as_str() {
+            "pot" => Some(crate::banks::TransferTarget::Pot(self.target_id.clone())),
+            "account" => Some(crate::banks::TransferTarget::Account(
+                self.target_id.clone(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Build from a fetched transfer row. `None` if the row is not a transfer.
+    #[must_use]
+    pub fn from_row(tx: &crate::banks::RawTransaction) -> Option<Self> {
+        let (target_kind, target_id) = match tx.transfer.as_ref()? {
+            crate::banks::TransferTarget::Pot(id) => ("pot", id.clone()),
+            crate::banks::TransferTarget::Account(id) => ("account", id.clone()),
+        };
+        Some(Self {
+            external_id: tx.external_id.clone(),
+            source_monzo_id: tx.source_monzo_id.clone(),
+            date: tx.date.format("%Y-%m-%d").to_string(),
+            amount: tx.amount_minor,
+            target_kind: target_kind.to_string(),
+            target_id,
+            raw_merchant: tx.raw_merchant.clone(),
+        })
     }
 }
 
@@ -467,6 +521,22 @@ impl State {
             category_resolved: cat_resolved,
             telegram_message_id: None,
         });
+        true
+    }
+
+    /// Enqueue a held transfer if not already queued (dedup by `external_id`).
+    /// Returns `true` if newly added.
+    // Wired in Task 7 (transfer routing); allow dead_code until then.
+    #[allow(dead_code)]
+    pub fn enqueue_held_transfer(&mut self, ht: HeldTransfer) -> bool {
+        if self
+            .held_transfers
+            .iter()
+            .any(|h| h.external_id == ht.external_id)
+        {
+            return false;
+        }
+        self.held_transfers.push(ht);
         true
     }
 }
@@ -907,5 +977,67 @@ mod tests {
         assert_eq!(by("b").unwrap().resolve_to, "Boots");
         assert!(by("c").unwrap().create_new);
         assert!(by("d").is_none());
+    }
+
+    #[test]
+    fn enqueue_held_transfer_dedupes_by_external_id() {
+        let mut s = State::default();
+        let mk = || HeldTransfer {
+            external_id: "tx_1".into(),
+            source_monzo_id: "acc_src".into(),
+            date: "2026-06-01".into(),
+            amount: -5000,
+            target_kind: "pot".into(),
+            target_id: "pot_abc".into(),
+            raw_merchant: "Savings".into(),
+        };
+        assert!(s.enqueue_held_transfer(mk())); // first insert -> true
+        assert!(!s.enqueue_held_transfer(mk())); // duplicate -> false, no growth
+        assert_eq!(s.held_transfers.len(), 1);
+    }
+
+    #[test]
+    fn held_transfer_round_trips_through_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut s = State::default();
+        let expected = HeldTransfer {
+            external_id: "tx_1".into(),
+            source_monzo_id: "acc_src".into(),
+            date: "2026-06-01".into(),
+            amount: -5000,
+            target_kind: "pot".into(),
+            target_id: "pot_abc".into(),
+            raw_merchant: "Savings".into(),
+        };
+        s.enqueue_held_transfer(expected.clone());
+        s.save(&path).unwrap();
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.held_transfers, vec![expected]);
+    }
+
+    #[test]
+    fn held_transfer_target_and_from_row_roundtrip() {
+        use crate::banks::{RawTransaction, TransferTarget};
+        let row = RawTransaction {
+            external_id: "tx_9".into(),
+            date: "2026-06-02".parse().unwrap(),
+            amount_minor: -1200,
+            raw_merchant: "Holiday".into(),
+            source_monzo_id: "acc_cur".into(),
+            transfer: Some(TransferTarget::Pot("pot_xyz".into())),
+        };
+        let ht = HeldTransfer::from_row(&row).unwrap();
+        assert_eq!(ht.target_kind, "pot");
+        assert_eq!(ht.target_id, "pot_xyz");
+        assert_eq!(ht.date, "2026-06-02");
+        assert_eq!(ht.target(), Some(TransferTarget::Pot("pot_xyz".into())));
+
+        // an ordinary (non-transfer) row yields None
+        let ordinary = RawTransaction {
+            transfer: None,
+            ..row
+        };
+        assert!(HeldTransfer::from_row(&ordinary).is_none());
     }
 }
