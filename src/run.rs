@@ -690,6 +690,55 @@ pub async fn run(
         fetched.into_iter().partition(|t| t.transfer.is_some());
     let fetched_count = fetched.len();
 
+    // ---- Flex mirror handling (Phase 3, Flex) --------------------------------
+    // A `monzo_flex` line on the Flex feed mirrors a main-side transfer. Suppress
+    // it when its twin (same abs amount + date) is a main-side Account(flex)
+    // transfer this run; otherwise hold it (fail-loud). Re-evaluate prior held
+    // mirrors too, so a mirror held in an earlier run resolves once its twin arrives.
+    let flex_account_id: Option<String> = state
+        .monzo
+        .accounts
+        .iter()
+        .find(|a| a.is_flex)
+        .map(|a| a.monzo_id.clone());
+
+    // Keys of main-side Flex transfers THIS run: (abs amount, "YYYY-MM-DD").
+    let main_flex_keys: std::collections::BTreeSet<(i64, String)> = transfer_rows
+        .iter()
+        .filter(|t| match (&t.transfer, &flex_account_id) {
+            (Some(TransferTarget::Account(dest)), Some(fid)) => dest == fid,
+            _ => false,
+        })
+        .map(|t| (t.amount_minor.abs(), t.date.format("%Y-%m-%d").to_string()))
+        .collect();
+
+    // Split mirrors out so the Account/Pot intent loop below never sees them.
+    let (mirror_rows, transfer_rows): (Vec<RawTransaction>, Vec<RawTransaction>) = transfer_rows
+        .into_iter()
+        .partition(|t| matches!(t.transfer, Some(TransferTarget::FlexMirror)));
+
+    // Pull prior held mirrors out of the durable queue; we re-decide their fate.
+    let prior_held_mirrors: Vec<HeldTransfer> = state
+        .held_transfers
+        .iter()
+        .filter(|h| h.target_kind == "flex_mirror")
+        .cloned()
+        .collect();
+    state
+        .held_transfers
+        .retain(|h| h.target_kind != "flex_mirror");
+
+    let mut flex_mirrors_suppressed = 0usize;
+    let new_mirror_hts = mirror_rows.iter().filter_map(HeldTransfer::from_row);
+    for ht in prior_held_mirrors.into_iter().chain(new_mirror_hts) {
+        let key = (ht.amount.abs(), ht.date.clone());
+        if main_flex_keys.contains(&key) {
+            flex_mirrors_suppressed += 1; // paired -> drop (Actual recreates this side)
+        } else {
+            state.enqueue_held_transfer(ht); // unpaired -> hold (dedup by external_id)
+        }
+    }
+
     // 3. Read Actual payees + schedules + categories. `get_payees` must stay
     // strictly before `get_categories`: the rotated-token regression test injects
     // a `get_payees` failure and asserts the run aborts at that earlier point.
@@ -1120,6 +1169,7 @@ pub async fn run(
         println!("  would hold   : {held}");
         println!("  would xfer-import : {transfers_imported}");
         println!("  would xfer-hold   : {}", state.held_transfers.len());
+        println!("  flex mirrors suppressed: {flex_mirrors_suppressed}");
         for (aid, rows) in &grouped {
             println!("  -> account {aid}: {} txns", rows.len());
             for r in rows {
@@ -1170,7 +1220,7 @@ pub async fn run(
         summary.updated += s.updated;
     }
     info!(
-        "imported added={} updated={} held={held}",
+        "imported added={} updated={} held={held} flex_mirrors_suppressed={flex_mirrors_suppressed}",
         summary.added, summary.updated
     );
 
@@ -1994,7 +2044,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
 let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
   const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
   const fs=require('fs'), path=require('path');
-  if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'},{id:'p_xfer_pot',name:'Transfer: Savings',transfer_acct:'act-pot'},{id:'p_xfer_cur',name:'Transfer: Current',transfer_acct:'act-cur'}]}); }
+  if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'},{id:'p_xfer_pot',name:'Transfer: Savings',transfer_acct:'act-pot'},{id:'p_xfer_cur',name:'Transfer: Current',transfer_acct:'act-cur'},{id:'p_xfer_flex',name:'Transfer: Flex',transfer_acct:'act-flex'}]}); }
   else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
   else if(req.op==='get_categories'){ out({ok:true,data:[{id:'c_groc',name:'Groceries'}]}); }
   else if(req.op==='create_payee'){ out({ok:true,data:{id:'p_new'}}); }
@@ -2542,6 +2592,144 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
                 "unmapped pot must never import, got: {logged}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn flex_repayment_imports_main_side_and_suppresses_mirror() {
+        // accounts: acc_cur->act-cur (main), acc_flex->act-flex (is_flex=true)
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_flex".into(),
+            actual_id: "act-flex".into(),
+            is_flex: true,
+            ..Default::default()
+        });
+
+        // Both sides of one repayment, same abs amount + date:
+        let main = RawTransaction {
+            external_id: "tx_main".into(),
+            date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+            amount_minor: -82822,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_cur".into(),
+            transfer: Some(TransferTarget::Account("acc_flex".into())),
+        };
+        let mirror = RawTransaction {
+            external_id: "tx_mirror".into(),
+            date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+            amount_minor: 82822,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_flex".into(),
+            transfer: Some(TransferTarget::FlexMirror),
+        };
+        let mut bank = FakeBank {
+            txs: vec![main, mirror],
+        };
+        let claude = FakeClaude { out: vec![] };
+
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&routed_log).expect("routed.log must exist");
+        let lines: Vec<&str> = logged.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one import call (main side only)");
+        assert!(
+            lines[0].contains("act-cur"),
+            "imported into the main account"
+        );
+        assert!(
+            lines[0].contains("p_xfer_flex"),
+            "via the Flex transfer payee"
+        );
+        assert!(
+            state.held_transfers.is_empty(),
+            "mirror suppressed, nothing held"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpaired_flex_mirror_is_held_not_dropped() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_flex".into(),
+            actual_id: "act-flex".into(),
+            is_flex: true,
+            ..Default::default()
+        });
+
+        // ONLY a flex-side mirror, no main twin this run:
+        let mirror = RawTransaction {
+            external_id: "tx_lonely".into(),
+            date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+            amount_minor: 500,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_flex".into(),
+            transfer: Some(TransferTarget::FlexMirror),
+        };
+        let mut bank = FakeBank { txs: vec![mirror] };
+        let claude = FakeClaude { out: vec![] };
+
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // no pot import; held with target_kind flex_mirror; not a Telegram review
+        let imported = std::fs::read_to_string(&routed_log)
+            .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count());
+        assert_eq!(imported, 0, "unpaired mirror not imported");
+        assert_eq!(state.held_transfers.len(), 1, "unpaired mirror held");
+        assert_eq!(state.held_transfers[0].target_kind, "flex_mirror");
+        assert!(
+            state.pending_reviews.is_empty(),
+            "transfers never use the Telegram review path"
+        );
     }
 
     #[tokio::test]

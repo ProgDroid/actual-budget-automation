@@ -540,9 +540,6 @@ impl State {
 
     /// Enqueue a held transfer if not already queued (dedup by `external_id`).
     /// Returns `true` if newly added.
-    // Public queue API, currently exercised only by unit tests; run() uses inline
-    // work-list dedup. Kept for future callers.
-    #[allow(dead_code)]
     pub fn enqueue_held_transfer(&mut self, ht: HeldTransfer) -> bool {
         if self
             .held_transfers
