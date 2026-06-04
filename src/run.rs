@@ -724,9 +724,10 @@ pub async fn run(
     for ht in transfer_intents {
         let Some(target) = ht.target() else {
             warn!(
-                "held transfer {} has unknown target_kind '{}'; dropping",
+                "held transfer {} has unknown target_kind '{}'; re-holding (state corruption?)",
                 ht.external_id, ht.target_kind
             );
+            still_held.push(ht);
             continue;
         };
         let dest = resolve_transfer_dest(&target, &pot_links, &account_links);
@@ -1042,8 +1043,8 @@ pub async fn run(
             fetched_count.saturating_sub(candidates.len())
         );
         println!("  would hold   : {held}");
-        println!("  would transfer-import : {transfers_imported}");
-        println!("  transfers still held  : {}", state.held_transfers.len());
+        println!("  would xfer-import : {transfers_imported}");
+        println!("  would xfer-hold   : {}", state.held_transfers.len());
         for (aid, rows) in &grouped {
             println!("  -> account {aid}: {} txns", rows.len());
             for r in rows {
