@@ -15,12 +15,20 @@ Transactions are routed to Actual accounts via `[[monzo.accounts]]` links in the
 state file (`monzo_id` → `actual_id`). Bootstrap them once:
 
 1. Ensure Monzo is authed (`aba auth monzo`) and a `refresh_token` is in state.
-2. Run `aba accounts` to preview the auto-suggested mapping (Monzo names matched
-   to Actual account names). Pots are listed for awareness but are NOT linked
-   (they become transfers in a later phase).
+2. Run `aba accounts` to preview the auto-suggested mapping (Monzo account names
+   and pot names each matched to Actual account names by similarity).
 3. Run `aba accounts --write` to persist it.
 4. Review the state file's `[[monzo.accounts]]` entries; fix any `actual_id` that
    is empty (UNMAPPED) or wrong by editing it directly.
+
+**Pot links (`[[monzo.pots]]`):** `aba accounts` also suggests a Monzo pot →
+Actual account mapping and `--write` persists it alongside the account links. For
+each pot you want to track as a transfer target, create a matching Actual account
+(on- or off-budget — aba only needs its id), then confirm or fix the mapping by
+editing `[[monzo.pots]]` in the state file. Pot-move transactions whose pot is
+unmapped are HELD and retried every run (surfaced in the run summary as
+"transfer(s) awaiting account mapping"); they import automatically once you map the
+pot. Pots you leave unmapped are simply held — no data is lost.
 
 **Migration:** an old state file with a single `[monzo] account_id` is auto-promoted
 on first load to one UNMAPPED `[[monzo.accounts]]` link (the old value is the Monzo

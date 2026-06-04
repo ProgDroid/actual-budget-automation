@@ -453,6 +453,37 @@ fn suggest_links(
         .collect()
 }
 
+/// Auto-suggest Monzo-pot → Actual-account links by normalised-name similarity.
+/// Same policy as `suggest_links`: best match above `threshold`, else unmapped.
+fn suggest_pot_links(
+    pots: &[(String, String)],
+    actual: &[(String, String)],
+    threshold: f64,
+) -> Vec<PotLink> {
+    pots.iter()
+        .map(|(pid, pname)| {
+            let best = actual
+                .iter()
+                .map(|(aid, aname)| (aid, aname, crate::matching::payee_similarity(pname, aname)))
+                .filter(|(_, _, score)| *score >= threshold)
+                .max_by(|a, b| a.2.total_cmp(&b.2));
+            match best {
+                Some((aid, aname, _)) => PotLink {
+                    monzo_pot_id: pid.clone(),
+                    monzo_pot_name: pname.clone(),
+                    actual_id: aid.clone(),
+                    actual_name: aname.clone(),
+                },
+                None => PotLink {
+                    monzo_pot_id: pid.clone(),
+                    monzo_pot_name: pname.clone(),
+                    ..PotLink::default()
+                },
+            }
+        })
+        .collect()
+}
+
 /// `aba accounts [--write]`: fetch Monzo accounts/pots + Actual accounts,
 /// auto-suggest a mapping, print it, and (with `--write`) persist to state.
 /// Run where it can reach Monzo + the Actual shim; review the printed mapping
@@ -511,29 +542,45 @@ pub async fn map_accounts(cfg: &Config, write: bool) -> anyhow::Result<()> {
         }
     }
 
-    // Informational: pots are Phase 3 (transfers), not linked here.
+    // Collect pots across all current accounts, then suggest Pot → Actual links.
+    let mut all_pots: Vec<(String, String)> = Vec::new();
     for (mid, _) in &monzo_accounts {
         match bank.list_pots(mid).await {
-            Ok(pots) if !pots.is_empty() => {
-                println!("Pots under {mid} (Phase 3 — not linked yet):");
-                for (pid, pname) in pots {
-                    println!("  {pname} ({pid})");
-                }
-            }
-            Ok(_) => {}
+            Ok(pots) => all_pots.extend(pots),
             Err(e) => warn!("could not list pots for {mid}: {}", bank_err_text(&e)),
+        }
+    }
+    let pot_links = suggest_pot_links(&all_pots, &actual_accounts, ACCOUNT_MATCH_THRESHOLD);
+    if !pot_links.is_empty() {
+        println!("\nSuggested Monzo pot → Actual account mapping:");
+        for l in &pot_links {
+            if l.actual_id.is_empty() {
+                println!(
+                    "  {} ({})  →  [UNMAPPED — edit state file]",
+                    l.monzo_pot_name, l.monzo_pot_id
+                );
+            } else {
+                println!(
+                    "  {} ({})  →  {} ({})",
+                    l.monzo_pot_name, l.monzo_pot_id, l.actual_name, l.actual_id
+                );
+            }
         }
     }
 
     if write {
         state.monzo.accounts = links;
+        state.monzo.pots = pot_links;
         state.save(&cfg.state_path)?;
         println!(
-            "\nWrote {} link(s) to {}.",
+            "\nWrote {} account link(s) and {} pot link(s) to {}.",
             state.monzo.accounts.len(),
+            state.monzo.pots.len(),
             cfg.state_path.display()
         );
-        println!("Review/override any UNMAPPED or wrong rows by editing [[monzo.accounts]] there.");
+        println!(
+            "Review/override UNMAPPED or wrong rows by editing [[monzo.accounts]] / [[monzo.pots]] there."
+        );
     } else {
         println!("\n(dry run — re-run with `aba accounts --write` to persist)");
     }
@@ -3481,5 +3528,22 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             resolve_transfer_dest(&TransferTarget::Pot("pot_x".into()), &pots_empty, &accts),
             None
         );
+    }
+
+    #[test]
+    fn suggest_pot_links_matches_by_name_and_leaves_unmatched_unmapped() {
+        let pots = vec![
+            ("pot_abc".to_string(), "Savings".to_string()),
+            ("pot_xyz".to_string(), "Holiday".to_string()),
+        ];
+        let actual = vec![("act-sav".to_string(), "Savings".to_string())];
+        let links = suggest_pot_links(&pots, &actual, ACCOUNT_MATCH_THRESHOLD);
+        assert_eq!(links.len(), 2);
+        let sav = links.iter().find(|l| l.monzo_pot_id == "pot_abc").unwrap();
+        assert_eq!(sav.actual_id, "act-sav");
+        assert_eq!(sav.actual_name, "Savings");
+        let hol = links.iter().find(|l| l.monzo_pot_id == "pot_xyz").unwrap();
+        assert!(hol.actual_id.is_empty()); // no match -> unmapped
+        assert_eq!(hol.monzo_pot_name, "Holiday");
     }
 }
