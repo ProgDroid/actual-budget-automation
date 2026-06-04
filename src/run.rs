@@ -462,6 +462,9 @@ fn suggest_links_with_flex(
     threshold: f64,
 ) -> Vec<AccountLink> {
     let mut links = suggest_links(monzo, actual, threshold);
+    // Defensive: list_accounts already excludes monzoflexbackingloan_ (is_mappable_account
+    // is the authoritative gate), but guard here too so this stays correct if called with
+    // a raw account list.
     for l in &mut links {
         if l.monzo_name.starts_with("monzoflex_")
             && !l.monzo_name.starts_with("monzoflexbackingloan_")
