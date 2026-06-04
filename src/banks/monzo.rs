@@ -71,6 +71,32 @@ impl MonzoTx {
         }
         None
     }
+
+    /// Full classifier with Flex context. `fetched_account_id` is the account
+    /// this row was fetched from; `flex_account_id` is the configured Flex
+    /// account's monzo id (if any).
+    ///  - `uk_retail_pot` -> Pot (delegates to `transfer_target`)
+    ///  - `monzo_flex` from another account -> `Account(flex_account_id)` (the transfer)
+    ///  - `monzo_flex` from the flex account, or with no flex configured -> `FlexMirror`
+    ///  - anything else (incl. `mastercard` direct Flex purchases) -> None (ordinary)
+    fn transfer_target_flex(
+        &self,
+        fetched_account_id: &str,
+        flex_account_id: Option<&str>,
+    ) -> Option<TransferTarget> {
+        if let Some(t) = self.transfer_target() {
+            return Some(t); // pots
+        }
+        if self.scheme == "monzo_flex" {
+            return match flex_account_id {
+                Some(fid) if fid != fetched_account_id => {
+                    Some(TransferTarget::Account(fid.to_owned()))
+                }
+                _ => Some(TransferTarget::FlexMirror),
+            };
+        }
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +237,13 @@ impl Monzo {
                 }
             }
         }
+        let flex_account_id: Option<String> = self
+            .monzo
+            .accounts
+            .iter()
+            .find(|a| a.is_flex)
+            .map(|a| a.monzo_id.clone());
+        let flex = flex_account_id.as_deref();
         Ok(all
             .into_iter()
             .filter(|t| t.decline_reason.is_none())
@@ -219,7 +252,7 @@ impl Monzo {
                     Some(m) if !m.name.is_empty() => m.name.clone(),
                     _ => t.description.clone(),
                 };
-                let transfer = t.transfer_target();
+                let transfer = t.transfer_target_flex(monzo_id, flex);
                 RawTransaction {
                     external_id: t.id,
                     date: t.created.date_naive(),
@@ -895,6 +928,97 @@ mod tests {
         assert!(!is_mappable_account("monzoflexbackingloan_0000X"));
         assert!(is_mappable_account("monzoflex_0000X")); // the real Flex account IS mappable
         assert!(is_mappable_account("user_0000X"));
+    }
+
+    #[test]
+    fn monzo_flex_from_main_account_targets_flex_account() {
+        let tx = MonzoTx {
+            id: "tx_r".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: -82822,
+            description: "Flex".into(),
+            decline_reason: None,
+            merchant: None,
+            scheme: "monzo_flex".into(),
+            metadata: TxMetadata { pot_id: None },
+        };
+        assert_eq!(
+            tx.transfer_target_flex("acc_cur", Some("acc_flex")),
+            Some(TransferTarget::Account("acc_flex".into()))
+        );
+    }
+
+    #[test]
+    fn monzo_flex_from_flex_account_is_mirror() {
+        let tx = MonzoTx {
+            id: "tx_r2".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: 82822,
+            description: "Flex".into(),
+            decline_reason: None,
+            merchant: None,
+            scheme: "monzo_flex".into(),
+            metadata: TxMetadata { pot_id: None },
+        };
+        assert_eq!(
+            tx.transfer_target_flex("acc_flex", Some("acc_flex")),
+            Some(TransferTarget::FlexMirror)
+        );
+    }
+
+    #[test]
+    fn monzo_flex_without_flex_account_configured_is_mirror() {
+        let tx = MonzoTx {
+            id: "tx_r3".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: -100,
+            description: "Flex".into(),
+            decline_reason: None,
+            merchant: None,
+            scheme: "monzo_flex".into(),
+            metadata: TxMetadata { pot_id: None },
+        };
+        assert_eq!(
+            tx.transfer_target_flex("acc_cur", None),
+            Some(TransferTarget::FlexMirror)
+        );
+    }
+
+    #[test]
+    fn mastercard_on_flex_feed_is_not_a_transfer() {
+        let tx = MonzoTx {
+            id: "tx_dp".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: -14997,
+            description: "SHOP".into(),
+            decline_reason: None,
+            merchant: Some(Merchant {
+                name: "Shop".into(),
+            }),
+            scheme: "mastercard".into(),
+            metadata: TxMetadata { pot_id: None },
+        };
+        assert_eq!(tx.transfer_target_flex("acc_flex", Some("acc_flex")), None);
+    }
+
+    #[test]
+    fn pot_still_classifies_via_flex_aware_path() {
+        let tx = MonzoTx {
+            id: "tx_p".into(),
+            created: "2026-06-01T10:00:00Z".parse().unwrap(),
+            amount: -5000,
+            description: "pot".into(),
+            decline_reason: None,
+            merchant: None,
+            scheme: "uk_retail_pot".into(),
+            metadata: TxMetadata {
+                pot_id: Some("pot_abc".into()),
+            },
+        };
+        assert_eq!(
+            tx.transfer_target_flex("acc_cur", Some("acc_flex")),
+            Some(TransferTarget::Pot("pot_abc".into()))
+        );
     }
 
     #[tokio::test]
