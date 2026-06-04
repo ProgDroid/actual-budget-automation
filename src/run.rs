@@ -1196,6 +1196,7 @@ pub mod tests {
             amount_minor: amount,
             raw_merchant: merchant.into(),
             source_monzo_id: "acc_1".into(),
+            transfer: None,
         }
     }
 
@@ -1955,6 +1956,7 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             amount_minor: -1200,
             raw_merchant: "BILLS LTD".into(),
             source_monzo_id: "acc_2".into(),
+            transfer: None,
         };
         let mut bank = FakeBank {
             txs: vec![tx_cafe, tx_bills],

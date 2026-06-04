@@ -197,6 +197,7 @@ impl Monzo {
                     amount_minor: t.amount,
                     raw_merchant,
                     source_monzo_id: monzo_id.to_string(),
+                    transfer: None,
                 }
             })
             .collect())

@@ -7,6 +7,19 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::state::State;
 
+/// Destination of a transfer detected in the bank feed. Resolved to an Actual
+/// account (and thence its transfer payee) at import time.
+// Both variants are constructed in Task 3/10 (Monzo transfer detection); allow
+// dead_code until then so clippy stays clean.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferTarget {
+    /// Monzo pot id (`pot_…`), matched against `[[monzo.pots]]`.
+    Pot(String),
+    /// Destination Monzo account id (`acc_…`), matched against `[[monzo.accounts]]`.
+    Account(String),
+}
+
 /// A transaction as fetched from a bank, before payee normalisation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTransaction {
@@ -19,6 +32,10 @@ pub struct RawTransaction {
     pub raw_merchant: String,
     /// Monzo account id this transaction was fetched from; routes the import.
     pub source_monzo_id: String,
+    /// `Some` when this row is a transfer (pot move or inter-account); routes to
+    /// the destination account's transfer payee instead of payee/category
+    /// classification. `None` = ordinary transaction (Phase 1/2 path, unchanged).
+    pub transfer: Option<TransferTarget>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +74,7 @@ mod tests {
             amount_minor: -450,
             raw_merchant: "SQ *SOME CAFE".into(),
             source_monzo_id: "acc_1".into(),
+            transfer: None,
         };
         assert_eq!(tx.amount_minor, -450);
         assert_eq!(tx.raw_merchant, "SQ *SOME CAFE");
