@@ -9,15 +9,16 @@ use crate::state::State;
 
 /// Destination of a transfer detected in the bank feed. Resolved to an Actual
 /// account (and thence its transfer payee) at import time.
-// Both variants are constructed in Task 3/10 (Monzo transfer detection); allow
-// dead_code until then so clippy stays clean.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferTarget {
     /// Monzo pot id (`pot_…`), matched against `[[monzo.pots]]`.
     Pot(String),
     /// Destination Monzo account id (`acc_…`), matched against `[[monzo.accounts]]`.
+    /// Used for the main-account side of a Monzo Flex transfer (id = the Flex account).
     Account(String),
+    /// The Flex-account side of a `monzo_flex` transfer — a mirror with no unique
+    /// data. Suppressed in `run()` when its main-side twin is present, else held.
+    FlexMirror,
 }
 
 /// A transaction as fetched from a bank, before payee normalisation.

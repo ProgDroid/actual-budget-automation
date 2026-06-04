@@ -66,6 +66,9 @@ fn resolve_transfer_dest(
             .iter()
             .find(|a| &a.monzo_id == acc_id && !a.actual_id.is_empty())
             .map(|a| a.actual_id.clone()),
+        // F5 suppresses FlexMirror when the main-side twin is present; until
+        // then it is held (None = unresolved destination).
+        TransferTarget::FlexMirror => None,
     }
 }
 

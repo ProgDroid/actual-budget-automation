@@ -192,6 +192,7 @@ impl HeldTransfer {
             "account" => Some(crate::banks::TransferTarget::Account(
                 self.target_id.clone(),
             )),
+            "flex_mirror" => Some(crate::banks::TransferTarget::FlexMirror),
             _ => None,
         }
     }
@@ -202,6 +203,7 @@ impl HeldTransfer {
         let (target_kind, target_id) = match tx.transfer.as_ref()? {
             crate::banks::TransferTarget::Pot(id) => ("pot", id.clone()),
             crate::banks::TransferTarget::Account(id) => ("account", id.clone()),
+            crate::banks::TransferTarget::FlexMirror => ("flex_mirror", String::new()),
         };
         Some(Self {
             external_id: tx.external_id.clone(),
@@ -1050,6 +1052,23 @@ mod tests {
         s.save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
         assert!(loaded.monzo.accounts[0].is_flex);
+    }
+
+    #[test]
+    fn held_transfer_flex_mirror_roundtrip() {
+        use crate::banks::TransferTarget;
+        let row = crate::banks::RawTransaction {
+            external_id: "tx_fm".into(),
+            date: "2026-06-02".parse().unwrap(),
+            amount_minor: 82822,
+            raw_merchant: "Flex".into(),
+            source_monzo_id: "acc_flex".into(),
+            transfer: Some(TransferTarget::FlexMirror),
+        };
+        let ht = HeldTransfer::from_row(&row).unwrap();
+        assert_eq!(ht.target_kind, "flex_mirror");
+        assert_eq!(ht.target_id, "");
+        assert_eq!(ht.target(), Some(TransferTarget::FlexMirror));
     }
 
     #[test]
