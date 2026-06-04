@@ -37,6 +37,29 @@ id; the Actual side must be supplied via `aba accounts`). Until mapped, transact
 from that account are HELD (never imported to a wrong/blank account) and surfaced in
 the run summary.
 
+## Monzo Flex
+
+`aba accounts` auto-detects the Flex credit account by its Monzo description prefix
+(`monzoflex_`) and tags the resulting `[[monzo.accounts]]` entry with `is_flex = true`
+(shown with a `[FLEX]` tag in the preview). The internal backing-loan account
+(`monzoflexbackingloan_`) is excluded from mapping because Monzo returns 403 on its
+transaction feed.
+
+Map the Flex account to a dedicated **credit/liability** account in Actual (create it
+in the Actual UI first, then confirm or fix the `actual_id` in the state file).
+
+**How transactions import:**
+
+- **Repayments and "Flex it" moves** — the main-account debit and the Flex mirror carry
+  a `monzo_flex` transfer marker. aba imports the main-account side as a transfer to
+  the Flex Actual account (via the matching `Transfer: Flex` payee) and suppresses the
+  mirror, so there is no double-count.
+- **Direct Flex purchases** (scheme `mastercard` on the Flex feed, `transfer: None`) —
+  take the ordinary Phase-1/2 path: routed to the Flex Actual account and categorised
+  by Claude/cache, exactly like any other spending transaction.
+- **Unexpected one-sided `monzo_flex` lines** — held in `held_transfers` and surfaced
+  in the run summary; never silently dropped.
+
 ## Daily run (server, one-shot container)
 
 The container runs as the non-root `node` user (uid 1000, set by `USER node` in

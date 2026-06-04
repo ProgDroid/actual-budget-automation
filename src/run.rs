@@ -3889,4 +3889,83 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert!(hol.actual_id.is_empty()); // no match -> unmapped
         assert_eq!(hol.monzo_pot_name, "Holiday");
     }
+
+    // ---- Task F6: direct Flex purchase regression ----
+
+    /// A direct Flex purchase (scheme=mastercard on the Flex feed, transfer:None)
+    /// must take the ordinary Phase-1/2 path: routed to the Flex Actual account,
+    /// categorised normally, NOT treated as a transfer, nothing held.
+    #[tokio::test]
+    async fn direct_flex_purchase_imports_as_ordinary_spending_on_flex_account() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        let mut state = State::default();
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_flex".into(),
+            actual_id: "act-flex".into(),
+            is_flex: true,
+            ..Default::default()
+        });
+
+        // Direct Flex purchase: mastercard on the Flex feed => transfer: None (ordinary).
+        let tx = RawTransaction {
+            external_id: "tx_dp".into(),
+            date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+            amount_minor: -14997,
+            raw_merchant: "Local Cafe".into(),
+            source_monzo_id: "acc_flex".into(),
+            transfer: None,
+        };
+        let mut bank = FakeBank { txs: vec![tx] };
+        // Confident payee+category so it auto-imports (matches p_cafe / c_groc from the shim).
+        let claude = FakeClaude {
+            out: vec![Classification {
+                raw: "Local Cafe".into(),
+                payee: Some("Local Cafe".into()),
+                payee_confidence: Confidence::High,
+                category: Some("Groceries".into()),
+                category_confidence: Confidence::High,
+            }],
+        };
+
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&routed_log).expect("routed.log must exist");
+        let lines: Vec<&str> = logged.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one ordinary import");
+        assert!(
+            lines[0].contains("act-flex"),
+            "routed to the Flex Actual account"
+        );
+        assert!(
+            lines[0].contains("p_cafe"),
+            "ordinary payee, NOT a transfer payee"
+        );
+        assert!(
+            !lines[0].contains("p_xfer"),
+            "must not use any transfer payee"
+        );
+        assert!(
+            state.held_transfers.is_empty(),
+            "not a transfer, nothing held"
+        );
+    }
 }
