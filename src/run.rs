@@ -1315,7 +1315,12 @@ pub async fn run(
 
     state.save(&cfg.state_path)?;
 
-    let awaiting = state.pending_reviews.len();
+    let awaiting = state
+        .pending_reviews
+        .iter()
+        .map(|p| p.raw_merchant.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     let mut body = format!(
         "Added {}, updated {}, held {} for review.",
         summary.added, summary.updated, held
@@ -1327,7 +1332,7 @@ pub async fn run(
         }
     }
     if awaiting > 0 {
-        let _ = write!(body, "\n{awaiting} item(s) awaiting your confirmation.");
+        let _ = write!(body, "\n{awaiting} merchant(s) awaiting your confirmation.");
     }
     if transfers_imported > 0 {
         let _ = write!(body, "\nImported {transfers_imported} transfer(s).");
@@ -1958,6 +1963,22 @@ pub mod tests {
             category_resolved: true,
             telegram_message_id: None,
         }
+    }
+
+    #[test]
+    fn awaiting_count_is_per_merchant() {
+        use std::collections::BTreeSet;
+        let reviews = [
+            held("tx1", "TFL TRAVEL CH"),
+            held("tx2", "TFL TRAVEL CH"),
+            held("tx3", "TESCO 1234"),
+        ];
+        let merchants = reviews
+            .iter()
+            .map(|p| p.raw_merchant.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert_eq!(merchants, 2, "three txns across two merchants");
     }
 
     #[tokio::test]
