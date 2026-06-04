@@ -3964,6 +3964,10 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             "must not use any transfer payee"
         );
         assert!(
+            lines[0].contains("c_groc"),
+            "categorised as Groceries (ordinary path includes category)"
+        );
+        assert!(
             state.held_transfers.is_empty(),
             "not a transfer, nothing held"
         );

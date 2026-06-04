@@ -55,8 +55,8 @@ in the Actual UI first, then confirm or fix the `actual_id` in the state file).
   the Flex Actual account (via the matching `Transfer: Flex` payee) and suppresses the
   mirror, so there is no double-count.
 - **Direct Flex purchases** (scheme `mastercard` on the Flex feed, `transfer: None`) —
-  take the ordinary Phase-1/2 path: routed to the Flex Actual account and categorised
-  by Claude/cache, exactly like any other spending transaction.
+  take the ordinary payee-and-category import path: routed to the Flex Actual account
+  and categorised by Claude/cache, exactly like any other spending transaction.
 - **Unexpected one-sided `monzo_flex` lines** — held in `held_transfers` and surfaced
   in the run summary; never silently dropped.
 
