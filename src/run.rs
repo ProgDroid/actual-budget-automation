@@ -3541,6 +3541,12 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
             resolve_transfer_dest(&TransferTarget::Account("acc_joint".into()), &pots, &accts),
             Some("act-joint".to_string())
         );
+        // FlexMirror has no resolvable destination (compile-forced default) -> None.
+        // Guards against accidental change in F5.
+        assert_eq!(
+            resolve_transfer_dest(&TransferTarget::FlexMirror, &pots, &accts),
+            None
+        );
         // unmapped pot -> None
         assert_eq!(
             resolve_transfer_dest(&TransferTarget::Pot("pot_unmapped".into()), &pots, &accts),

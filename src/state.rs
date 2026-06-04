@@ -176,7 +176,8 @@ pub struct HeldTransfer {
     /// Discriminator: "pot" or "account" — selects which map resolves `target_id`.
     #[serde(default)]
     pub target_kind: String,
-    /// The destination id: a Monzo pot id (`pot_…`) or account id (`acc_…`).
+    /// The destination id: a Monzo pot id (`pot_…`) or account id (`acc_…`),
+    /// or an empty string for `flex_mirror`.
     #[serde(default)]
     pub target_id: String,
     #[serde(default)]
