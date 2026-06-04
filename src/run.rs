@@ -14,7 +14,7 @@ use crate::claude::{Classification, ClaudeMatcher, Confidence};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
 use crate::matching::{Schedule, best_payee_match, matches_scheduled};
 use crate::notify::Notifier;
-use crate::state::{AccountLink, ClassifiedHold, PendingReview, PotLink, State};
+use crate::state::{AccountLink, ClassifiedHold, HeldTransfer, PendingReview, PotLink, State};
 use crate::telegram::{ConfirmChannel, Prompt};
 
 /// Minimum normalised-name similarity for `aba accounts` to auto-link a Monzo
@@ -42,11 +42,7 @@ fn actual_id_for(source_monzo_id: &str, links: &[AccountLink]) -> Option<String>
 
 /// Find the transfer payee id for an Actual account (a payee whose
 /// `transfer_acct` equals `actual_id`). Actual auto-creates one per account.
-#[allow(dead_code)] // wired into run() in Task 7
-fn transfer_payee_id<'a>(
-    payees: &'a [crate::actual::shim_protocol::Payee],
-    actual_id: &str,
-) -> Option<&'a str> {
+fn transfer_payee_id<'a>(payees: &'a [Payee], actual_id: &str) -> Option<&'a str> {
     payees
         .iter()
         .find(|p| p.transfer_acct.as_deref() == Some(actual_id))
@@ -56,7 +52,6 @@ fn transfer_payee_id<'a>(
 /// Resolve a transfer's destination to an Actual account id. `Pot` looks up
 /// `[[monzo.pots]]`; `Account` looks up `[[monzo.accounts]]`. Empty `actual_id`
 /// (present but unmapped) and a missing entry both yield `None` (caller holds).
-#[allow(dead_code)] // wired into run() in Task 7
 fn resolve_transfer_dest(
     target: &TransferTarget,
     pots: &[PotLink],
@@ -614,6 +609,10 @@ pub async fn run(
         BankError::AuthExpired(m) => anyhow::anyhow!("auth expired mid-fetch: {m}"),
     })?;
     info!("fetched {} transactions since {since}", fetched.len());
+    // Partition transfers out of the ordinary pipeline BEFORE computing
+    // `fetched_count`, so the scheduled-skip math stays about ordinary rows only.
+    let (transfer_rows, fetched): (Vec<RawTransaction>, Vec<RawTransaction>) =
+        fetched.into_iter().partition(|t| t.transfer.is_some());
     let fetched_count = fetched.len();
 
     // 3. Read Actual payees + schedules + categories. `get_payees` must stay
@@ -702,6 +701,59 @@ pub async fn run(
     // 6. Assemble import rows (payee NAME -> id; never auto-create on the matched path).
     let mut grouped: BTreeMap<String, Vec<ImportTxn>> = BTreeMap::new();
     let mut held = 0usize;
+
+    // ---- Phase 3: transfers (retry queue + newly fetched) ----
+    // Transfers bypass the Claude/payee/category pipeline: resolve dest -> Actual
+    // account -> that account's transfer payee, and import ONE uncategorised row
+    // into the SOURCE account's group (Actual auto-creates the linked counterpart).
+    let pot_links = state.monzo.pots.clone();
+    // Work list: previously-held transfers (retry) + newly fetched, deduped by external_id.
+    let mut transfer_intents: Vec<HeldTransfer> = state.held_transfers.clone();
+    for row in &transfer_rows {
+        if let Some(ht) = HeldTransfer::from_row(row)
+            && !transfer_intents
+                .iter()
+                .any(|h| h.external_id == ht.external_id)
+        {
+            transfer_intents.push(ht);
+        }
+    }
+
+    let mut still_held: Vec<HeldTransfer> = Vec::new();
+    let mut transfers_imported = 0usize;
+    for ht in transfer_intents {
+        let Some(target) = ht.target() else {
+            warn!(
+                "held transfer {} has unknown target_kind '{}'; dropping",
+                ht.external_id, ht.target_kind
+            );
+            continue;
+        };
+        let dest = resolve_transfer_dest(&target, &pot_links, &account_links);
+        let src = actual_id_for(&ht.source_monzo_id, &account_links);
+        match (src, dest) {
+            (Some(src_actual), Some(dest_actual)) => {
+                if let Some(pid) = transfer_payee_id(&payees, &dest_actual) {
+                    grouped.entry(src_actual).or_default().push(ImportTxn {
+                        date: ht.date.clone(),
+                        amount: ht.amount,
+                        payee: pid.to_string(),
+                        category: None, // transfers are uncategorised
+                        imported_id: ht.external_id.clone(),
+                    });
+                    transfers_imported += 1;
+                } else {
+                    warn!(
+                        "no transfer payee for account {dest_actual}; re-holding transfer {}",
+                        ht.external_id
+                    );
+                    still_held.push(ht);
+                }
+            }
+            _ => still_held.push(ht), // source and/or dest unmapped -> keep, retry next run
+        }
+    }
+    state.held_transfers = still_held;
 
     let make_row = |tx: &RawTransaction, payee_id: &str, category_id: Option<String>| ImportTxn {
         date: tx.date.format("%Y-%m-%d").to_string(),
@@ -990,6 +1042,8 @@ pub async fn run(
             fetched_count.saturating_sub(candidates.len())
         );
         println!("  would hold   : {held}");
+        println!("  would transfer-import : {transfers_imported}");
+        println!("  transfers still held  : {}", state.held_transfers.len());
         for (aid, rows) in &grouped {
             println!("  -> account {aid}: {} txns", rows.len());
             for r in rows {
@@ -1088,6 +1142,16 @@ pub async fn run(
     }
     if awaiting > 0 {
         let _ = write!(body, "\n{awaiting} item(s) awaiting your confirmation.");
+    }
+    if transfers_imported > 0 {
+        let _ = write!(body, "\nImported {transfers_imported} transfer(s).");
+    }
+    if !state.held_transfers.is_empty() {
+        let _ = write!(
+            body,
+            "\n\u{2922} {} transfer(s) awaiting account mapping \u{2014} run `aba accounts`.",
+            state.held_transfers.len()
+        );
     }
     notifier.notify("Actual import complete", &body).await.ok();
 
@@ -1846,6 +1910,34 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         )
     }
 
+    /// Like `fake_actual_routing` but `get_payees` also returns transfer payees:
+    /// `{p_xfer_pot, transfer_acct:'act-pot'}` and `{p_xfer_cur, transfer_acct:'act-cur'}`.
+    /// `import_transactions` logs `{account_id, transactions}` lines to `<dir>/routed.log`.
+    fn fake_actual_transfers(dir: &TempDir) -> ActualClient {
+        let script = r"
+let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
+  const req=JSON.parse(b); const out=o=>process.stdout.write(JSON.stringify(o));
+  const fs=require('fs'), path=require('path');
+  if(req.op==='get_payees'){ out({ok:true,data:[{id:'p_cafe',name:'Local Cafe'},{id:'p_xfer_pot',name:'Transfer: Savings',transfer_acct:'act-pot'},{id:'p_xfer_cur',name:'Transfer: Current',transfer_acct:'act-cur'}]}); }
+  else if(req.op==='get_scheduled'){ out({ok:true,data:[]}); }
+  else if(req.op==='get_categories'){ out({ok:true,data:[{id:'c_groc',name:'Groceries'}]}); }
+  else if(req.op==='create_payee'){ out({ok:true,data:{id:'p_new'}}); }
+  else if(req.op==='import_transactions'){
+    fs.appendFileSync(path.join(__dirname,'routed.log'), JSON.stringify({account_id:req.account_id,transactions:req.transactions})+'\n');
+    out({ok:true,data:{added:req.transactions.length,updated:0}});
+  } else { out({ok:false,error:'unknown op'}); }
+});
+";
+        std::fs::write(dir.path().join("index.js"), script).unwrap();
+        ActualClient::new(
+            dir.path().to_path_buf(),
+            false,
+            "http://t".into(),
+            "pw".into(),
+            "sync".into(),
+        )
+    }
+
     fn cfg_at(state_path: &std::path::Path) -> Config {
         Config::from_getter(|k| match k {
             "ANTHROPIC_API_KEY" => Some("ak".into()),
@@ -2053,6 +2145,144 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert_eq!(calls[1]["transactions"].as_array().unwrap().len(), 1);
         assert_eq!(calls[1]["transactions"][0]["imported_id"], "tx_bills");
         assert_eq!(calls[1]["transactions"][0]["payee"], "p_bills");
+    }
+
+    /// Build a pot-deposit transfer row: negative amount, source `acc_cur`,
+    /// `transfer: Some(Pot("pot_abc"))`.
+    fn pot_deposit(id: &str) -> RawTransaction {
+        RawTransaction {
+            external_id: id.into(),
+            date: NaiveDate::from_ymd_opt(2026, 5, 30).unwrap(),
+            amount_minor: -2000,
+            raw_merchant: "Pot deposit".into(),
+            source_monzo_id: "acc_cur".into(),
+            transfer: Some(TransferTarget::Pot("pot_abc".into())),
+        }
+    }
+
+    #[tokio::test]
+    async fn pot_deposit_imports_as_transfer_when_mapped() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        let mut state = State::default();
+        // Source account mapped: acc_cur -> act-cur.
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+        // Pot mapped: pot_abc -> act-pot.
+        state.monzo.pots.push(PotLink {
+            monzo_pot_id: "pot_abc".into(),
+            actual_id: "act-pot".into(),
+            ..Default::default()
+        });
+
+        let mut bank = FakeBank {
+            txs: vec![pot_deposit("xfer_1")],
+        };
+        let claude = FakeClaude { out: vec![] }; // transfers bypass Claude
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&routed_log).unwrap();
+        let calls: Vec<serde_json::Value> = logged
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly one transfer import");
+        assert_eq!(
+            calls[0]["account_id"], "act-cur",
+            "routed to SOURCE account"
+        );
+        let txns = calls[0]["transactions"].as_array().unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(
+            txns[0]["payee"], "p_xfer_pot",
+            "imported under the destination account's transfer payee"
+        );
+        assert!(
+            txns[0].get("category").is_none(),
+            "transfers are uncategorised -> no category field on the wire"
+        );
+        assert!(
+            state.held_transfers.is_empty(),
+            "mapped transfer must not be held"
+        );
+    }
+
+    #[tokio::test]
+    async fn pot_deposit_is_held_when_pot_unmapped() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let routed_log = shim.path().join("routed.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual_transfers(&shim);
+        let notifier = NullNotifier;
+
+        let mut state = State::default();
+        // Source mapped, but the pot is NOT mapped (pots empty).
+        state.monzo.accounts.push(AccountLink {
+            monzo_id: "acc_cur".into(),
+            actual_id: "act-cur".into(),
+            ..Default::default()
+        });
+
+        let mut bank = FakeBank {
+            txs: vec![pot_deposit("xfer_1")],
+        };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            None,
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // The transfer was NOT imported: routed.log either absent or has no
+        // transfer import.
+        if routed_log.exists() {
+            let logged = std::fs::read_to_string(&routed_log).unwrap();
+            assert!(
+                !logged.contains("p_xfer_pot"),
+                "unmapped pot must NOT be imported, got: {logged}"
+            );
+        }
+        assert_eq!(state.held_transfers.len(), 1, "unmapped pot -> held");
+        let ht = &state.held_transfers[0];
+        assert_eq!(ht.target_kind, "pot");
+        assert_eq!(ht.target_id, "pot_abc");
+        assert_eq!(ht.source_monzo_id, "acc_cur");
+        assert!(
+            state.pending_reviews.is_empty(),
+            "transfers do NOT use the Telegram review path"
+        );
     }
 
     #[tokio::test]

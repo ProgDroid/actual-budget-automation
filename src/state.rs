@@ -177,8 +177,6 @@ pub struct HeldTransfer {
     pub raw_merchant: String,
 }
 
-// Methods are constructed in Task 7 (transfer routing); allow dead_code until then.
-#[allow(dead_code)]
 impl HeldTransfer {
     /// Reconstruct the typed target. Unknown `target_kind` → `None` (defensive).
     #[must_use]
