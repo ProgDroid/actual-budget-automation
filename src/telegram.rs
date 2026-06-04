@@ -19,7 +19,7 @@ pub enum ReplyAction {
     Remap(String),
 }
 
-/// A reply correlated to a pending entry (`entry_key` = transaction `external_id`).
+/// A reply correlated to a merchant group (`entry_key` = `group_key(raw_merchant)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
     pub entry_key: String,
@@ -45,7 +45,7 @@ pub struct ParsedUpdates {
 #[async_trait]
 pub trait ConfirmChannel: Send + Sync {
     /// Drain updates newer than `since`. `msg_map` maps a prompt's `message_id` to
-    /// the entry it was sent for, so free-text replies can be correlated.
+    /// the merchant group key it was sent for, so free-text replies can be correlated.
     /// Returns (applied replies, new offset to persist).
     async fn poll_replies(
         &self,
@@ -69,6 +69,26 @@ pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
         return None;
     }
     Some(s)
+}
+
+/// Stable, bounded key identifying a merchant group, derived from the exact
+/// `raw_merchant`. Used as the Telegram `callback_data`/free-text correlation
+/// key so one prompt and one reply cover every held transaction of a merchant.
+///
+/// FNV-1a 64-bit rendered as 16 lowercase hex chars: deterministic and
+/// version-stable by construction (unlike `std::hash::DefaultHasher`, whose
+/// output is not contractually stable across toolchains). 16 hex + the longest
+/// `<action>:` prefix stays far under Telegram's 64-byte cap, so grouped prompts
+/// never lose their keyboard to length.
+#[must_use]
+#[allow(dead_code)] // used in the forthcoming grouping phase; no callers yet
+pub fn group_key(raw_merchant: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for byte in raw_merchant.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("{hash:016x}")
 }
 
 pub fn parse_callback(data: &str) -> Option<(String, String)> {
@@ -458,6 +478,20 @@ mod tests {
         assert!(parsed.replies.is_empty());
         assert_eq!(parsed.ack_callback_ids, vec!["cb_x".to_string()]);
         assert_eq!(parsed.new_offset, 6);
+    }
+
+    #[test]
+    fn group_key_is_deterministic_and_fits_callback() {
+        let a = group_key("TFL TRAVEL CH");
+        assert_eq!(
+            a,
+            group_key("TFL TRAVEL CH"),
+            "deterministic for equal input"
+        );
+        assert_ne!(a, group_key("TESCO 1234"), "differs for different input");
+        assert_eq!(a.len(), 16, "16 hex chars");
+        // `<action>:<group_key>` must fit Telegram's 64-byte callback cap.
+        assert!(encode_callback("nw", &a).is_some());
     }
 
     #[test]
