@@ -2,6 +2,9 @@
 name = "actual-budget-automation"
 version = "0.1.0"
 edition = "2024"
+# File::lock() (src/lock.rs) stabilised in 1.89; Duration::from_mins() in 1.91 —
+# older toolchains fail with cryptic "method not found" without this floor.
+rust-version = "1.91"
 
 [[bin]]
 name = "aba"
