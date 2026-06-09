@@ -109,12 +109,18 @@ fn action_from_code(code: &str) -> Option<ReplyAction> {
     }
 }
 
-/// Telegram rejects message text over 4096 chars with HTTP 400 — which would
-/// re-fail identically every run (same failure shape as the old Markdown bug).
-pub const TELEGRAM_TEXT_LIMIT: usize = 4096;
+/// Telegram rejects message text over 4096 characters with HTTP 400 — which
+/// would re-fail identically every run (same failure shape as the old
+/// Markdown bug). We cap BYTES at 4096: byte count >= char count in UTF-8,
+/// so this is conservative (may over-truncate multibyte text, never under).
+// `pub(crate)` is deliberate (crate-internal API, not for export); the module
+// is private so clippy's nursery `redundant_pub_crate` flags it — allow it.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) const TELEGRAM_TEXT_LIMIT: usize = 4096;
 
 /// Cap text at the Telegram limit on a char boundary, appending `…` when cut.
-pub fn truncate_for_telegram(text: &str) -> String {
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn truncate_for_telegram(text: &str) -> String {
     if text.len() <= TELEGRAM_TEXT_LIMIT {
         return text.to_string();
     }
