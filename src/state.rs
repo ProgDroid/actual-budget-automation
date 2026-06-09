@@ -254,7 +254,17 @@ impl State {
         let body = toml::to_string_pretty(self)?;
         let dir = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
             Some(p) => {
+                // Only tighten permissions on a directory WE create — never
+                // chmod a pre-existing dir the operator set up (e.g. /data).
+                let created = !p.exists();
                 std::fs::create_dir_all(p)?;
+                #[cfg(unix)]
+                if created {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+                }
+                #[cfg(not(unix))]
+                let _ = created;
                 p.to_path_buf()
             }
             None => std::path::PathBuf::from("."),
@@ -1092,5 +1102,17 @@ mod tests {
             ..row
         };
         assert!(HeldTransfer::from_row(&ordinary).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_private_state_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("newly").join("created");
+        let path = nested.join("s.toml");
+        State::default().save(&path).unwrap();
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "state dir we create must be owner-only");
     }
 }
