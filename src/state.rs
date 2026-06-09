@@ -6,8 +6,20 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Bump when the TOML schema changes shape incompatibly. `load` refuses files
+/// from a NEWER binary (rollback safety); older files are migrated forward.
+pub const CURRENT_STATE_VERSION: u32 = 1;
+
+const fn default_state_version() -> u32 {
+    // Absent field = pre-versioning file = schema v1.
+    CURRENT_STATE_VERSION
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
+    /// Schema version; see [`CURRENT_STATE_VERSION`].
+    #[serde(default = "default_state_version")]
+    pub version: u32,
     pub last_run: Option<DateTime<Utc>>,
     #[serde(default)]
     pub monzo: MonzoState,
@@ -24,6 +36,21 @@ pub struct State {
     pub held_transfers: Vec<HeldTransfer>,
     #[serde(default)]
     pub telegram: TelegramState,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_STATE_VERSION,
+            last_run: None,
+            monzo: MonzoState::default(),
+            payee_cache: BTreeMap::new(),
+            category_cache: BTreeMap::new(),
+            pending_reviews: Vec::new(),
+            held_transfers: Vec::new(),
+            telegram: TelegramState::default(),
+        }
+    }
 }
 
 #[derive(Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +252,16 @@ impl State {
         match read_result {
             Ok(s) => {
                 let mut state: Self = toml::from_str(&s)?;
+                if state.version > CURRENT_STATE_VERSION {
+                    anyhow::bail!(
+                        "state file {} is schema v{} — newer than this binary supports (v{}); \
+                         refusing to load to avoid silently dropping fields on the next save",
+                        path.display(),
+                        state.version,
+                        CURRENT_STATE_VERSION
+                    );
+                }
+                state.version = CURRENT_STATE_VERSION;
                 state.migrate_legacy_account();
                 Ok(state)
             }
@@ -1114,5 +1151,35 @@ mod tests {
         State::default().save(&path).unwrap();
         let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "state dir we create must be owner-only");
+    }
+
+    #[test]
+    fn legacy_state_without_version_loads_as_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.toml");
+        std::fs::write(&p, "last_run = \"2026-06-01T00:00:00Z\"\n").unwrap();
+        let s = State::load(&p).unwrap();
+        assert_eq!(s.version, CURRENT_STATE_VERSION);
+    }
+
+    #[test]
+    fn newer_state_version_refuses_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.toml");
+        std::fs::write(&p, format!("version = {}\n", CURRENT_STATE_VERSION + 1)).unwrap();
+        let err = State::load(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("newer"),
+            "must explain downgrade refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn fresh_default_state_round_trips_with_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.toml");
+        State::default().save(&p).unwrap();
+        let s = State::load(&p).unwrap();
+        assert_eq!(s.version, CURRENT_STATE_VERSION);
     }
 }
