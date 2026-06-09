@@ -1393,7 +1393,16 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to bind {port}: {e}"))?;
     println!("Waiting for redirect on 127.0.0.1:{port} ...");
 
-    let request = server.recv().context("listener error")?;
+    // Bounded wait: a browser that never redirects must not hang the command
+    // forever. 300s is generous for the Monzo consent screen.
+    let request = server
+        .recv_timeout(std::time::Duration::from_mins(5))
+        .context("listener error")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "timed out after 300s waiting for the Monzo redirect; re-run `aba auth monzo`"
+            )
+        })?;
     let url = format!("http://localhost{}", request.url());
     let parsed = url::Url::parse(&url).context("bad redirect URL")?;
     let code = parsed
