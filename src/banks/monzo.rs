@@ -66,8 +66,10 @@ struct TxMetadata {
 }
 
 impl MonzoTx {
-    /// Classify this row as a transfer, if it is one. Pots only in this slice;
-    /// inter-account (`p2p_payment`) is added in the inter-account slice.
+    /// Classify this row as a transfer, if it is one. Pots here; `monzo_flex`
+    /// lines are classified separately (Flex flow). `p2p_payment` is
+    /// deliberately NOT a transfer target: friend payments must remain ordinary
+    /// transactions or real income/expenses would be suppressed as transfers.
     fn transfer_target(&self) -> Option<TransferTarget> {
         if self.scheme == "uk_retail_pot"
             && let Some(pot_id) = self.metadata.pot_id.as_deref()
