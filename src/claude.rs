@@ -380,4 +380,27 @@ mod tests {
         assert!(s.contains("Rate limited."), "message retained: {s}");
         assert!(!s.contains("DO-NOT-LOG-ME"), "full body must not leak: {s}");
     }
+
+    #[tokio::test]
+    async fn classify_error_without_message_field_uses_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(
+                    serde_json::json!({ "weird": "shape", "blob": "DO-NOT-LOG-ME" }),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let c = HttpClaude::new("k".into(), "m".into()).with_base_url(server.uri());
+        let err = c.classify(&["X".into()], &[], &[]).await.unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("500"), "status retained: {s}");
+        assert!(s.contains("unknown error"), "fallback message used: {s}");
+        assert!(
+            !s.contains("DO-NOT-LOG-ME"),
+            "body must not leak even on fallback: {s}"
+        );
+    }
 }
