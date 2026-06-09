@@ -741,6 +741,7 @@ pub async fn run(
     channel: Option<&dyn ConfirmChannel>,
     autoimport: Confidence,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     // 1. Auth. Monzo rotates the refresh token on every successful refresh and
     // invalidates the previous one server-side, so persist the rotated token to
     // disk IMMEDIATELY — before any fallible fetch/Actual work. Otherwise a later
@@ -1301,11 +1302,6 @@ pub async fn run(
         summary.added += s.added;
         summary.updated += s.updated;
     }
-    info!(
-        "imported added={} updated={} held={held} flex_mirrors_suppressed={flex_mirrors_suppressed}",
-        summary.added, summary.updated
-    );
-
     state.last_run = Some(fetch_start);
 
     // Send one prompt per merchant group for everything still held.
@@ -1321,6 +1317,18 @@ pub async fn run(
         .map(|p| p.raw_merchant.as_str())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    info!(
+        fetched = fetched_count,
+        added = summary.added,
+        updated = summary.updated,
+        held,
+        transfers_imported,
+        flex_mirrors_suppressed,
+        awaiting_merchants = awaiting,
+        held_transfers = state.held_transfers.len(),
+        duration_secs = started.elapsed().as_secs(),
+        "run complete"
+    );
     let mut body = format!(
         "Added {}, updated {}, held {} for review.",
         summary.added, summary.updated, held
