@@ -94,16 +94,20 @@ impl ActualClient {
                     String::from_utf8_lossy(&output.stdout)
                 )
             })?;
-        match parsed {
-            ShimResponse::Ok { data } => Ok(data),
-            ShimResponse::Err { error } => {
-                let safe = if self.password.is_empty() {
-                    error
-                } else {
-                    error.replace(&self.password, "***")
-                };
-                Err(anyhow!("shim error: {safe}"))
-            }
+        if parsed.ok {
+            parsed
+                .data
+                .ok_or_else(|| anyhow!("shim returned ok=true but no data field"))
+        } else {
+            let error = parsed
+                .error
+                .unwrap_or_else(|| "shim returned ok=false with no error message".to_string());
+            let safe = if self.password.is_empty() {
+                error
+            } else {
+                error.replace(&self.password, "***")
+            };
+            Err(anyhow!("shim error: {safe}"))
         }
     }
 
