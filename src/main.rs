@@ -84,7 +84,19 @@ async fn dispatch(cli: Cli, cfg: &Config) -> Result<()> {
     match cli.command {
         Command::Auth {
             which: AuthCommand::Monzo,
-        } => run::auth_monzo(cfg).await,
+        } => {
+            #[cfg(feature = "auth-flow")]
+            {
+                run::auth_monzo(cfg).await
+            }
+            #[cfg(not(feature = "auth-flow"))]
+            {
+                anyhow::bail!(
+                    "this binary was built without the auth-flow feature (production image); \
+                     run `aba auth monzo` from a dev build instead"
+                )
+            }
+        }
         Command::Poll => {
             let Some(channel) = build_channel(cfg) else {
                 tracing::info!("Telegram not configured; poll is a no-op");

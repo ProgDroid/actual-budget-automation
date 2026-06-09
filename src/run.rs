@@ -1357,6 +1357,7 @@ pub async fn run(
     Ok(())
 }
 
+#[cfg(feature = "auth-flow")]
 /// Generate an unguessable 128-bit OAuth `state` nonce, hex-encoded (32 chars).
 fn random_state() -> anyhow::Result<String> {
     let mut buf = [0u8; 16];
@@ -1367,6 +1368,7 @@ fn random_state() -> anyhow::Result<String> {
     }))
 }
 
+#[cfg(feature = "auth-flow")]
 /// Verify the OAuth `state` echoed back on the redirect matches what we sent.
 /// # Errors
 /// Errors if `returned` is absent or does not equal `expected` (possible CSRF).
@@ -1378,6 +1380,7 @@ fn verify_state(expected: &str, returned: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "auth-flow")]
 /// One-time Monzo OAuth bootstrap. Run on a machine with a browser.
 pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     let redirect = url::Url::parse(&cfg.monzo_redirect_uri)
@@ -1464,6 +1467,7 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "auth-flow")]
 /// Minimal percent-encoding for query parameters.
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -3958,21 +3962,25 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert_eq!(schedules[0].payee, "Rent Co");
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn verify_state_accepts_exact_match() {
         assert!(super::verify_state("abc123", Some("abc123")).is_ok());
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn verify_state_rejects_mismatch() {
         assert!(super::verify_state("abc123", Some("nope")).is_err());
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn verify_state_rejects_missing() {
         assert!(super::verify_state("abc123", None).is_err());
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn random_state_is_32_hex_chars_and_varies() {
         let a = super::random_state().unwrap();

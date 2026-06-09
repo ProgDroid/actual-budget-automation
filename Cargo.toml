@@ -10,6 +10,13 @@ rust-version = "1.91"
 name = "aba"
 path = "src/main.rs"
 
+[features]
+default = ["auth-flow"]
+# Interactive Monzo OAuth bootstrap (`aba auth monzo`) — dev machines only.
+# The production container is built --no-default-features: no local HTTP
+# listener / browser-opener code in the prod binary.
+auth-flow = ["dep:tiny_http", "dep:webbrowser"]
+
 [dependencies]
 anyhow = "1"
 thiserror = "2"
@@ -25,8 +32,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 strsim = "0.11"
 url = "2"
-tiny_http = "0.12"
-webbrowser = "1"
+tiny_http = { version = "0.12", optional = true }
+webbrowser = { version = "1", optional = true }
 getrandom = "0.3"
 tempfile = "3"
 
