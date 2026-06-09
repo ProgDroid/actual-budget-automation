@@ -231,7 +231,12 @@ impl ClaudeMatcher for HttpClaude {
         let status = resp.status();
         let value: Value = resp.json().await.context("anthropic response not JSON")?;
         if !status.is_success() {
-            return Err(anyhow!("anthropic error {status}: {value}"));
+            // Surface only the API's message, not the whole body (log hygiene).
+            let msg = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(anyhow!("anthropic error {status}: {msg}"));
         }
         parse_response(&value)
     }
@@ -354,5 +359,25 @@ mod tests {
             .unwrap();
         assert_eq!(out[0].payee.as_deref(), Some("Transport for London"));
         assert_eq!(out[0].category.as_deref(), Some("Transport"));
+    }
+
+    #[tokio::test]
+    async fn classify_error_uses_message_not_full_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "type": "error",
+                "error": { "type": "rate_limit_error", "message": "Rate limited." },
+                "internal_debug_blob": "DO-NOT-LOG-ME"
+            })))
+            .mount(&server)
+            .await;
+        let c = HttpClaude::new("k".into(), "m".into()).with_base_url(server.uri());
+        let err = c.classify(&["X".into()], &[], &[]).await.unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("429"), "status retained: {s}");
+        assert!(s.contains("Rate limited."), "message retained: {s}");
+        assert!(!s.contains("DO-NOT-LOG-ME"), "full body must not leak: {s}");
     }
 }
