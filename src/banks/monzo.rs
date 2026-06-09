@@ -223,16 +223,8 @@ impl Monzo {
                 .send()
                 .await
                 .map_err(|e| BankError::Other(e.into()))?;
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                || resp.status() == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(BankError::AuthExpired("Monzo access token rejected".into()));
-            }
-            if !resp.status().is_success() {
-                let s = resp.status();
-                return Err(BankError::Other(anyhow::anyhow!(
-                    "Monzo transactions error {s}"
-                )));
+            if let Some(e) = status_error(resp.status(), "transactions", true) {
+                return Err(e);
             }
             let list: TxList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
             let raw_len = list.transactions.len();
@@ -297,11 +289,8 @@ impl Monzo {
             .send()
             .await
             .map_err(|e| BankError::Other(e.into()))?;
-        if !resp.status().is_success() {
-            let s = resp.status();
-            return Err(BankError::Other(anyhow::anyhow!(
-                "Monzo accounts error {s}"
-            )));
+        if let Some(e) = status_error(resp.status(), "accounts", false) {
+            return Err(e);
         }
         let list: AccountList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
         Ok(list
@@ -329,9 +318,8 @@ impl Monzo {
             .send()
             .await
             .map_err(|e| BankError::Other(e.into()))?;
-        if !resp.status().is_success() {
-            let s = resp.status();
-            return Err(BankError::Other(anyhow::anyhow!("Monzo pots error {s}")));
+        if let Some(e) = status_error(resp.status(), "pots", false) {
+            return Err(e);
         }
         let list: PotList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
         Ok(list
@@ -348,6 +336,29 @@ impl Monzo {
 /// and would fail-loud the whole run if mapped.
 fn is_mappable_account(description: &str) -> bool {
     !description.starts_with("monzoflexbackingloan_")
+}
+
+/// Map a Monzo response status to the right error, or `None` when successful.
+/// `auth_sensitive`: 401/403 mean the token was rejected → [`BankError::AuthExpired`]
+/// (the 90-day re-auth path); endpoints where 401/403 is an ordinary error pass false.
+fn status_error(
+    status: reqwest::StatusCode,
+    what: &str,
+    auth_sensitive: bool,
+) -> Option<BankError> {
+    if auth_sensitive
+        && (status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN)
+    {
+        return Some(BankError::AuthExpired(format!(
+            "Monzo {what} rejected ({status})"
+        )));
+    }
+    if !status.is_success() {
+        return Some(BankError::Other(anyhow::anyhow!(
+            "Monzo {what} error {status}"
+        )));
+    }
+    None
 }
 
 #[async_trait]
@@ -380,17 +391,8 @@ impl BankSource for Monzo {
             .await
             .map_err(|e| BankError::Other(e.into()))?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(BankError::AuthExpired(format!(
-                "Monzo refresh rejected ({})",
-                resp.status()
-            )));
-        }
-        if !resp.status().is_success() {
-            let s = resp.status();
-            return Err(BankError::Other(anyhow::anyhow!("Monzo token error {s}")));
+        if let Some(e) = status_error(resp.status(), "token refresh", true) {
+            return Err(e);
         }
 
         let token: TokenResponse = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
