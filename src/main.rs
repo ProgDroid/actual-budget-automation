@@ -150,5 +150,23 @@ async fn dispatch(cli: Cli, cfg: &Config) -> Result<()> {
             .unwrap_or_else(|_| Err(anyhow::anyhow!("run timed out after 600s")))
         }
         Command::Accounts { write } => run::map_accounts(cfg, write).await,
+        Command::CheckConfig => {
+            // Config::from_env() already succeeded before dispatch; validate
+            // the lazily-checked knobs that would otherwise fail mid-run.
+            Confidence::from_env_str(&cfg.autoimport_confidence)?;
+            match (&cfg.telegram_bot_token, &cfg.telegram_chat_id) {
+                (Some(_), Some(chat)) => {
+                    chat.parse::<i64>().map_err(|_| {
+                        anyhow::anyhow!("TELEGRAM_CHAT_ID is not a valid integer: {chat}")
+                    })?;
+                }
+                (None, None) => {}
+                _ => anyhow::bail!(
+                    "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set together (or neither)"
+                ),
+            }
+            println!("config OK");
+            Ok(())
+        }
     }
 }
