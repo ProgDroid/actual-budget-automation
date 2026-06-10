@@ -109,7 +109,7 @@ pub async fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::tests::FakeChannel;
+    use crate::pipeline::testutil::FakeChannel;
     use crate::telegram::Reply;
     use tempfile::tempdir;
 
@@ -288,7 +288,7 @@ mod tests {
         }
 
         let gk = crate::telegram::group_key("SQ *CAFE");
-        let channel = crate::pipeline::tests::FakeChannel::new(
+        let channel = crate::pipeline::testutil::FakeChannel::new(
             vec![Reply {
                 entry_key: gk,
                 action: ReplyAction::Confirm,
@@ -332,7 +332,7 @@ mod tests {
         }
 
         let gk = crate::telegram::group_key("TFL TRAVEL CH");
-        let channel = crate::pipeline::tests::FakeChannel::new(
+        let channel = crate::pipeline::testutil::FakeChannel::new(
             vec![Reply {
                 entry_key: gk,
                 action: ReplyAction::Confirm,
