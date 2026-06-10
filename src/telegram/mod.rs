@@ -1,5 +1,7 @@
 //! Telegram confirm/correct channel: trait, transport, and pure parsing.
 
+pub mod prompts;
+
 use std::collections::BTreeMap;
 
 use anyhow::{Context, anyhow};
@@ -80,6 +82,12 @@ pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
 /// output is not contractually stable across toolchains). 16 hex + the longest
 /// `<action>:` prefix stays far under Telegram's 64-byte cap, so grouped prompts
 /// never lose their keyboard to length.
+///
+/// FNV-1a is not collision-free: two distinct `raw_merchant` strings could (with
+/// ~1/2^64 probability) hash to the same key and thus share one prompt — a reply
+/// would then resolve both merchants together. At personal-finance volumes this
+/// is astronomically unlikely and acceptable; revisit (e.g. salt + length-prefix,
+/// or store the raw merchant alongside the key) only if collisions ever surface.
 #[must_use]
 pub fn group_key(raw_merchant: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
