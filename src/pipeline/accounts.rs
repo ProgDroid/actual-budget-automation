@@ -6,7 +6,7 @@ use crate::banks::{BankError, BankSource as _};
 use crate::config::Config;
 use crate::state::{AccountLink, PotLink, State};
 
-use super::persist_rotated_token;
+use super::auth::persist_rotated_token;
 
 /// Minimum normalised-name similarity for `aba accounts` to auto-link a Monzo
 /// account to an Actual account; below this the row is left unmapped.
