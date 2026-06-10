@@ -1,7 +1,6 @@
 //! Run pipeline and auth bootstrap.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 
 use anyhow::Context;
 use chrono::Utc;
@@ -32,10 +31,9 @@ mod transfer;
 use transfer::{actual_id_for, resolve_transfer_dest, transfer_payee_id};
 mod import;
 use import::{hold_unmapped, schedules_from_rows};
-// Re-exported (not just `use`d) because a later task adds a top-level `report`
-// module — a sibling of `pipeline`, not a descendant — that needs
+// Re-exported (not just `use`d) because the top-level `report` module —
+// a sibling of `pipeline`, not a descendant — needs
 // `crate::pipeline::HeldClassification`, and `mod classify;` is private.
-#[allow(unused_imports)]
 pub use classify::HeldClassification;
 
 #[cfg(test)]
@@ -561,45 +559,18 @@ pub async fn run(
 
     // 7. Import or report.
     if dry_run {
-        let total: usize = grouped.values().map(Vec::len).sum();
-        println!("DRY RUN — no writes to Actual");
-        println!("  would import : {total}");
-        println!(
-            "  would skip   : {} (matched a schedule)",
-            fetched_count.saturating_sub(candidates.len())
+        crate::report::dry_run(
+            &grouped,
+            &outcome.held,
+            &newly_cached,
+            &crate::report::DryRunCounts {
+                would_skip: fetched_count.saturating_sub(candidates.len()),
+                held,
+                transfers_imported,
+                transfers_held: state.held_transfers.len(),
+                flex_mirrors_suppressed,
+            },
         );
-        println!("  would hold   : {held}");
-        println!("  would xfer-import : {transfers_imported}");
-        println!("  would xfer-hold   : {}", state.held_transfers.len());
-        println!("  flex mirrors suppressed: {flex_mirrors_suppressed}");
-        for (aid, rows) in &grouped {
-            println!("  -> account {aid}: {} txns", rows.len());
-            for r in rows {
-                println!("    + {} {} -> payee {}", r.date, r.amount, r.payee);
-            }
-        }
-        for h in &outcome.held {
-            let p = h
-                .payee_resolved
-                .as_deref()
-                .or(h.payee_suggestion.as_deref())
-                .unwrap_or("?");
-            let c = h
-                .category_resolved
-                .as_deref()
-                .or(h.category_suggestion.as_deref())
-                .unwrap_or("?");
-            println!(
-                "    ? hold {} {} (payee {p}, category {c})",
-                h.tx.raw_merchant, h.tx.amount_minor
-            );
-        }
-        if !newly_cached.is_empty() {
-            println!("  would cache  : {}", newly_cached.len());
-            for (raw, payee) in &newly_cached {
-                println!("    ~ {raw} -> {payee}");
-            }
-        }
         // Re-persist only the rotated token (see persist_rotated_token); discard
         // the in-memory cache/pending/last_run changes a dry-run must not commit.
         persist_rotated_token(cfg, state)?;
@@ -648,29 +619,15 @@ pub async fn run(
         duration_secs = started.elapsed().as_secs(),
         "run complete"
     );
-    let mut body = format!(
-        "Added {}, updated {}, held {} for review.",
-        summary.added, summary.updated, held
+    let body = crate::report::summary_body(
+        summary.added,
+        summary.updated,
+        held,
+        &newly_cached,
+        awaiting,
+        transfers_imported,
+        state.held_transfers.len(),
     );
-    if !newly_cached.is_empty() {
-        let _ = write!(body, "\nNewly auto-matched ({}):", newly_cached.len());
-        for (raw, payee) in &newly_cached {
-            let _ = write!(body, "\n  {raw} -> {payee}");
-        }
-    }
-    if awaiting > 0 {
-        let _ = write!(body, "\n{awaiting} merchant(s) awaiting your confirmation.");
-    }
-    if transfers_imported > 0 {
-        let _ = write!(body, "\nImported {transfers_imported} transfer(s).");
-    }
-    if !state.held_transfers.is_empty() {
-        let _ = write!(
-            body,
-            "\n\u{2922} {} transfer(s) awaiting account mapping \u{2014} run `aba accounts`.",
-            state.held_transfers.len()
-        );
-    }
     notifier.notify("Actual import complete", &body).await.ok();
 
     Ok(())

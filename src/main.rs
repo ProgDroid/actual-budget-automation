@@ -8,6 +8,7 @@ mod matching;
 mod notify;
 mod pipeline;
 mod poll;
+mod report;
 mod state;
 mod telegram;
 
