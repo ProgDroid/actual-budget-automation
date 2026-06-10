@@ -6,8 +6,9 @@ mod http;
 mod lock;
 mod matching;
 mod notify;
+mod pipeline;
 mod poll;
-mod run;
+mod report;
 mod state;
 mod telegram;
 
@@ -87,7 +88,7 @@ async fn dispatch(cli: Cli, cfg: &Config) -> Result<()> {
         } => {
             #[cfg(feature = "auth-flow")]
             {
-                run::auth_monzo(cfg).await
+                pipeline::auth_monzo(cfg).await
             }
             #[cfg(not(feature = "auth-flow"))]
             {
@@ -144,7 +145,7 @@ async fn dispatch(cli: Cli, cfg: &Config) -> Result<()> {
 
             tokio::time::timeout(
                 std::time::Duration::from_mins(10),
-                run::run(
+                pipeline::run(
                     cfg,
                     dry_run,
                     &mut state,
@@ -161,7 +162,7 @@ async fn dispatch(cli: Cli, cfg: &Config) -> Result<()> {
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("run timed out after 600s")))
         }
-        Command::Accounts { write } => run::map_accounts(cfg, write).await,
+        Command::Accounts { write } => pipeline::map_accounts(cfg, write).await,
         Command::CheckConfig => {
             // Config::from_env() already succeeded before dispatch; validate
             // the lazily-checked knobs that would otherwise fail mid-run.
