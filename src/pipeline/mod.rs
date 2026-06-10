@@ -8,14 +8,16 @@ use tracing::{info, warn};
 
 use crate::actual::ActualClient;
 use crate::actual::shim_protocol::ImportTxn;
-use crate::banks::{BankError, BankSource, RawTransaction, TransferTarget};
+#[cfg(test)]
+use crate::banks::TransferTarget;
+use crate::banks::{BankError, BankSource, RawTransaction};
 use crate::claude::{Classification, ClaudeMatcher, Confidence};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
 use crate::matching::matches_scheduled;
 use crate::notify::Notifier;
 #[cfg(test)]
 use crate::state::{AccountLink, PendingReview, PotLink};
-use crate::state::{ClassifiedHold, HeldTransfer, State};
+use crate::state::{ClassifiedHold, State};
 use crate::telegram::ConfirmChannel;
 use crate::telegram::prompts::{rehold_failed_remaps, send_group_prompts};
 
@@ -28,7 +30,7 @@ pub use accounts::map_accounts;
 mod classify;
 use classify::{apply_matches, category_id_for, payee_id_for, plan_resolution};
 mod transfer;
-use transfer::{actual_id_for, resolve_transfer_dest, transfer_payee_id};
+use transfer::actual_id_for;
 mod import;
 use import::{hold_unmapped, schedules_from_rows};
 // Re-exported (not just `use`d) because the top-level `report` module —
@@ -101,58 +103,10 @@ pub async fn run(
         fetched.into_iter().partition(|t| t.transfer.is_some());
     let fetched_count = fetched.len();
 
-    // ---- Flex mirror handling (Phase 3, Flex) --------------------------------
-    // A `monzo_flex` line on the Flex feed mirrors a main-side transfer. Suppress
-    // it when its twin (same abs amount + date) is a main-side Account(flex)
-    // transfer this run; otherwise hold it (fail-loud). Re-evaluate prior held
-    // mirrors too, so a mirror held in an earlier run resolves once its twin arrives.
-    let flex_account_id: Option<String> = state
-        .monzo
-        .accounts
-        .iter()
-        .find(|a| a.is_flex)
-        .map(|a| a.monzo_id.clone());
-
-    // Keys of main-side Flex transfers THIS run: (abs amount, "YYYY-MM-DD").
-    // (abs amount, date) is imprecise for same-amount same-day duplicates: it
-    // suppresses rather than double-imports (the main side fully represents the
-    // movement), so this is the safe direction. Rare in practice.
-    let main_flex_keys: std::collections::BTreeSet<(i64, String)> = transfer_rows
-        .iter()
-        .filter(|t| match (&t.transfer, &flex_account_id) {
-            (Some(TransferTarget::Account(dest)), Some(fid)) => dest == fid,
-            _ => false,
-        })
-        .map(|t| (t.amount_minor.abs(), t.date.format("%Y-%m-%d").to_string()))
-        .collect();
-
-    // Split mirrors out so the Account/Pot intent loop below never sees them.
-    let (mirror_rows, transfer_rows): (Vec<RawTransaction>, Vec<RawTransaction>) = transfer_rows
-        .into_iter()
-        .partition(|t| matches!(t.transfer, Some(TransferTarget::FlexMirror)));
-
-    // Pull prior held mirrors out of the durable queue; we re-decide their fate.
-    let prior_held_mirrors: Vec<HeldTransfer> = state
-        .held_transfers
-        .iter()
-        .filter(|h| h.target_kind == "flex_mirror")
-        .cloned()
-        .collect();
-    state
-        .held_transfers
-        .retain(|h| h.target_kind != "flex_mirror");
-
-    let mut flex_mirrors_suppressed = 0usize;
-    // from_row is infallible here: every mirror_rows entry carries Some(FlexMirror).
-    let new_mirror_hts = mirror_rows.iter().filter_map(HeldTransfer::from_row);
-    for ht in prior_held_mirrors.into_iter().chain(new_mirror_hts) {
-        let key = (ht.amount.abs(), ht.date.clone());
-        if main_flex_keys.contains(&key) {
-            flex_mirrors_suppressed += 1; // paired -> drop (Actual recreates this side)
-        } else {
-            state.enqueue_held_transfer(ht); // unpaired -> hold (dedup by external_id)
-        }
-    }
+    // ---- Flex mirror handling (Phase 3, Flex): suppress mirrors paired with a
+    // main-side Flex transfer this run; hold unpaired ones (fail-loud). ----
+    let (transfer_rows, flex_mirrors_suppressed) =
+        transfer::reconcile_flex_mirrors(state, transfer_rows);
 
     // 3. Read Actual payees + schedules + categories. `get_payees` must stay
     // strictly before `get_categories`: the rotated-token regression test injects
@@ -215,70 +169,23 @@ pub async fn run(
         categories_available,
     );
 
-    // Clone links so the routing closure/holds don't fight the borrow checker
-    // against `state` mutations below. Cheap: a handful of entries.
+    // Clone links so the routing/holds don't fight the borrow checker against
+    // `state` mutations below. Cheap: a handful of entries.
     let account_links = state.monzo.accounts.clone();
+    let pot_links = state.monzo.pots.clone();
 
     // 6. Assemble import rows (payee NAME -> id; never auto-create on the matched path).
     let mut grouped: BTreeMap<String, Vec<ImportTxn>> = BTreeMap::new();
     let mut held = 0usize;
 
-    // ---- Phase 3: transfers (retry queue + newly fetched) ----
-    // Transfers bypass the Claude/payee/category pipeline: resolve dest -> Actual
-    // account -> that account's transfer payee, and import ONE uncategorised row
-    // into the SOURCE account's group (Actual auto-creates the linked counterpart).
-    let pot_links = state.monzo.pots.clone();
-    // Work list: previously-held transfers (retry) + newly fetched, deduped by external_id.
-    // NOTE: flex_mirror HeldTransfers enqueued by the Flex mirror block above are
-    // deliberately re-cloned here and re-held via FlexMirror -> resolve_transfer_dest
-    // None -> still_held. Do NOT move the mirror block below this clone.
-    let mut transfer_intents: Vec<HeldTransfer> = state.held_transfers.clone();
-    for row in &transfer_rows {
-        if let Some(ht) = HeldTransfer::from_row(row)
-            && !transfer_intents
-                .iter()
-                .any(|h| h.external_id == ht.external_id)
-        {
-            transfer_intents.push(ht);
-        }
+    // ---- Phase 3: transfers (retry queue + newly fetched). Seed `grouped` with
+    // these FIRST so transfers keep their original position ahead of ordinary
+    // imports within each account group. ----
+    let (xfer_rows, transfers_imported) =
+        transfer::resolve_intents(state, &transfer_rows, &account_links, &pot_links, &payees);
+    for (aid, row) in xfer_rows {
+        grouped.entry(aid).or_default().push(row);
     }
-
-    let mut still_held: Vec<HeldTransfer> = Vec::new();
-    let mut transfers_imported = 0usize;
-    for ht in transfer_intents {
-        let Some(target) = ht.target() else {
-            warn!(
-                "held transfer {} has unknown target_kind '{}'; re-holding (state corruption?)",
-                ht.external_id, ht.target_kind
-            );
-            still_held.push(ht);
-            continue;
-        };
-        let dest = resolve_transfer_dest(&target, &pot_links, &account_links);
-        let src = actual_id_for(&ht.source_monzo_id, &account_links);
-        match (src, dest) {
-            (Some(src_actual), Some(dest_actual)) => {
-                if let Some(pid) = transfer_payee_id(&payees, &dest_actual) {
-                    grouped.entry(src_actual).or_default().push(ImportTxn {
-                        date: ht.date.clone(),
-                        amount: ht.amount,
-                        payee: pid.to_string(),
-                        category: None, // transfers are uncategorised
-                        imported_id: ht.external_id.clone(),
-                    });
-                    transfers_imported += 1;
-                } else {
-                    warn!(
-                        "no transfer payee for account {dest_actual}; re-holding transfer {}",
-                        ht.external_id
-                    );
-                    still_held.push(ht);
-                }
-            }
-            _ => still_held.push(ht), // source and/or dest unmapped -> keep, retry next run
-        }
-    }
-    state.held_transfers = still_held;
 
     let make_row = |tx: &RawTransaction, payee_id: &str, category_id: Option<String>| ImportTxn {
         date: tx.date.format("%Y-%m-%d").to_string(),
