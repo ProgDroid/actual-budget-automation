@@ -46,7 +46,7 @@ fn build_channel(cfg: &Config) -> Option<HttpTelegram> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -54,14 +54,51 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = Config::from_env()?;
+    // Config problems are operator errors: exit 2 so cron alerting can
+    // distinguish "fix your env" from a transient runtime failure (exit 1).
+    let cfg = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("configuration error: {e:#}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if let Err(e) = Confidence::from_env_str(&cfg.autoimport_confidence) {
+        tracing::error!("configuration error: {e:#}");
+        return std::process::ExitCode::from(2);
+    }
+    match dispatch(cli, &cfg).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
+#[allow(
+    clippy::too_many_lines,   // dispatch is a thin command router; splitting it adds no clarity
+    clippy::future_not_send  // non-Send dyn traits (&mut dyn BankSource etc.) are safe: single-threaded run loop
+)]
+async fn dispatch(cli: Cli, cfg: &Config) -> Result<()> {
     match cli.command {
         Command::Auth {
             which: AuthCommand::Monzo,
-        } => run::auth_monzo(&cfg).await,
+        } => {
+            #[cfg(feature = "auth-flow")]
+            {
+                run::auth_monzo(cfg).await
+            }
+            #[cfg(not(feature = "auth-flow"))]
+            {
+                anyhow::bail!(
+                    "this binary was built without the auth-flow feature (production image); \
+                     run `aba auth monzo` from a dev build instead"
+                )
+            }
+        }
         Command::Poll => {
-            let Some(channel) = build_channel(&cfg) else {
+            let Some(channel) = build_channel(cfg) else {
                 tracing::info!("Telegram not configured; poll is a no-op");
                 return Ok(());
             };
@@ -73,7 +110,7 @@ async fn main() -> Result<()> {
             let mut state = State::load(&cfg.state_path)?;
             match tokio::time::timeout(
                 std::time::Duration::from_mins(10),
-                poll(&cfg, &mut state, &channel),
+                poll(cfg, &mut state, &channel),
             )
             .await
             {
@@ -102,13 +139,13 @@ async fn main() -> Result<()> {
             );
             let claude = HttpClaude::new(cfg.anthropic_api_key.clone(), cfg.claude_model.clone());
             let notifier = HttpApprise::new(cfg.apprise_url.clone());
-            let channel = build_channel(&cfg);
+            let channel = build_channel(cfg);
             let autoimport = Confidence::from_env_str(&cfg.autoimport_confidence)?;
 
             tokio::time::timeout(
                 std::time::Duration::from_mins(10),
                 run::run(
-                    &cfg,
+                    cfg,
                     dry_run,
                     &mut state,
                     &mut bank,
@@ -124,6 +161,24 @@ async fn main() -> Result<()> {
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("run timed out after 600s")))
         }
-        Command::Accounts { write } => run::map_accounts(&cfg, write).await,
+        Command::Accounts { write } => run::map_accounts(cfg, write).await,
+        Command::CheckConfig => {
+            // Config::from_env() already succeeded before dispatch; validate
+            // the lazily-checked knobs that would otherwise fail mid-run.
+            Confidence::from_env_str(&cfg.autoimport_confidence)?;
+            match (&cfg.telegram_bot_token, &cfg.telegram_chat_id) {
+                (Some(_), Some(chat)) => {
+                    chat.parse::<i64>().map_err(|_| {
+                        anyhow::anyhow!("TELEGRAM_CHAT_ID is not a valid integer: {chat}")
+                    })?;
+                }
+                (None, None) => {}
+                _ => anyhow::bail!(
+                    "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set together (or neither)"
+                ),
+            }
+            println!("config OK");
+            Ok(())
+        }
     }
 }

@@ -741,6 +741,7 @@ pub async fn run(
     channel: Option<&dyn ConfirmChannel>,
     autoimport: Confidence,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     // 1. Auth. Monzo rotates the refresh token on every successful refresh and
     // invalidates the previous one server-side, so persist the rotated token to
     // disk IMMEDIATELY — before any fallible fetch/Actual work. Otherwise a later
@@ -1301,11 +1302,6 @@ pub async fn run(
         summary.added += s.added;
         summary.updated += s.updated;
     }
-    info!(
-        "imported added={} updated={} held={held} flex_mirrors_suppressed={flex_mirrors_suppressed}",
-        summary.added, summary.updated
-    );
-
     state.last_run = Some(fetch_start);
 
     // Send one prompt per merchant group for everything still held.
@@ -1321,6 +1317,18 @@ pub async fn run(
         .map(|p| p.raw_merchant.as_str())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    info!(
+        fetched = fetched_count,
+        added = summary.added,
+        updated = summary.updated,
+        held,
+        transfers_imported,
+        flex_mirrors_suppressed,
+        awaiting_merchants = awaiting,
+        held_transfers = state.held_transfers.len(),
+        duration_secs = started.elapsed().as_secs(),
+        "run complete"
+    );
     let mut body = format!(
         "Added {}, updated {}, held {} for review.",
         summary.added, summary.updated, held
@@ -1349,6 +1357,7 @@ pub async fn run(
     Ok(())
 }
 
+#[cfg(feature = "auth-flow")]
 /// Generate an unguessable 128-bit OAuth `state` nonce, hex-encoded (32 chars).
 fn random_state() -> anyhow::Result<String> {
     let mut buf = [0u8; 16];
@@ -1359,6 +1368,7 @@ fn random_state() -> anyhow::Result<String> {
     }))
 }
 
+#[cfg(feature = "auth-flow")]
 /// Verify the OAuth `state` echoed back on the redirect matches what we sent.
 /// # Errors
 /// Errors if `returned` is absent or does not equal `expected` (possible CSRF).
@@ -1370,6 +1380,7 @@ fn verify_state(expected: &str, returned: Option<&str>) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "auth-flow")]
 /// One-time Monzo OAuth bootstrap. Run on a machine with a browser.
 pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     let redirect = url::Url::parse(&cfg.monzo_redirect_uri)
@@ -1393,7 +1404,16 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to bind {port}: {e}"))?;
     println!("Waiting for redirect on 127.0.0.1:{port} ...");
 
-    let request = server.recv().context("listener error")?;
+    // Bounded wait: a browser that never redirects must not hang the command
+    // forever. 300s is generous for the Monzo consent screen.
+    let request = server
+        .recv_timeout(std::time::Duration::from_mins(5))
+        .context("listener error")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "timed out after 300s waiting for the Monzo redirect; re-run `aba auth monzo`"
+            )
+        })?;
     let url = format!("http://localhost{}", request.url());
     let parsed = url::Url::parse(&url).context("bad redirect URL")?;
     let code = parsed
@@ -1447,6 +1467,7 @@ pub async fn auth_monzo(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "auth-flow")]
 /// Minimal percent-encoding for query parameters.
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -3941,21 +3962,25 @@ let b='';process.stdin.on('data',c=>b+=c);process.stdin.on('end',()=>{
         assert_eq!(schedules[0].payee, "Rent Co");
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn verify_state_accepts_exact_match() {
         assert!(super::verify_state("abc123", Some("abc123")).is_ok());
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn verify_state_rejects_mismatch() {
         assert!(super::verify_state("abc123", Some("nope")).is_err());
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn verify_state_rejects_missing() {
         assert!(super::verify_state("abc123", None).is_err());
     }
 
+    #[cfg(feature = "auth-flow")]
     #[test]
     fn random_state_is_32_hex_chars_and_varies() {
         let a = super::random_state().unwrap();

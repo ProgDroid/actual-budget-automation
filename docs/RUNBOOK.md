@@ -1,6 +1,11 @@
 # aba Runbook
 
 ## One-time Monzo bootstrap (on a machine with a browser)
+
+> **Note:** The production container image is built `--no-default-features` and will
+> refuse `aba auth monzo` with an error; run this command from a dev build instead
+> (it requires a browser anyway).
+
 1. Register a Monzo OAuth client at https://developers.monzo.com with redirect
    URI `http://localhost:8080/callback` (confidential client).
 2. Export env: `MONZO_CLIENT_ID`, `MONZO_CLIENT_SECRET`,

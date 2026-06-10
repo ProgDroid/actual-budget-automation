@@ -109,6 +109,31 @@ fn action_from_code(code: &str) -> Option<ReplyAction> {
     }
 }
 
+/// Telegram rejects message text over 4096 characters with HTTP 400 — which
+/// would re-fail identically every run (same failure shape as the old
+/// Markdown bug). We cap BYTES at 4096: byte count >= char count in UTF-8,
+/// so this is conservative (may over-truncate multibyte text, never under).
+// `pub(crate)` is deliberate (crate-internal API, not for export); the module
+// is private so clippy's nursery `redundant_pub_crate` flags it — allow it.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) const TELEGRAM_TEXT_LIMIT: usize = 4096;
+
+/// Cap text at the Telegram limit on a char boundary, appending `…` when cut.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn truncate_for_telegram(text: &str) -> String {
+    if text.len() <= TELEGRAM_TEXT_LIMIT {
+        return text.to_string();
+    }
+    let budget = TELEGRAM_TEXT_LIMIT - '…'.len_utf8();
+    let cut = (0..=budget)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    let mut out = text[..cut].to_string();
+    out.push('…');
+    out
+}
+
 /// Parse a `getUpdates` `result` array into replies + the next offset. Updates
 /// from any chat other than `allowed_chat_id` are ignored, but every consumed
 /// update still advances the offset (so foreign spam is never re-read forever).
@@ -178,7 +203,7 @@ pub fn parse_get_updates(
 pub fn build_send_request(prompt: &Prompt, chat_id: i64) -> Value {
     let mut body = json!({
         "chat_id": chat_id,
-        "text": prompt.chat_text,
+        "text": truncate_for_telegram(&prompt.chat_text),
     });
     if !prompt.buttons.is_empty() {
         let row: Vec<Value> = prompt
@@ -313,7 +338,7 @@ impl ConfirmChannel for HttpTelegram {
         let body = json!({
             "chat_id": self.chat_id,
             "message_id": message_id,
-            "text": text
+            "text": truncate_for_telegram(text)
         });
         let resp = self
             .http
@@ -680,5 +705,25 @@ mod tests {
             !chain.contains("SUPERSECRET"),
             "token must be redacted: {chain}"
         );
+    }
+
+    #[test]
+    fn truncate_caps_at_telegram_limit_on_char_boundary() {
+        // 5000 multibyte chars (é is 2 bytes in UTF-8) — must cap by BYTES without
+        // splitting a char, and end with an ellipsis.
+        let long: String = "é".repeat(5000);
+        let t = truncate_for_telegram(&long);
+        assert!(
+            t.len() <= TELEGRAM_TEXT_LIMIT,
+            "byte len {} > limit",
+            t.len()
+        );
+        assert!(t.ends_with('…'), "must signal truncation");
+        assert!(t.is_char_boundary(t.len() - '…'.len_utf8()));
+    }
+
+    #[test]
+    fn truncate_leaves_short_text_untouched() {
+        assert_eq!(truncate_for_telegram("hello"), "hello");
     }
 }

@@ -65,11 +65,22 @@ pub struct ScheduleRow {
     pub payee_id: Option<String>,
 }
 
+/// Returns `None`; used as a serde `default` for `Option<T>` fields where `T`
+/// may not implement `Default`.
+const fn none<T>() -> Option<T> {
+    None
+}
+
+/// Flat shim envelope. The shim always emits `ok`; `data` xor `error` is
+/// populated. An explicit discriminant (not `#[serde(untagged)]`) so a future
+/// shim change can never silently misparse into the wrong variant.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ShimResponse<T> {
-    Ok { data: T },
-    Err { error: String },
+pub struct ShimResponse<T> {
+    pub ok: bool,
+    #[serde(default = "none")]
+    pub data: Option<T>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]
@@ -183,17 +194,30 @@ mod tests {
     }
 
     #[test]
-    fn response_deserialises_ok_and_error() {
+    fn response_parses_ok_and_error_via_discriminant() {
         let ok: ShimResponse<Vec<Payee>> = serde_json::from_value(serde_json::json!({
             "ok": true, "data": [{ "id": "p1", "name": "Amazon" }]
         }))
         .unwrap();
-        assert!(matches!(ok, ShimResponse::Ok { .. }));
+        assert!(ok.ok);
+        assert_eq!(ok.data.unwrap().len(), 1);
+        assert_eq!(ok.error, None);
 
         let err: ShimResponse<Vec<Payee>> = serde_json::from_value(serde_json::json!({
             "ok": false, "error": "boom"
         }))
         .unwrap();
-        assert!(matches!(err, ShimResponse::Err { .. }));
+        assert!(!err.ok);
+        assert!(err.data.is_none());
+        assert_eq!(err.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn response_ok_true_without_data_is_parseable_but_dataless() {
+        // The mod.rs caller turns this into an explicit error instead of a panic.
+        let r: ShimResponse<Vec<Payee>> =
+            serde_json::from_value(serde_json::json!({ "ok": true })).unwrap();
+        assert!(r.ok);
+        assert!(r.data.is_none());
     }
 }

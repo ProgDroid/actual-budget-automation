@@ -8,7 +8,7 @@ FROM rust:1-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef49
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --bin aba
+RUN cargo build --release --bin aba --no-default-features
 
 # --- Node deps stage ---
 # Digest resolved 2026-06-02 via: docker buildx imagetools inspect node:22-slim

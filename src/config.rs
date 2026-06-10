@@ -38,6 +38,8 @@ pub enum Command {
         #[arg(long)]
         write: bool,
     },
+    /// Validate environment configuration and exit (deploy smoke test).
+    CheckConfig,
 }
 
 #[derive(Debug, Subcommand)]
