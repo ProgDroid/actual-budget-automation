@@ -4,15 +4,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use anyhow::Context;
-use chrono::{NaiveDate, Utc};
+use chrono::Utc;
 use tracing::{info, warn};
 
 use crate::actual::ActualClient;
-use crate::actual::shim_protocol::{ImportTxn, Payee, ScheduleRow};
+use crate::actual::shim_protocol::ImportTxn;
 use crate::banks::{BankError, BankSource, RawTransaction, TransferTarget};
 use crate::claude::{Classification, ClaudeMatcher, Confidence};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
-use crate::matching::{Schedule, best_payee_match, matches_scheduled};
+use crate::matching::{best_payee_match, matches_scheduled};
 use crate::notify::Notifier;
 use crate::state::{AccountLink, ClassifiedHold, HeldTransfer, PendingReview, PotLink, State};
 use crate::telegram::{ConfirmChannel, Prompt};
@@ -21,6 +21,8 @@ mod classify;
 use classify::{apply_matches, category_id_for, payee_id_for, plan_resolution};
 mod transfer;
 use transfer::{actual_id_for, resolve_transfer_dest, transfer_payee_id};
+mod import;
+use import::{hold_unmapped, schedules_from_rows};
 // Re-exported (not just `use`d) because a later task adds a top-level `report`
 // module — a sibling of `pipeline`, not a descendant — that needs
 // `crate::pipeline::HeldClassification`, and `mod classify;` is private.
@@ -33,56 +35,6 @@ pub mod testutil;
 /// Minimum normalised-name similarity for `aba accounts` to auto-link a Monzo
 /// account to an Actual account; below this the row is left unmapped.
 const ACCOUNT_MATCH_THRESHOLD: f64 = 0.6;
-
-/// Hold a transaction whose source Monzo account is not mapped to an Actual
-/// account (no routing target yet). Payee/category default to unsettled.
-fn hold_unmapped(state: &mut State, tx: &RawTransaction, held: &mut usize) {
-    let date = tx.date.format("%Y-%m-%d").to_string();
-    if state.add_pending(
-        &tx.external_id,
-        &tx.raw_merchant,
-        tx.amount_minor,
-        &date,
-        &tx.source_monzo_id,
-    ) {
-        *held += 1;
-    }
-}
-
-/// Build `Schedule`s for matching by resolving each row's payee id to a name.
-fn schedules_from_rows(rows: Vec<ScheduleRow>, payees: &[Payee]) -> Vec<Schedule> {
-    let by_id: BTreeMap<&str, &str> = payees
-        .iter()
-        .map(|p| (p.id.as_str(), p.name.as_str()))
-        .collect();
-    rows.into_iter()
-        .filter_map(|r| {
-            let Some(date_str) = r.date.as_deref() else {
-                warn!("schedule dropped: missing date (payee_id={:?})", r.payee_id);
-                return None;
-            };
-            let date = match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!("schedule dropped: unparseable date '{date_str}': {e}");
-                    return None;
-                }
-            };
-            let Some(payee) = r.payee_id.as_deref().and_then(|id| by_id.get(id).copied()) else {
-                warn!(
-                    "schedule dropped: payee_id {:?} not in payee list",
-                    r.payee_id
-                );
-                return None;
-            };
-            Some(Schedule {
-                amount: r.amount,
-                date,
-                payee: payee.to_string(),
-            })
-        })
-        .collect()
-}
 
 /// Build the Telegram prompt for a held entry, choosing the dimension to prompt:
 /// - If the payee dimension is unsettled → payee prompt (3 flavors, unchanged):
@@ -3151,44 +3103,6 @@ pub mod tests {
         assert_eq!(j.actual_id, "u2");
         let x = links.iter().find(|l| l.monzo_id == "acc_x").unwrap();
         assert_eq!(x.actual_id, "", "no confident match → unmapped");
-    }
-
-    #[test]
-    fn schedules_from_rows_drops_bad_date_and_missing_payee_loudly() {
-        let payees = vec![Payee {
-            id: "p1".into(),
-            name: "Rent Co".into(),
-            transfer_acct: None,
-        }];
-        let rows = vec![
-            // good
-            ScheduleRow {
-                date: Some("2026-06-01".into()),
-                amount: Some(-1000),
-                payee_id: Some("p1".into()),
-            },
-            // bad date -> dropped
-            ScheduleRow {
-                date: Some("not-a-date".into()),
-                amount: Some(-1000),
-                payee_id: Some("p1".into()),
-            },
-            // missing date -> dropped
-            ScheduleRow {
-                date: None,
-                amount: Some(-1000),
-                payee_id: Some("p1".into()),
-            },
-            // payee not in list -> dropped
-            ScheduleRow {
-                date: Some("2026-06-02".into()),
-                amount: Some(-1000),
-                payee_id: Some("nope".into()),
-            },
-        ];
-        let schedules = super::schedules_from_rows(rows, &payees);
-        assert_eq!(schedules.len(), 1, "only the fully-valid row survives");
-        assert_eq!(schedules[0].payee, "Rent Co");
     }
 
     #[cfg(feature = "auth-flow")]
