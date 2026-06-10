@@ -283,7 +283,7 @@ pub async fn run(
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::testutil::*;
     use super::*;
     use chrono::NaiveDate;
