@@ -204,6 +204,7 @@ pub async fn send_group_prompts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{ExternalTxId, MonzoAccountId};
     use crate::pipeline::testutil::*;
 
     #[test]
@@ -213,7 +214,7 @@ mod tests {
         // proposed, suggestion exists -> confirm/create/skip
         let proposed = PendingReview {
             external_id: "tx1".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "SQ *CAFE".into(),
             amount: -450,
             date: "2026-06-01".into(),
@@ -247,7 +248,7 @@ mod tests {
         // no-match -> create/skip only
         let unmatched = PendingReview {
             external_id: "tx2".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "MYSTERY".into(),
             amount: -10,
             date: "2026-06-01".into(),
@@ -271,7 +272,7 @@ mod tests {
         // failed remap: suggestion set but NOT in payees -> "create it?" flavor
         let failed = PendingReview {
             external_id: "tx3".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "X".into(),
             amount: -10,
             date: "2026-06-01".into(),
@@ -304,7 +305,7 @@ mod tests {
         // pathologically long external_id no longer drops the inline keyboard.
         let payees = vec!["Tesco".to_string()];
         let entry = PendingReview {
-            external_id: "z".repeat(200),
+            external_id: ExternalTxId::from("z".repeat(200)),
             source_monzo_id: "acc_1".into(),
             raw_merchant: "SQ *CAFE".into(),
             amount: -100,
@@ -333,7 +334,7 @@ mod tests {
         let cats = vec!["Dining".to_string(), "Groceries".to_string()];
         let entry = PendingReview {
             external_id: "tx1".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "SQ *CAFE".into(),
             amount: -450,
             date: "2026-06-01".into(),
@@ -372,7 +373,7 @@ mod tests {
         let cats = vec!["Dining".to_string()];
         let entry = PendingReview {
             external_id: "tx2".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "SQ *CAFE".into(),
             amount: -450,
             date: "2026-06-01".into(),

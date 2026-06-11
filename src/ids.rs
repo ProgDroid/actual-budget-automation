@@ -6,10 +6,18 @@
 //! **Serde is `transparent`**: on the wire (`state.json`, the Node shim JSON
 //! protocol) each id is just its inner string — byte-identical to the
 //! pre-newtype representation. Validation lives ONLY in the smart constructors
-//! (`new`), which are called at ingestion boundaries (Monzo / Actual JSON parse).
+//! (`new`), which are called at the Monzo JSON-parse ingestion boundary.
 //! `Deserialize` is deliberately NOT validated, so a persisted state file or a
 //! shim response never fails to load. `Default` likewise yields an unvalidated
 //! empty id for struct-update ergonomics in tests.
+//!
+//! Two construction paths, by intent:
+//! - `new(..) -> Result<Self, IdError>` — **validating**; use at the Monzo
+//!   ingestion boundary where bad data must be rejected. (`ActualAccountId` has
+//!   no `new`: see the note on its `impl`.)
+//! - `From<String>` / `From<&str>` — **unchecked**; use for in-memory moves and
+//!   for reconstructing already-trusted persisted ids (the in-memory twin of the
+//!   unchecked transparent `Deserialize`).
 
 use std::fmt;
 
@@ -24,8 +32,6 @@ pub enum IdError {
     MonzoPot(String),
     #[error("external transaction id must not be empty")]
     EmptyExternalTx,
-    #[error("Actual account id must not be empty")]
-    EmptyActualAccount,
 }
 
 macro_rules! string_newtype {
@@ -44,12 +50,6 @@ macro_rules! string_newtype {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
-
-            /// Consume the newtype, returning the inner `String`.
-            #[must_use]
-            pub fn into_inner(self) -> String {
-                self.0
-            }
         }
 
         impl fmt::Display for $name {
@@ -61,6 +61,21 @@ macro_rules! string_newtype {
         impl AsRef<str> for $name {
             fn as_ref(&self) -> &str {
                 &self.0
+            }
+        }
+
+        // Unchecked construction (see module docs): for in-memory moves and
+        // reconstructing already-trusted persisted ids. Validation lives in
+        // `new`, used at ingestion boundaries only.
+        impl From<String> for $name {
+            fn from(s: String) -> Self {
+                Self(s)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(s: &str) -> Self {
+                Self(s.to_owned())
             }
         }
     };
@@ -113,22 +128,11 @@ impl MonzoPotId {
     }
 }
 
-impl ActualAccountId {
-    /// Construct from a raw string, rejecting the empty string (which would
-    /// collide with the historical "unmapped" sentinel — now modelled as
-    /// `Option::None`).
-    ///
-    /// # Errors
-    /// Returns [`IdError::EmptyActualAccount`] if `s` is empty.
-    pub fn new(s: impl Into<String>) -> Result<Self, IdError> {
-        let s = s.into();
-        if s.is_empty() {
-            Err(IdError::EmptyActualAccount)
-        } else {
-            Ok(Self(s))
-        }
-    }
-}
+// `ActualAccountId` has no validating `new`: its values originate only from
+// Actual's own database via the trusted (transparent, unchecked) `Deserialize`
+// path, or from the `opt_actual_empty` adapter below — never from an untrusted
+// raw string. The empty-string hazard a constructor would guard is structurally
+// impossible here: "unmapped" is modelled as `Option::None`, not `""`.
 
 impl ExternalTxId {
     /// Construct from a raw string, rejecting the empty string.
@@ -155,6 +159,9 @@ pub mod opt_actual_empty {
 
     /// # Errors
     /// Propagates the serializer's error.
+    // serde's `#[serde(with = ...)]` contract fixes this signature to take
+    // `&Option<T>`; `Option<&T>` would not satisfy it.
+    #[allow(clippy::ref_option)]
     pub fn serialize<S: Serializer>(v: &Option<ActualAccountId>, s: S) -> Result<S::Ok, S::Error> {
         match v {
             Some(id) => s.serialize_str(id.as_str()),
@@ -197,9 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_and_external_reject_empty() {
-        assert!(ActualAccountId::new("uuid").is_ok());
-        assert_eq!(ActualAccountId::new(""), Err(IdError::EmptyActualAccount));
+    fn external_tx_rejects_empty() {
         assert!(ExternalTxId::new("tx_1").is_ok());
         assert_eq!(ExternalTxId::new(""), Err(IdError::EmptyExternalTx));
     }

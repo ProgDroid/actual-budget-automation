@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{ActualAccountId, ExternalTxId};
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ShimRequest {
@@ -10,7 +12,7 @@ pub enum ShimRequest {
     GetScheduled,
     GetCategories,
     ImportTransactions {
-        account_id: String,
+        account_id: ActualAccountId,
         transactions: Vec<ImportTxn>,
     },
     CreatePayee {
@@ -28,12 +30,12 @@ pub struct ImportTxn {
     /// (Actual leaves the transaction uncategorised).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    pub imported_id: String,
+    pub imported_id: ExternalTxId,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Account {
-    pub id: String,
+    pub id: ActualAccountId,
     pub name: String,
 }
 
@@ -45,7 +47,7 @@ pub struct Payee {
     /// transaction with this payee creates a linked transfer into that account.
     /// `None`/absent for ordinary payees.
     #[serde(default)]
-    pub transfer_acct: Option<String>,
+    pub transfer_acct: Option<ActualAccountId>,
 }
 
 /// An assignable Actual category (real categories carry a `group_id`; the shim

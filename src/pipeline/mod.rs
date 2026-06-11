@@ -13,6 +13,7 @@ use crate::banks::TransferTarget;
 use crate::banks::{BankError, BankSource, RawTransaction};
 use crate::claude::{Classification, ClaudeMatcher, Confidence};
 use crate::config::{Config, DATE_TOLERANCE_DAYS, PAYEE_THRESHOLD};
+use crate::ids::ActualAccountId;
 use crate::matching::matches_scheduled;
 use crate::notify::Notifier;
 use crate::state::State;
@@ -171,7 +172,7 @@ pub async fn run(
     let pot_links = state.monzo.pots.clone();
 
     // 6. Assemble import rows (payee NAME -> id; never auto-create on the matched path).
-    let mut grouped: BTreeMap<String, Vec<ImportTxn>> = BTreeMap::new();
+    let mut grouped: BTreeMap<ActualAccountId, Vec<ImportTxn>> = BTreeMap::new();
 
     // ---- Phase 3: transfers (retry queue + newly fetched). Seed `grouped` with
     // these FIRST so transfers keep their original position ahead of ordinary
@@ -286,6 +287,7 @@ pub async fn run(
 mod tests {
     use super::testutil::*;
     use super::*;
+    use crate::ids::{ExternalTxId, MonzoAccountId};
     use chrono::NaiveDate;
 
     #[test]
@@ -322,7 +324,7 @@ mod tests {
         // tx() tags source_monzo_id "acc_1"; map it so the eventual import routes.
         state.monzo.accounts.push(crate::state::AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "acc".into(),
+            actual_id: Some(ActualAccountId::from("acc")),
             ..Default::default()
         });
         let mut bank = FakeBank {
@@ -415,12 +417,12 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "u1".into(),
+            actual_id: Some(ActualAccountId::from("u1")),
             ..Default::default()
         });
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_2".into(),
-            actual_id: "u2".into(),
+            actual_id: Some(ActualAccountId::from("u2")),
             ..Default::default()
         });
 
@@ -511,13 +513,13 @@ mod tests {
         // Source account mapped: acc_cur -> act-cur.
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
         // Pot mapped: pot_abc -> act-pot.
         state.monzo.pots.push(PotLink {
             monzo_pot_id: "pot_abc".into(),
-            actual_id: "act-pot".into(),
+            actual_id: Some(ActualAccountId::from("act-pot")),
             ..Default::default()
         });
 
@@ -580,7 +582,7 @@ mod tests {
         // Source mapped, but the pot is NOT mapped (pots empty).
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
 
@@ -615,7 +617,7 @@ mod tests {
         let ht = &state.held_transfers[0];
         assert_eq!(ht.target_kind, "pot");
         assert_eq!(ht.target_id, "pot_abc");
-        assert_eq!(ht.source_monzo_id, "acc_cur");
+        assert_eq!(ht.source_monzo_id.as_str(), "acc_cur");
         assert!(
             state.pending_reviews.is_empty(),
             "transfers do NOT use the Telegram review path"
@@ -639,7 +641,7 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
 
@@ -679,7 +681,7 @@ mod tests {
         // Now map the pot.
         state.monzo.pots.push(PotLink {
             monzo_pot_id: "pot_abc".into(),
-            actual_id: "act-pot".into(),
+            actual_id: Some(ActualAccountId::from("act-pot")),
             ..Default::default()
         });
 
@@ -746,7 +748,7 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
 
@@ -819,12 +821,12 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_flex".into(),
-            actual_id: "act-flex".into(),
+            actual_id: Some(ActualAccountId::from("act-flex")),
             is_flex: true,
             ..Default::default()
         });
@@ -895,12 +897,12 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_flex".into(),
-            actual_id: "act-flex".into(),
+            actual_id: Some(ActualAccountId::from("act-flex")),
             is_flex: true,
             ..Default::default()
         });
@@ -960,12 +962,12 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_flex".into(),
-            actual_id: "act-flex".into(),
+            actual_id: Some(ActualAccountId::from("act-flex")),
             is_flex: true,
             ..Default::default()
         });
@@ -1054,7 +1056,7 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_cur".into(),
-            actual_id: "act-cur".into(),
+            actual_id: Some(ActualAccountId::from("act-cur")),
             ..Default::default()
         });
         // is_flex = true but actual_id empty (unmapped):
@@ -1335,7 +1337,7 @@ mod tests {
             payee_cache: BTreeMap::from([("KEPT".to_string(), "Kept Payee".to_string())]),
             pending_reviews: vec![PendingReview {
                 external_id: "p1".into(),
-                source_monzo_id: String::new(),
+                source_monzo_id: MonzoAccountId::default(),
                 raw_merchant: "RESOLVE_ME".into(),
                 amount: -100,
                 date: "2026-06-01".into(),
@@ -1467,7 +1469,7 @@ mod tests {
                 account_id: "acc".into(),
                 accounts: vec![crate::state::AccountLink {
                     monzo_id: "acc_1".into(),
-                    actual_id: "acc".into(),
+                    actual_id: Some(ActualAccountId::from("acc")),
                     ..Default::default()
                 }],
                 pots: Vec::new(),
@@ -1522,7 +1524,7 @@ mod tests {
             1,
             "resolved review still on disk -> retry is clean (state not saved on failure)"
         );
-        assert_eq!(on_disk.pending_reviews[0].external_id, "tx_x");
+        assert_eq!(on_disk.pending_reviews[0].external_id.as_str(), "tx_x");
     }
 
     #[tokio::test]
@@ -1539,13 +1541,13 @@ mod tests {
         // the live payee list, with an existing prompt message_id (500).
         let mut state = State::default();
         state.add_pending_full(
-            "tx1",
+            &ExternalTxId::from("tx1"),
             "SQ *CAFE",
             -450,
             "2026-06-01",
             Some("Local Cafe".into()),
             Some("medium".into()),
-            "",
+            &MonzoAccountId::default(),
         );
         state.pending_reviews[0].telegram_message_id = Some(500);
         assert!(state.remap_pending("tx1", "Nonexistent Payee"));
@@ -1596,13 +1598,13 @@ mod tests {
 
         let mut state = State::default();
         state.add_pending_full(
-            "tx1",
+            &ExternalTxId::from("tx1"),
             "SQ *CAFE",
             -450,
             "2026-06-01",
             Some("Local Cafe".into()),
             Some("medium".into()),
-            "",
+            &MonzoAccountId::default(),
         );
         state.pending_reviews[0].telegram_message_id = Some(500);
         assert!(state.remap_pending("tx1", "Nonexistent Payee"));
@@ -1678,7 +1680,7 @@ mod tests {
         );
         // ...held for review with the proposed name as the suggestion...
         assert_eq!(state.pending_reviews.len(), 1);
-        assert_eq!(state.pending_reviews[0].external_id, "tx_ghost");
+        assert_eq!(state.pending_reviews[0].external_id.as_str(), "tx_ghost");
         assert_eq!(
             state.pending_reviews[0].suggestion.as_deref(),
             Some("Ghost Payee")
@@ -1706,7 +1708,7 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "acc".into(),
+            actual_id: Some(ActualAccountId::from("acc")),
             ..Default::default()
         });
         // Cached: payee exists in the shim; category "Utilities" does NOT.
@@ -1743,7 +1745,7 @@ mod tests {
         );
         assert_eq!(state.pending_reviews.len(), 1);
         let pr = &state.pending_reviews[0];
-        assert_eq!(pr.external_id, "tx_cafe");
+        assert_eq!(pr.external_id.as_str(), "tx_cafe");
         // Payee dimension PRE-SETTLED to the still-valid cached payee.
         assert!(pr.payee_settled(), "payee must be pre-settled");
         assert_eq!(pr.resolve_to, "Local Cafe");
@@ -1777,12 +1779,12 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "u1".into(),
+            actual_id: Some(ActualAccountId::from("u1")),
             ..Default::default()
         });
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_2".into(),
-            actual_id: "u2".into(),
+            actual_id: Some(ActualAccountId::from("u2")),
             ..Default::default()
         });
 
@@ -1832,10 +1834,11 @@ mod tests {
         let reheld = state
             .pending_reviews
             .iter()
-            .find(|p| p.external_id == "tx_unmapped")
+            .find(|p| p.external_id.as_str() == "tx_unmapped")
             .expect("resolved-but-unmapped review must be re-held, not dropped");
         assert_eq!(
-            reheld.source_monzo_id, "acc_unmapped",
+            reheld.source_monzo_id.as_str(),
+            "acc_unmapped",
             "source preserved for re-routing once mapped"
         );
         assert_eq!(
@@ -1849,7 +1852,7 @@ mod tests {
             on_disk
                 .pending_reviews
                 .iter()
-                .any(|p| p.external_id == "tx_unmapped"),
+                .any(|p| p.external_id.as_str() == "tx_unmapped"),
             "re-hold must survive the successful run's save"
         );
     }
@@ -1870,7 +1873,7 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(crate::state::AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "acc".into(),
+            actual_id: Some(ActualAccountId::from("acc")),
             ..Default::default()
         });
         let mut bank = FakeBank {
@@ -1926,7 +1929,7 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(crate::state::AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "acc".into(),
+            actual_id: Some(ActualAccountId::from("acc")),
             ..Default::default()
         });
         let mut bank = FakeBank {
@@ -2012,7 +2015,7 @@ mod tests {
         let mut state = State::default();
         state.monzo.accounts.push(AccountLink {
             monzo_id: "acc_flex".into(),
-            actual_id: "act-flex".into(),
+            actual_id: Some(ActualAccountId::from("act-flex")),
             is_flex: true,
             ..Default::default()
         });

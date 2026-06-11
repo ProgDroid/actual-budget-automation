@@ -5,6 +5,7 @@ use tracing::warn;
 use crate::actual::shim_protocol::{Category, Payee};
 use crate::banks::RawTransaction;
 use crate::claude::{Classification, Confidence};
+use crate::ids::ExternalTxId;
 
 /// Result of splitting fetched transactions against the payee + category caches.
 #[derive(Debug, PartialEq, Eq)]
@@ -12,7 +13,7 @@ pub struct ResolutionPlan {
     /// (`external_id`, `payee_name`, `category_name`) for FULL cache hits.
     /// Convention: an empty `category_name` String is the "uncategorised"
     /// sentinel (so `cached[i].2 == ""` means cached as uncategorised).
-    pub cached: Vec<(String, String, String)>,
+    pub cached: Vec<(ExternalTxId, String, String)>,
     /// Distinct raw merchant names that need a Claude lookup.
     pub needs_claude: Vec<String>,
 }
@@ -67,7 +68,7 @@ pub struct MatchOutcome {
     /// (`external_id`, `payee_name`, `category_name`) confident in BOTH dimensions.
     /// Convention: an empty `category_name` String is the "uncategorised"
     /// sentinel (so `matched[i].2 == ""` when no categories exist). Imported now.
-    pub matched: Vec<(String, String, String)>,
+    pub matched: Vec<(ExternalTxId, String, String)>,
     /// Held: at least one dimension uncertain.
     pub held: Vec<HeldClassification>,
 }
@@ -259,7 +260,7 @@ mod tests {
         assert_eq!(
             outcome.matched,
             vec![(
-                "1".to_string(),
+                ExternalTxId::from("1"),
                 "Tesco".to_string(),
                 "Groceries".to_string()
             )]
@@ -269,7 +270,7 @@ mod tests {
         let h2 = outcome
             .held
             .iter()
-            .find(|h| h.tx.external_id == "2")
+            .find(|h| h.tx.external_id.as_str() == "2")
             .unwrap();
         assert_eq!(h2.payee_resolved.as_deref(), Some("Local Cafe")); // pre-settled
         assert_eq!(h2.category_suggestion.as_deref(), Some("Dining"));
@@ -278,7 +279,7 @@ mod tests {
         let h3 = outcome
             .held
             .iter()
-            .find(|h| h.tx.external_id == "3")
+            .find(|h| h.tx.external_id.as_str() == "3")
             .unwrap();
         assert_eq!(h3.payee_resolved, None);
         assert_eq!(h3.payee_suggestion, None);

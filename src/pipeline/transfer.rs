@@ -2,22 +2,26 @@ use tracing::warn;
 
 use crate::actual::shim_protocol::{ImportTxn, Payee};
 use crate::banks::{RawTransaction, TransferTarget};
+use crate::ids::{ActualAccountId, MonzoAccountId};
 use crate::state::{AccountLink, HeldTransfer, PotLink, State};
 
 /// Resolve the Actual account id for a source Monzo account.
 /// Falls back to the sole mapped account when there's exactly one (covers
 /// single-account users and legacy held items with an empty source). Returns
 /// `None` when the source is unknown and the mapping is ambiguous → caller holds.
-pub fn actual_id_for(source_monzo_id: &str, links: &[AccountLink]) -> Option<String> {
+pub fn actual_id_for(
+    source_monzo_id: &MonzoAccountId,
+    links: &[AccountLink],
+) -> Option<ActualAccountId> {
     if let Some(l) = links
         .iter()
-        .find(|l| l.monzo_id == source_monzo_id && !l.actual_id.is_empty())
+        .find(|l| &l.monzo_id == source_monzo_id && l.actual_id.is_some())
     {
-        return Some(l.actual_id.clone());
+        return l.actual_id.clone();
     }
-    let mapped: Vec<&AccountLink> = links.iter().filter(|l| !l.actual_id.is_empty()).collect();
+    let mapped: Vec<&AccountLink> = links.iter().filter(|l| l.actual_id.is_some()).collect();
     if let [only] = mapped.as_slice() {
-        Some(only.actual_id.clone())
+        only.actual_id.clone()
     } else {
         None
     }
@@ -25,30 +29,30 @@ pub fn actual_id_for(source_monzo_id: &str, links: &[AccountLink]) -> Option<Str
 
 /// Find the transfer payee id for an Actual account (a payee whose
 /// `transfer_acct` equals `actual_id`). Actual auto-creates one per account.
-pub fn transfer_payee_id<'a>(payees: &'a [Payee], actual_id: &str) -> Option<&'a str> {
+pub fn transfer_payee_id<'a>(payees: &'a [Payee], actual_id: &ActualAccountId) -> Option<&'a str> {
     payees
         .iter()
-        .find(|p| p.transfer_acct.as_deref() == Some(actual_id))
+        .find(|p| p.transfer_acct.as_ref() == Some(actual_id))
         .map(|p| p.id.as_str())
 }
 
 /// Resolve a transfer's destination to an Actual account id. `Pot` looks up
-/// `[[monzo.pots]]`; `Account` looks up `[[monzo.accounts]]`. Empty `actual_id`
-/// (present but unmapped) and a missing entry both yield `None` (caller holds).
+/// `[[monzo.pots]]`; `Account` looks up `[[monzo.accounts]]`. An unmapped
+/// (`None`) `actual_id` and a missing entry both yield `None` (caller holds).
 pub fn resolve_transfer_dest(
     target: &TransferTarget,
     pots: &[PotLink],
     accounts: &[AccountLink],
-) -> Option<String> {
+) -> Option<ActualAccountId> {
     match target {
         TransferTarget::Pot(pot_id) => pots
             .iter()
-            .find(|p| &p.monzo_pot_id == pot_id && !p.actual_id.is_empty())
-            .map(|p| p.actual_id.clone()),
+            .find(|p| &p.monzo_pot_id == pot_id && p.actual_id.is_some())
+            .and_then(|p| p.actual_id.clone()),
         TransferTarget::Account(acc_id) => accounts
             .iter()
-            .find(|a| &a.monzo_id == acc_id && !a.actual_id.is_empty())
-            .map(|a| a.actual_id.clone()),
+            .find(|a| &a.monzo_id == acc_id && a.actual_id.is_some())
+            .and_then(|a| a.actual_id.clone()),
         // F5 suppresses FlexMirror when the main-side twin is present; until
         // then it is held (None = unresolved destination).
         TransferTarget::FlexMirror => None,
@@ -67,7 +71,7 @@ pub fn reconcile_flex_mirrors(
     state: &mut State,
     transfer_rows: Vec<RawTransaction>,
 ) -> (Vec<RawTransaction>, usize) {
-    let flex_account_id: Option<String> = state
+    let flex_account_id: Option<MonzoAccountId> = state
         .monzo
         .accounts
         .iter()
@@ -135,8 +139,8 @@ pub fn resolve_intents(
     account_links: &[AccountLink],
     pot_links: &[PotLink],
     payees: &[Payee],
-) -> (Vec<(String, ImportTxn)>, usize) {
-    let mut rows: Vec<(String, ImportTxn)> = Vec::new();
+) -> (Vec<(ActualAccountId, ImportTxn)>, usize) {
+    let mut rows: Vec<(ActualAccountId, ImportTxn)> = Vec::new();
     let mut transfer_intents: Vec<HeldTransfer> = state.held_transfers.clone();
     for row in transfer_rows {
         if let Some(ht) = HeldTransfer::from_row(row)
@@ -199,24 +203,33 @@ mod tests {
         let links = vec![
             AccountLink {
                 monzo_id: "acc_1".into(),
-                actual_id: "u1".into(),
+                actual_id: Some("u1".into()),
                 ..Default::default()
             },
             AccountLink {
                 monzo_id: "acc_2".into(),
-                actual_id: "u2".into(),
+                actual_id: Some("u2".into()),
                 ..Default::default()
             },
         ];
-        assert_eq!(actual_id_for("acc_2", &links).as_deref(), Some("u2"));
-        assert_eq!(actual_id_for("acc_unknown", &links), None); // ambiguous → hold
+        assert_eq!(
+            actual_id_for(&MonzoAccountId::from("acc_2"), &links),
+            Some(ActualAccountId::from("u2"))
+        );
+        assert_eq!(
+            actual_id_for(&MonzoAccountId::from("acc_unknown"), &links),
+            None
+        ); // ambiguous → hold
 
         let single = vec![AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "u1".into(),
+            actual_id: Some("u1".into()),
             ..Default::default()
         }];
-        assert_eq!(actual_id_for("", &single).as_deref(), Some("u1")); // legacy fallback
+        assert_eq!(
+            actual_id_for(&MonzoAccountId::from(""), &single),
+            Some(ActualAccountId::from("u1"))
+        ); // legacy fallback
     }
 
     #[test]
@@ -234,8 +247,14 @@ mod tests {
                 transfer_acct: Some("act-pot".into()),
             },
         ];
-        assert_eq!(transfer_payee_id(&payees, "act-pot"), Some("p2"));
-        assert_eq!(transfer_payee_id(&payees, "act-missing"), None);
+        assert_eq!(
+            transfer_payee_id(&payees, &ActualAccountId::from("act-pot")),
+            Some("p2")
+        );
+        assert_eq!(
+            transfer_payee_id(&payees, &ActualAccountId::from("act-missing")),
+            None
+        );
     }
 
     #[test]
@@ -244,23 +263,23 @@ mod tests {
         let pots = vec![PotLink {
             monzo_pot_id: "pot_abc".into(),
             monzo_pot_name: "Savings".into(),
-            actual_id: "act-pot".into(),
+            actual_id: Some("act-pot".into()),
             actual_name: "Savings".into(),
         }];
         let accts = vec![AccountLink {
             monzo_id: "acc_joint".into(),
             monzo_name: "Joint".into(),
-            actual_id: "act-joint".into(),
+            actual_id: Some("act-joint".into()),
             actual_name: "Joint".into(),
             is_flex: false,
         }];
         assert_eq!(
             resolve_transfer_dest(&TransferTarget::Pot("pot_abc".into()), &pots, &accts),
-            Some("act-pot".to_string())
+            Some(ActualAccountId::from("act-pot"))
         );
         assert_eq!(
             resolve_transfer_dest(&TransferTarget::Account("acc_joint".into()), &pots, &accts),
-            Some("act-joint".to_string())
+            Some(ActualAccountId::from("act-joint"))
         );
         // FlexMirror has no resolvable destination (compile-forced default) -> None.
         // Guards against accidental change in F5.
@@ -277,7 +296,7 @@ mod tests {
         let pots_empty = vec![PotLink {
             monzo_pot_id: "pot_x".into(),
             monzo_pot_name: "X".into(),
-            actual_id: String::new(),
+            actual_id: None,
             actual_name: String::new(),
         }];
         assert_eq!(

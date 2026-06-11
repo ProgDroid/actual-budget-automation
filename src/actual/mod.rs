@@ -12,6 +12,8 @@ use tokio::process::Command;
 
 use shim_protocol::{Account, Category, ImportTxn, Payee, ScheduleRow, ShimRequest, ShimResponse};
 
+use crate::ids::ActualAccountId;
+
 /// Spawns the Node shim once per operation, exchanging JSON over stdin/stdout.
 pub struct ActualClient {
     /// Program to run (production: "node").
@@ -139,7 +141,7 @@ impl ActualClient {
     /// Returns an error if the shim fails to spawn, exits non-zero, or returns invalid JSON.
     pub async fn import_transactions(
         &self,
-        account_id: String,
+        account_id: ActualAccountId,
         transactions: Vec<ImportTxn>,
     ) -> anyhow::Result<ImportSummary> {
         self.call(&ShimRequest::ImportTransactions {
@@ -210,7 +212,13 @@ mod tests {
         );
         // Explicitly assert each path survived the round-trip.
         assert_eq!(payees[0].transfer_acct, None);
-        assert_eq!(payees[1].transfer_acct.as_deref(), Some("act-123"));
+        assert_eq!(
+            payees[1]
+                .transfer_acct
+                .as_ref()
+                .map(ActualAccountId::as_str),
+            Some("act-123")
+        );
     }
 
     #[test]
@@ -221,7 +229,13 @@ mod tests {
         ]"#;
         let payees: Vec<Payee> = serde_json::from_str(json).unwrap();
         assert_eq!(payees[0].transfer_acct, None);
-        assert_eq!(payees[1].transfer_acct.as_deref(), Some("act-uuid"));
+        assert_eq!(
+            payees[1]
+                .transfer_acct
+                .as_ref()
+                .map(ActualAccountId::as_str),
+            Some("act-uuid")
+        );
     }
 
     #[test]
