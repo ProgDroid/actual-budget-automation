@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use tracing::warn;
 
@@ -116,7 +117,6 @@ pub async fn rehold_failed_remaps(
     channel: Option<&dyn ConfirmChannel>,
     payee_names: &[String],
 ) {
-    use std::collections::BTreeSet;
     let mut edited: BTreeSet<i64> = BTreeSet::new();
     for pr in &mut state.pending_reviews {
         if !pr.create_new && !pr.resolve_to.is_empty() {
@@ -163,15 +163,13 @@ pub async fn send_group_prompts(
 /// Poll-side variant: send category prompts ONLY for the given `raw_merchant`s
 /// (the groups poll just settled this tick), using the cached Actual catalogs.
 /// Same per-merchant send/adopt/persist semantics as [`send_group_prompts`].
-// Called by poll (Task 3); not yet wired up in main binary.
-#[allow(dead_code)]
 pub async fn send_chained_category_prompts(
     state: &mut State,
     channel: &dyn ConfirmChannel,
     payee_names: &[String],
     category_names: &[String],
     state_path: &std::path::Path,
-    only: &std::collections::BTreeSet<String>,
+    only: &BTreeSet<String>,
 ) {
     send_group_prompts_inner(
         state,
@@ -192,7 +190,7 @@ async fn send_group_prompts_inner(
     payee_names: &[String],
     category_names: &[String],
     state_path: &std::path::Path,
-    restrict: Option<&std::collections::BTreeSet<String>>,
+    restrict: Option<&BTreeSet<String>>,
 ) {
     let mut order: Vec<String> = Vec::new();
     let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -567,7 +565,6 @@ mod tests {
 
     #[tokio::test]
     async fn send_chained_only_sends_for_listed_merchants() {
-        use std::collections::BTreeSet;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.toml");
 
