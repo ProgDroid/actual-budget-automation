@@ -1,4 +1,7 @@
-//! `aba poll`: drain Telegram replies into the state file. Never touches Actual.
+//! `aba poll`: drain Telegram replies into the state file. Talks only to
+//! Telegram, never to Actual — when a reply settles a payee with the category
+//! still open, it chains the category prompt immediately using the Actual
+//! catalogs cached in state by the last `run` (Phase D).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
