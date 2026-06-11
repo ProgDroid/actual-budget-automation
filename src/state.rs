@@ -31,6 +31,18 @@ pub struct State {
     /// raw merchant -> resolved Actual category name.
     #[serde(default)]
     pub category_cache: BTreeMap<String, String>,
+    /// Actual's live payee-name catalog. Snapshotted at the last successful
+    /// non-dry-run (dry runs update this in-memory but do not persist it).
+    /// Lets `poll` build a chained category prompt without touching Actual.
+    /// Distinct from `payee_cache` (a raw-merchant -> resolved-name map).
+    #[serde(default)]
+    pub actual_payee_names: Vec<String>,
+    /// Actual's live category-name catalog. Snapshotted at the last successful
+    /// non-dry-run (dry runs update this in-memory but do not persist it).
+    /// See [`State::actual_payee_names`]. Distinct from `category_cache` (a
+    /// raw-merchant -> resolved-name map).
+    #[serde(default)]
+    pub actual_category_names: Vec<String>,
     #[serde(default, rename = "pending_review")]
     pub pending_reviews: Vec<PendingReview>,
     /// Transfers awaiting account/pot mapping; retried every run (see [`HeldTransfer`]).
@@ -48,6 +60,8 @@ impl Default for State {
             monzo: MonzoState::default(),
             payee_cache: BTreeMap::new(),
             category_cache: BTreeMap::new(),
+            actual_payee_names: Vec::new(),
+            actual_category_names: Vec::new(),
             pending_reviews: Vec::new(),
             held_transfers: Vec::new(),
             telegram: TelegramState::default(),
