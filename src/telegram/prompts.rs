@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use tracing::warn;
 
@@ -116,7 +117,6 @@ pub async fn rehold_failed_remaps(
     channel: Option<&dyn ConfirmChannel>,
     payee_names: &[String],
 ) {
-    use std::collections::BTreeSet;
     let mut edited: BTreeSet<i64> = BTreeSet::new();
     for pr in &mut state.pending_reviews {
         if !pr.create_new && !pr.resolve_to.is_empty() {
@@ -149,6 +149,49 @@ pub async fn send_group_prompts(
     category_names: &[String],
     state_path: &std::path::Path,
 ) {
+    send_group_prompts_inner(
+        state,
+        channel,
+        payee_names,
+        category_names,
+        state_path,
+        None,
+    )
+    .await;
+}
+
+/// Poll-side variant: send category prompts ONLY for the given `raw_merchant`s
+/// (the groups poll just settled this tick), using the cached Actual catalogs.
+/// Same per-merchant send/adopt/persist semantics as [`send_group_prompts`].
+pub async fn send_chained_category_prompts(
+    state: &mut State,
+    channel: &dyn ConfirmChannel,
+    payee_names: &[String],
+    category_names: &[String],
+    state_path: &std::path::Path,
+    only: &BTreeSet<String>,
+) {
+    send_group_prompts_inner(
+        state,
+        channel,
+        payee_names,
+        category_names,
+        state_path,
+        Some(only),
+    )
+    .await;
+}
+
+/// `restrict = Some(set)` sends only for merchants in `set`; `None` sends for
+/// every held merchant (the `run()` path).
+async fn send_group_prompts_inner(
+    state: &mut State,
+    channel: &dyn ConfirmChannel,
+    payee_names: &[String],
+    category_names: &[String],
+    state_path: &std::path::Path,
+    restrict: Option<&BTreeSet<String>>,
+) {
     let mut order: Vec<String> = Vec::new();
     let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, p) in state.pending_reviews.iter().enumerate() {
@@ -164,6 +207,14 @@ pub async fn send_group_prompts(
     // run — see the Err arm below). Acceptable at current volume; add pacing
     // here if held-merchant counts ever grow large.
     for merchant in order {
+        // Poll's scoped path only re-prompts the groups it just settled; a
+        // resolved sibling is impossible here (run() imports+removes resolved
+        // entries each cycle and same-run same-merchant siblings share one
+        // Claude classification), so the cleared-to-None members are the only
+        // anchors and plain restriction is sufficient.
+        if restrict.is_some_and(|only| !only.contains(&merchant)) {
+            continue;
+        }
         let members = buckets[&merchant].clone();
         if let Some(id) = members
             .iter()
@@ -509,6 +560,56 @@ mod tests {
             state.pending_reviews[1].telegram_message_id,
             Some(777),
             "new member adopts the id"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_chained_only_sends_for_listed_merchants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+
+        // Two payee-settled, category-open groups, neither with a live prompt.
+        let cat_open = |id: &str, merch: &str| PendingReview {
+            external_id: id.into(),
+            source_monzo_id: MonzoAccountId::default(),
+            raw_merchant: merch.into(),
+            amount: -100,
+            date: "2026-06-01".into(),
+            resolve_to: "Local Cafe".into(), // payee settled
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Dining".into()),
+            category_confidence: Some("medium".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false, // category open
+            telegram_message_id: None,
+        };
+        let mut state = crate::state::State {
+            pending_reviews: vec![cat_open("a", "AAA"), cat_open("b", "BBB")],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+        let cats = vec!["Dining".to_string()];
+        let only: BTreeSet<String> = std::iter::once("AAA".to_string()).collect();
+
+        send_chained_category_prompts(&mut state, &channel, &[], &cats, &path, &only).await;
+
+        assert_eq!(channel.sent.lock().unwrap().len(), 1, "only AAA prompted");
+        let a = state
+            .pending_reviews
+            .iter()
+            .find(|p| p.raw_merchant == "AAA")
+            .unwrap();
+        let b = state
+            .pending_reviews
+            .iter()
+            .find(|p| p.raw_merchant == "BBB")
+            .unwrap();
+        assert!(a.telegram_message_id.is_some(), "AAA got a prompt id");
+        assert!(
+            b.telegram_message_id.is_none(),
+            "BBB excluded from the restrict set"
         );
     }
 }

@@ -1,9 +1,12 @@
-//! `aba poll`: drain Telegram replies into the state file. Never touches Actual.
+//! `aba poll`: drain Telegram replies into the state file. Talks only to
+//! Telegram, never to Actual — when a reply settles a payee with the category
+//! still open, it chains the category prompt immediately using the Actual
+//! catalogs cached in state by the last `run` (Phase D).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::state::State;
@@ -38,6 +41,10 @@ pub async fn poll(
     let valid: BTreeSet<String> = msg_map.values().cloned().collect();
 
     let mut applied = 0usize;
+    // Phase D: groups whose payee we settle THIS tick (category still open),
+    // keyed by raw_merchant -> the old prompt id (for keyboard tidy). Drives the
+    // chained category send below.
+    let mut settled: BTreeMap<String, Option<i64>> = BTreeMap::new();
     for r in &replies {
         if !valid.contains(&r.entry_key) {
             continue; // stale / spoofed group key
@@ -92,6 +99,12 @@ pub async fn poll(
                     .filter(|p| group_key(&p.raw_merchant) == r.entry_key)
                 {
                     if p.payee_settled() && !p.category_resolved {
+                        // Record (merchant, old prompt id) before clearing so we can
+                        // tidy the answered payee keyboard and send a fresh category
+                        // prompt below. Members share one id, so first-write wins.
+                        settled
+                            .entry(p.raw_merchant.clone())
+                            .or_insert(p.telegram_message_id);
                         p.telegram_message_id = None;
                     }
                 }
@@ -100,10 +113,45 @@ pub async fn poll(
         }
     }
 
+    chain_after_payee_settle(state, channel, &settled, &cfg.state_path).await;
+
     state.telegram.last_update_id = new_offset;
     state.save(&cfg.state_path)?;
     info!("poll applied {applied} group(s); offset now {new_offset}");
     Ok(applied)
+}
+
+/// Phase D: tidy the answered payee keyboards and send a chained category prompt
+/// for each merchant whose payee was settled this tick (category still open).
+/// Skip when the category cache is empty — fall back to `run()`'s next-cycle
+/// re-prompt (effectively unreachable in normal operation but guards old state).
+async fn chain_after_payee_settle(
+    state: &mut State,
+    channel: &dyn ConfirmChannel,
+    settled: &BTreeMap<String, Option<i64>>,
+    state_path: &std::path::Path,
+) {
+    if settled.is_empty() || state.actual_category_names.is_empty() {
+        return;
+    }
+    // Strip the answered payee keyboard once per distinct old message id.
+    let mut tidied: BTreeSet<i64> = BTreeSet::new();
+    for old in settled.values().copied().flatten() {
+        if tidied.insert(old)
+            && let Err(e) = channel
+                .edit_message_text(old, "✅ Payee set — now categorising…")
+                .await
+        {
+            warn!("telegram edit_message_text failed (stale payee keyboard left in chat): {e}");
+        }
+    }
+    let merchants: BTreeSet<String> = settled.keys().cloned().collect();
+    let payees = state.actual_payee_names.clone();
+    let cats = state.actual_category_names.clone();
+    crate::telegram::prompts::send_chained_category_prompts(
+        state, channel, &payees, &cats, state_path, &merchants,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -349,5 +397,185 @@ mod tests {
                 .all(|p| p.resolve_to == "Transport for London"),
             "both members resolved"
         );
+    }
+
+    // Phase D: a payee-settling reply chains straight into the category prompt.
+    fn payee_open_cat_open(id: &str, merch: &str, msg: Option<i64>) -> crate::state::PendingReview {
+        crate::state::PendingReview {
+            external_id: id.into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: merch.into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(), // payee unsettled
+            create_new: false,
+            suggestion: Some("Local Cafe".into()),
+            confidence: Some("medium".into()),
+            category_suggestion: Some("Dining".into()),
+            category_confidence: Some("medium".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false, // category open
+            telegram_message_id: msg,
+        }
+    }
+
+    #[tokio::test]
+    async fn payee_confirm_chains_category_prompt_immediately() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        let mut state = State {
+            actual_payee_names: vec!["Local Cafe".into()],
+            actual_category_names: vec!["Dining".into()],
+            ..State::default()
+        };
+        state
+            .pending_reviews
+            .push(payee_open_cat_open("tx1", "SQ *CAFE", Some(900)));
+
+        let channel = FakeChannel::new(
+            vec![Reply {
+                entry_key: crate::telegram::group_key("SQ *CAFE"),
+                action: ReplyAction::Confirm,
+            }],
+            55,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+
+        assert_eq!(applied, 1);
+        assert_eq!(state.pending_reviews[0].resolve_to, "Local Cafe"); // payee settled
+        // answered payee keyboard tidied (old id 900)
+        assert_eq!(channel.edits(), 1);
+        assert_eq!(channel.edited.lock().unwrap()[0].0, 900);
+        // a fresh category prompt was sent
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+        assert!(
+            channel.sent.lock().unwrap()[0]
+                .chat_text
+                .to_lowercase()
+                .contains("category")
+        );
+        // member adopted the new id (FakeChannel hands out 1001 first), not 900
+        assert_eq!(state.pending_reviews[0].telegram_message_id, Some(1001));
+    }
+
+    #[tokio::test]
+    async fn chaining_is_scoped_to_groups_settled_this_tick() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        let mut state = State {
+            actual_payee_names: vec!["Local Cafe".into()],
+            actual_category_names: vec!["Dining".into()],
+            ..State::default()
+        };
+        // Group A: payee unsettled, confirmed this tick.
+        state
+            .pending_reviews
+            .push(payee_open_cat_open("txA", "AAA", Some(900)));
+        // Group B: already payee-settled, category open, NO live prompt, NO reply
+        // this tick (e.g. a prior run failed to send). Poll must NOT prompt it.
+        state.pending_reviews.push(crate::state::PendingReview {
+            external_id: "txB".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "BBB".into(),
+            amount: -200,
+            date: "2026-06-01".into(),
+            resolve_to: "Local Cafe".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Dining".into()),
+            category_confidence: Some("medium".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+        });
+
+        let channel = FakeChannel::new(
+            vec![Reply {
+                entry_key: crate::telegram::group_key("AAA"),
+                action: ReplyAction::Confirm,
+            }],
+            55,
+        );
+        poll(&cfg, &mut state, &channel).await.unwrap();
+
+        assert_eq!(channel.sent.lock().unwrap().len(), 1, "only AAA prompted");
+        let b = state
+            .pending_reviews
+            .iter()
+            .find(|p| p.raw_merchant == "BBB")
+            .unwrap();
+        assert!(
+            b.telegram_message_id.is_none(),
+            "non-settled group B must stay unprompted"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_category_cache_falls_back_to_bare_clear() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        // actual_category_names deliberately left empty.
+        let mut state = State {
+            actual_payee_names: vec!["Local Cafe".into()],
+            ..State::default()
+        };
+        state
+            .pending_reviews
+            .push(payee_open_cat_open("tx1", "SQ *CAFE", Some(900)));
+
+        let channel = FakeChannel::new(
+            vec![Reply {
+                entry_key: crate::telegram::group_key("SQ *CAFE"),
+                action: ReplyAction::Confirm,
+            }],
+            55,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+
+        assert_eq!(applied, 1);
+        assert_eq!(state.pending_reviews[0].resolve_to, "Local Cafe"); // payee still settled
+        assert_eq!(channel.sent.lock().unwrap().len(), 0, "no chained prompt");
+        assert_eq!(channel.edits(), 0, "no keyboard tidy");
+        assert!(
+            state.pending_reviews[0].telegram_message_id.is_none(),
+            "bare-cleared for next run to re-prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_keyboard_tidy_does_not_abort_chaining() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        let mut state = State {
+            actual_payee_names: vec!["Local Cafe".into()],
+            actual_category_names: vec!["Dining".into()],
+            ..State::default()
+        };
+        state
+            .pending_reviews
+            .push(payee_open_cat_open("tx1", "SQ *CAFE", Some(900)));
+
+        let channel = FakeChannel::new(
+            vec![Reply {
+                entry_key: crate::telegram::group_key("SQ *CAFE"),
+                action: ReplyAction::Confirm,
+            }],
+            55,
+        )
+        .with_failing_edit();
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+
+        assert_eq!(applied, 1);
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "category prompt still sent despite the failed tidy"
+        );
+        assert_eq!(state.pending_reviews[0].resolve_to, "Local Cafe");
     }
 }

@@ -128,6 +128,10 @@ pub async fn run(
 
     // Build payee name list once (reused for remap normalisation and Claude call).
     let payee_names: Vec<String> = payees.iter().map(|p| p.name.clone()).collect();
+    // Phase D: snapshot the live Actual catalogs so `poll` can build the chained
+    // category prompt without touching Actual. Staleness is bounded by one run.
+    state.actual_payee_names.clone_from(&payee_names);
+    state.actual_category_names.clone_from(&category_names);
 
     // Normalise any free-text remap replies against the live payee list, so
     // `take_resolved` only ever folds a real existing payee into the cache.
@@ -2077,6 +2081,42 @@ mod tests {
         assert!(
             state.held_transfers.is_empty(),
             "not a transfer, nothing held"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_caches_actual_name_catalogs() {
+        // run() must snapshot Actual's payee + category catalogs into State so
+        // poll can build the chained category prompt without touching Actual.
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim); // payees [Local Cafe]; categories [Groceries, Dining]
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        let mut bank = FakeBank { txs: vec![] };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.actual_payee_names, vec!["Local Cafe".to_string()]);
+        assert_eq!(
+            state.actual_category_names,
+            vec!["Groceries".to_string(), "Dining".to_string()]
         );
     }
 
