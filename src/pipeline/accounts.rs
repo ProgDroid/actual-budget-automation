@@ -4,6 +4,7 @@ use tracing::warn;
 use crate::actual::ActualClient;
 use crate::banks::{BankError, BankSource as _};
 use crate::config::Config;
+use crate::ids::{ActualAccountId, MonzoAccountId, MonzoPotId};
 use crate::state::{AccountLink, PotLink, State};
 
 use super::auth::persist_rotated_token;
@@ -16,8 +17,8 @@ const ACCOUNT_MATCH_THRESHOLD: f64 = 0.6;
 /// account is linked to its best Actual match above `threshold`; below it the
 /// link is left unmapped (`actual_id` empty) for the user to fill in.
 fn suggest_links(
-    monzo: &[(String, String)],
-    actual: &[(String, String)],
+    monzo: &[(MonzoAccountId, String)],
+    actual: &[(ActualAccountId, String)],
     threshold: f64,
 ) -> Vec<AccountLink> {
     monzo
@@ -32,7 +33,7 @@ fn suggest_links(
                 Some((aid, aname, _)) => AccountLink {
                     monzo_id: mid.clone(),
                     monzo_name: mname.clone(),
-                    actual_id: aid.clone(),
+                    actual_id: Some(aid.clone()),
                     actual_name: aname.clone(),
                     is_flex: false,
                 },
@@ -49,8 +50,8 @@ fn suggest_links(
 /// `suggest_links` plus Flex auto-detection: flag any link whose Monzo
 /// description (stored in `monzo_name`) starts with `monzoflex_`.
 fn suggest_links_with_flex(
-    monzo: &[(String, String)],
-    actual: &[(String, String)],
+    monzo: &[(MonzoAccountId, String)],
+    actual: &[(ActualAccountId, String)],
     threshold: f64,
 ) -> Vec<AccountLink> {
     let mut links = suggest_links(monzo, actual, threshold);
@@ -70,8 +71,8 @@ fn suggest_links_with_flex(
 /// Auto-suggest Monzo-pot → Actual-account links by normalised-name similarity.
 /// Same policy as `suggest_links`: best match above `threshold`, else unmapped.
 fn suggest_pot_links(
-    pots: &[(String, String)],
-    actual: &[(String, String)],
+    pots: &[(MonzoPotId, String)],
+    actual: &[(ActualAccountId, String)],
     threshold: f64,
 ) -> Vec<PotLink> {
     pots.iter()
@@ -85,7 +86,7 @@ fn suggest_pot_links(
                 Some((aid, aname, _)) => PotLink {
                     monzo_pot_id: pid.clone(),
                     monzo_pot_name: pname.clone(),
-                    actual_id: aid.clone(),
+                    actual_id: Some(aid.clone()),
                     actual_name: aname.clone(),
                 },
                 None => PotLink {
@@ -131,7 +132,7 @@ pub async fn map_accounts(cfg: &Config, write: bool) -> anyhow::Result<()> {
         cfg.actual_password.clone(),
         cfg.actual_sync_id.clone(),
     );
-    let actual_accounts: Vec<(String, String)> = actual
+    let actual_accounts: Vec<(ActualAccountId, String)> = actual
         .get_accounts()
         .await
         .context("get_accounts")?
@@ -144,23 +145,22 @@ pub async fn map_accounts(cfg: &Config, write: bool) -> anyhow::Result<()> {
     println!("Suggested Monzo → Actual account mapping:");
     for l in &links {
         let flex = if l.is_flex { "  [FLEX]" } else { "" };
-        if l.actual_id.is_empty() {
-            println!(
+        match &l.actual_id {
+            Some(aid) => println!(
+                "  {} ({})  →  {} ({}){}",
+                l.monzo_name, l.monzo_id, l.actual_name, aid, flex
+            ),
+            None => println!(
                 "  {} ({})  →  [UNMAPPED — edit state file]{}",
                 l.monzo_name, l.monzo_id, flex
-            );
-        } else {
-            println!(
-                "  {} ({})  →  {} ({}){}",
-                l.monzo_name, l.monzo_id, l.actual_name, l.actual_id, flex
-            );
+            ),
         }
     }
 
     // Collect pots across all current accounts, then suggest Pot → Actual links.
-    let mut all_pots: Vec<(String, String)> = Vec::new();
+    let mut all_pots: Vec<(MonzoPotId, String)> = Vec::new();
     for (mid, _) in &monzo_accounts {
-        match bank.list_pots(mid).await {
+        match bank.list_pots(mid.as_str()).await {
             Ok(pots) => all_pots.extend(pots),
             Err(e) => warn!("could not list pots for {mid}: {}", bank_err_text(&e)),
         }
@@ -171,16 +171,15 @@ pub async fn map_accounts(cfg: &Config, write: bool) -> anyhow::Result<()> {
     } else {
         println!("\nSuggested Monzo pot → Actual account mapping:");
         for l in &pot_links {
-            if l.actual_id.is_empty() {
-                println!(
+            match &l.actual_id {
+                Some(aid) => println!(
+                    "  {} ({})  →  {} ({})",
+                    l.monzo_pot_name, l.monzo_pot_id, l.actual_name, aid
+                ),
+                None => println!(
                     "  {} ({})  →  [UNMAPPED — edit state file]",
                     l.monzo_pot_name, l.monzo_pot_id
-                );
-            } else {
-                println!(
-                    "  {} ({})  →  {} ({})",
-                    l.monzo_pot_name, l.monzo_pot_id, l.actual_name, l.actual_id
-                );
+                ),
             }
         }
     }
@@ -225,54 +224,78 @@ mod tests {
     #[test]
     fn suggest_links_matches_by_name_and_leaves_unmatched_unmapped() {
         let monzo = vec![
-            ("acc_1".to_string(), "Personal".to_string()),
-            ("acc_2".to_string(), "Joint Account".to_string()),
-            ("acc_x".to_string(), "Nothing Like It".to_string()),
+            (MonzoAccountId::from("acc_1"), "Personal".to_string()),
+            (MonzoAccountId::from("acc_2"), "Joint Account".to_string()),
+            (MonzoAccountId::from("acc_x"), "Nothing Like It".to_string()),
         ];
         let actual = vec![
-            ("u1".to_string(), "Monzo Personal".to_string()),
-            ("u2".to_string(), "Monzo Joint".to_string()),
+            (ActualAccountId::from("u1"), "Monzo Personal".to_string()),
+            (ActualAccountId::from("u2"), "Monzo Joint".to_string()),
         ];
         let links = suggest_links(&monzo, &actual, 0.6);
-        let p = links.iter().find(|l| l.monzo_id == "acc_1").unwrap();
-        assert_eq!(p.actual_id, "u1");
-        let j = links.iter().find(|l| l.monzo_id == "acc_2").unwrap();
-        assert_eq!(j.actual_id, "u2");
-        let x = links.iter().find(|l| l.monzo_id == "acc_x").unwrap();
-        assert_eq!(x.actual_id, "", "no confident match → unmapped");
+        let p = links
+            .iter()
+            .find(|l| l.monzo_id.as_str() == "acc_1")
+            .unwrap();
+        assert_eq!(p.actual_id, Some(ActualAccountId::from("u1")));
+        let j = links
+            .iter()
+            .find(|l| l.monzo_id.as_str() == "acc_2")
+            .unwrap();
+        assert_eq!(j.actual_id, Some(ActualAccountId::from("u2")));
+        let x = links
+            .iter()
+            .find(|l| l.monzo_id.as_str() == "acc_x")
+            .unwrap();
+        assert_eq!(x.actual_id, None, "no confident match → unmapped");
     }
 
     #[test]
     fn map_accounts_flags_flex_account_by_description_prefix() {
         let monzo = vec![
-            ("acc_cur".to_string(), "user_0000".to_string()),
-            ("acc_flex".to_string(), "monzoflex_0000".to_string()),
+            (MonzoAccountId::from("acc_cur"), "user_0000".to_string()),
+            (
+                MonzoAccountId::from("acc_flex"),
+                "monzoflex_0000".to_string(),
+            ),
         ];
         let actual = vec![
-            ("u-cur".to_string(), "Current".to_string()),
-            ("u-flex".to_string(), "Flex".to_string()),
+            (ActualAccountId::from("u-cur"), "Current".to_string()),
+            (ActualAccountId::from("u-flex"), "Flex".to_string()),
         ];
         let links = suggest_links_with_flex(&monzo, &actual, ACCOUNT_MATCH_THRESHOLD);
-        let flex = links.iter().find(|l| l.monzo_id == "acc_flex").unwrap();
+        let flex = links
+            .iter()
+            .find(|l| l.monzo_id.as_str() == "acc_flex")
+            .unwrap();
         assert!(flex.is_flex);
-        let cur = links.iter().find(|l| l.monzo_id == "acc_cur").unwrap();
+        let cur = links
+            .iter()
+            .find(|l| l.monzo_id.as_str() == "acc_cur")
+            .unwrap();
         assert!(!cur.is_flex);
     }
 
     #[test]
     fn suggest_pot_links_matches_by_name_and_leaves_unmatched_unmapped() {
         let pots = vec![
-            ("pot_abc".to_string(), "Savings".to_string()),
-            ("pot_xyz".to_string(), "Holiday".to_string()),
+            (MonzoPotId::from("pot_abc"), "Savings".to_string()),
+            (MonzoPotId::from("pot_xyz"), "Holiday".to_string()),
         ];
-        let actual = vec![("act-sav".to_string(), "Savings".to_string())];
+        let actual = vec![(ActualAccountId::from("act-sav"), "Savings".to_string())];
         let links = suggest_pot_links(&pots, &actual, ACCOUNT_MATCH_THRESHOLD);
         assert_eq!(links.len(), 2);
-        let sav = links.iter().find(|l| l.monzo_pot_id == "pot_abc").unwrap();
-        assert_eq!(sav.actual_id, "act-sav");
+        let sav = links
+            .iter()
+            .find(|l| l.monzo_pot_id.as_str() == "pot_abc")
+            .unwrap();
+        assert_eq!(sav.actual_id, Some(ActualAccountId::from("act-sav")));
         assert_eq!(sav.actual_name, "Savings");
-        let hol = links.iter().find(|l| l.monzo_pot_id == "pot_xyz").unwrap();
-        assert!(hol.actual_id.is_empty()); // no match -> unmapped
+        let hol = links
+            .iter()
+            .find(|l| l.monzo_pot_id.as_str() == "pot_xyz")
+            .unwrap();
+        assert_eq!(hol.actual_id, None); // no match -> unmapped
         assert_eq!(hol.monzo_pot_name, "Holiday");
     }
 }

@@ -3,6 +3,7 @@ mod banks;
 mod claude;
 mod config;
 mod http;
+mod ids;
 mod lock;
 mod matching;
 mod notify;

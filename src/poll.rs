@@ -47,7 +47,7 @@ pub async fn poll(
             .pending_reviews
             .iter()
             .filter(|p| group_key(&p.raw_merchant) == r.entry_key)
-            .map(|p| p.external_id.clone())
+            .map(|p| p.external_id.as_str().to_owned())
             .collect();
         // Members share raw_merchant, hence the same dimension/suggestion; the
         // first member decides whether a free-text remap targets payee or category.
@@ -109,6 +109,7 @@ pub async fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{ExternalTxId, MonzoAccountId};
     use crate::pipeline::testutil::FakeChannel;
     use crate::telegram::Reply;
     use tempfile::tempdir;
@@ -209,13 +210,13 @@ mod tests {
 
         let mut state = State::default();
         state.add_pending_full(
-            "tx1",
+            &ExternalTxId::from("tx1"),
             "SQ *CAFE",
             -450,
             "2026-06-01",
             Some("Local Cafe".into()),
             Some("medium".into()),
-            "",
+            &MonzoAccountId::default(),
         );
         state.pending_reviews[0].telegram_message_id = Some(500);
 
@@ -255,20 +256,20 @@ mod tests {
         // add_pending_full 7th arg is source_monzo_id, not resolve_to;
         // resolve_to is always initialised to "". We pass "" for monzo_id here.
         state.add_pending_full(
-            "txA",
+            &ExternalTxId::from("txA"),
             "SQ *CAFE",
             -100,
             "2026-06-01",
             Some("Local Cafe".into()),
             Some("medium".into()),
-            "",
+            &MonzoAccountId::default(),
         );
 
         // Member B: same merchant but payee already settled, category open.
         // Must be a struct literal because add_pending_full cannot set resolve_to.
         state.pending_reviews.push(crate::state::PendingReview {
             external_id: "txB".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "SQ *CAFE".into(),
             amount: -200,
             date: "2026-06-02".into(),
@@ -318,13 +319,13 @@ mod tests {
         let mut state = State::default();
         for ext in ["tx1", "tx2"] {
             state.add_pending_full(
-                ext,
+                &ExternalTxId::from(ext),
                 "TFL TRAVEL CH",
                 -250,
                 "2026-06-01",
                 Some("Transport for London".into()),
                 Some("medium".into()),
-                "",
+                &MonzoAccountId::default(),
             );
         }
         for p in &mut state.pending_reviews {

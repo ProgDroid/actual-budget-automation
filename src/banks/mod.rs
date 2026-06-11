@@ -5,6 +5,7 @@ pub mod monzo;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 
+use crate::ids::{ExternalTxId, MonzoAccountId, MonzoPotId};
 use crate::state::State;
 
 /// Destination of a transfer detected in the bank feed. Resolved to an Actual
@@ -12,10 +13,10 @@ use crate::state::State;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferTarget {
     /// Monzo pot id (`pot_…`), matched against `[[monzo.pots]]`.
-    Pot(String),
+    Pot(MonzoPotId),
     /// Destination Monzo account id (`acc_…`), matched against `[[monzo.accounts]]`.
     /// Used for the main-account side of a Monzo Flex transfer (id = the Flex account).
-    Account(String),
+    Account(MonzoAccountId),
     /// The Flex-account side of a `monzo_flex` transfer — a mirror with no unique
     /// data. Suppressed in `run()` when its main-side twin is present, else held.
     FlexMirror,
@@ -25,14 +26,14 @@ pub enum TransferTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTransaction {
     /// Bank's stable id; used as Actual's `imported_id` for idempotency.
-    pub external_id: String,
+    pub external_id: ExternalTxId,
     pub date: NaiveDate,
     /// Integer minor units (pence). Negative = outflow.
     pub amount_minor: i64,
     /// Best raw merchant string (merchant name, fallback description).
     pub raw_merchant: String,
     /// Monzo account id this transaction was fetched from; routes the import.
-    pub source_monzo_id: String,
+    pub source_monzo_id: MonzoAccountId,
     /// `Some` when this row is a transfer (pot move or inter-account); routes to
     /// the destination account's transfer payee instead of payee/category
     /// classification. `None` = ordinary transaction (Phase 1/2 path, unchanged).

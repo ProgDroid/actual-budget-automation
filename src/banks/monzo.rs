@@ -6,6 +6,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::banks::{BankError, BankSource, RawTransaction, TransferTarget};
+use crate::ids::{ExternalTxId, MonzoAccountId, MonzoPotId};
 use crate::state::{MonzoState, State};
 
 // `monzo` holds this bank's persisted MonzoState; the name mirrors the domain and
@@ -74,7 +75,7 @@ impl MonzoTx {
         if self.scheme == "uk_retail_pot"
             && let Some(pot_id) = self.metadata.pot_id.as_deref()
         {
-            return Some(TransferTarget::Pot(pot_id.to_owned()));
+            return Some(TransferTarget::Pot(MonzoPotId::from(pot_id)));
         }
         None
     }
@@ -88,8 +89,8 @@ impl MonzoTx {
     ///  - anything else (incl. `mastercard` direct Flex purchases) -> None (ordinary)
     fn transfer_target_flex(
         &self,
-        fetched_account_id: &str,
-        flex_account_id: Option<&str>,
+        fetched_account_id: &MonzoAccountId,
+        flex_account_id: Option<&MonzoAccountId>,
     ) -> Option<TransferTarget> {
         if let Some(t) = self.transfer_target() {
             return Some(t); // pots
@@ -97,7 +98,7 @@ impl MonzoTx {
         if self.scheme == "monzo_flex" {
             return match flex_account_id {
                 Some(fid) if fid != fetched_account_id => {
-                    Some(TransferTarget::Account(fid.to_owned()))
+                    Some(TransferTarget::Account(fid.clone()))
                 }
                 _ => Some(TransferTarget::FlexMirror),
             };
@@ -188,7 +189,7 @@ impl Monzo {
     /// `fetch_since` errors (no partial Ok).
     async fn fetch_account(
         &self,
-        monzo_id: &str,
+        monzo_id: &MonzoAccountId,
         since: DateTime<Utc>,
     ) -> Result<Vec<RawTransaction>, BankError> {
         let token = self
@@ -215,7 +216,7 @@ impl Monzo {
                 .get(format!("{}/transactions", self.base_url))
                 .bearer_auth(token)
                 .query(&[
-                    ("account_id", monzo_id),
+                    ("account_id", monzo_id.as_str()),
                     ("since", cursor.as_str()),
                     ("expand[]", "merchant"),
                     ("limit", "100"),
@@ -242,15 +243,14 @@ impl Monzo {
                 }
             }
         }
-        let flex_account_id: Option<String> = self
+        let flex_account_id: Option<MonzoAccountId> = self
             .monzo
             .accounts
             .iter()
             .find(|a| a.is_flex)
             .map(|a| a.monzo_id.clone());
-        let flex = flex_account_id.as_deref();
-        Ok(all
-            .into_iter()
+        let flex = flex_account_id.as_ref();
+        all.into_iter()
             .filter(|t| t.decline_reason.is_none())
             .map(|t| {
                 // Merchant first (card purchases), then counterparty (incoming
@@ -264,20 +264,27 @@ impl Monzo {
                     },
                 };
                 let transfer = t.transfer_target_flex(monzo_id, flex);
-                RawTransaction {
-                    external_id: t.id,
+                // Validate the bank id at the ingestion boundary; an empty id
+                // would break import idempotency, so fail loud rather than drop.
+                let external_id = ExternalTxId::new(&t.id).map_err(|e| {
+                    BankError::Other(anyhow::anyhow!(
+                        "Monzo returned a transaction with an invalid id: {e}"
+                    ))
+                })?;
+                Ok(RawTransaction {
+                    external_id,
                     date: t.created.date_naive(),
                     amount_minor: t.amount,
                     raw_merchant,
-                    source_monzo_id: monzo_id.to_string(),
+                    source_monzo_id: monzo_id.clone(),
                     transfer,
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// List open Monzo accounts as (id, name). Requires a prior `ensure_auth`.
-    pub async fn list_accounts(&self) -> Result<Vec<(String, String)>, BankError> {
+    pub async fn list_accounts(&self) -> Result<Vec<(MonzoAccountId, String)>, BankError> {
         let token = self
             .access_token
             .as_ref()
@@ -293,19 +300,29 @@ impl Monzo {
             return Err(e);
         }
         let list: AccountList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
-        Ok(list
-            .accounts
+        // Ingestion boundary: validate the `acc_` prefix, fail-loud on a malformed
+        // id rather than silently routing against a bad key.
+        list.accounts
             .into_iter()
             .filter(|a| !a.closed && is_mappable_account(&a.description))
-            .map(|a| (a.id, a.description))
-            .collect())
+            .map(|a| {
+                let description = a.description;
+                MonzoAccountId::new(a.id)
+                    .map(|id| (id, description))
+                    .map_err(|e| {
+                        BankError::Other(anyhow::anyhow!(
+                            "Monzo returned an invalid account id: {e}"
+                        ))
+                    })
+            })
+            .collect()
     }
 
     /// List active pots for a current account as (id, name). Informational only.
     pub async fn list_pots(
         &self,
         current_account_id: &str,
-    ) -> Result<Vec<(String, String)>, BankError> {
+    ) -> Result<Vec<(MonzoPotId, String)>, BankError> {
         let token = self
             .access_token
             .as_ref()
@@ -322,12 +339,17 @@ impl Monzo {
             return Err(e);
         }
         let list: PotList = resp.json().await.map_err(|e| BankError::Other(e.into()))?;
-        Ok(list
-            .pots
+        // Ingestion boundary: validate the `pot_` prefix, fail-loud on a malformed id.
+        list.pots
             .into_iter()
             .filter(|p| !p.deleted)
-            .map(|p| (p.id, p.name))
-            .collect())
+            .map(|p| {
+                let name = p.name;
+                MonzoPotId::new(p.id).map(|id| (id, name)).map_err(|e| {
+                    BankError::Other(anyhow::anyhow!("Monzo returned an invalid pot id: {e}"))
+                })
+            })
+            .collect()
     }
 }
 
@@ -424,7 +446,7 @@ impl BankSource for Monzo {
         let mut out = Vec::new();
         for link in &self.monzo.accounts {
             // Empty monzo_id is not expected post-migration; defensive skip.
-            if link.monzo_id.is_empty() {
+            if link.monzo_id.as_str().is_empty() {
                 warn!("skipping account link with empty monzo_id");
                 continue;
             }
@@ -439,6 +461,7 @@ impl BankSource for Monzo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::ActualAccountId;
     use crate::state::State;
     use chrono::TimeZone;
     use wiremock::matchers::{method, path, query_param};
@@ -451,10 +474,10 @@ mod tests {
             base,
             crate::state::MonzoState {
                 refresh_token: "old_rt".into(),
-                account_id: String::new(),
+                account_id: MonzoAccountId::default(),
                 accounts: vec![crate::state::AccountLink {
                     monzo_id: "acc_1".into(),
-                    actual_id: "uuid-1".into(),
+                    actual_id: Some(ActualAccountId::from("uuid-1")),
                     ..Default::default()
                 }],
                 pots: Vec::new(),
@@ -530,7 +553,7 @@ mod tests {
         let txs = m.fetch_since(since).await.unwrap();
 
         assert_eq!(txs.len(), 2);
-        assert_eq!(txs[0].external_id, "tx_1");
+        assert_eq!(txs[0].external_id.as_str(), "tx_1");
         assert_eq!(txs[0].raw_merchant, "Some Cafe");
         assert_eq!(txs[1].raw_merchant, "AMZNMKTPLACE");
         assert_eq!(txs[1].amount_minor, -1999);
@@ -588,7 +611,7 @@ mod tests {
             "http://unused".into(),
             crate::state::MonzoState {
                 refresh_token: "rt".into(),
-                account_id: String::new(),
+                account_id: MonzoAccountId::default(),
                 accounts: Vec::new(),
                 pots: Vec::new(),
             },
@@ -668,8 +691,8 @@ mod tests {
             102,
             "both pages should be fetched and concatenated"
         );
-        assert_eq!(txs[0].external_id, "tx_0");
-        assert_eq!(txs[101].external_id, "tx_101");
+        assert_eq!(txs[0].external_id.as_str(), "tx_0");
+        assert_eq!(txs[101].external_id.as_str(), "tx_101");
         assert_eq!(txs[101].amount_minor, -300);
     }
 
@@ -721,7 +744,7 @@ mod tests {
 
         // 60 non-declined from page 1 + 1 from page 2 = 61.
         assert_eq!(txs.len(), 61);
-        assert_eq!(txs[60].external_id, "tx_100");
+        assert_eq!(txs[60].external_id.as_str(), "tx_100");
     }
 
     #[tokio::test]
@@ -813,7 +836,7 @@ mod tests {
         m.set_access_token_for_test("at_x".into());
         let txs = m.fetch_since(since).await.unwrap();
 
-        assert_eq!(txs.last().unwrap().external_id, "tx_100");
+        assert_eq!(txs.last().unwrap().external_id.as_str(), "tx_100");
     }
 
     #[tokio::test]
@@ -892,16 +915,16 @@ mod tests {
             server.uri(),
             crate::state::MonzoState {
                 refresh_token: "rt".into(),
-                account_id: String::new(),
+                account_id: MonzoAccountId::default(),
                 accounts: vec![
                     crate::state::AccountLink {
                         monzo_id: "acc_1".into(),
-                        actual_id: "u1".into(),
+                        actual_id: Some(ActualAccountId::from("u1")),
                         ..Default::default()
                     },
                     crate::state::AccountLink {
                         monzo_id: "acc_2".into(),
-                        actual_id: "u2".into(),
+                        actual_id: Some(ActualAccountId::from("u2")),
                         ..Default::default()
                     },
                 ],
@@ -913,10 +936,10 @@ mod tests {
         let txs = m.fetch_since(since).await.unwrap();
 
         assert_eq!(txs.len(), 2);
-        let a = txs.iter().find(|t| t.external_id == "a1").unwrap();
-        let b = txs.iter().find(|t| t.external_id == "b1").unwrap();
-        assert_eq!(a.source_monzo_id, "acc_1");
-        assert_eq!(b.source_monzo_id, "acc_2");
+        let a = txs.iter().find(|t| t.external_id.as_str() == "a1").unwrap();
+        let b = txs.iter().find(|t| t.external_id.as_str() == "b1").unwrap();
+        assert_eq!(a.source_monzo_id.as_str(), "acc_1");
+        assert_eq!(b.source_monzo_id.as_str(), "acc_2");
     }
 
     #[tokio::test]
@@ -935,7 +958,10 @@ mod tests {
         let mut m = client(server.uri());
         m.set_access_token_for_test("at_x".into());
         let accts = m.list_accounts().await.unwrap();
-        assert_eq!(accts, vec![("acc_1".to_string(), "Personal".to_string())]);
+        assert_eq!(
+            accts,
+            vec![(MonzoAccountId::from("acc_1"), "Personal".to_string())]
+        );
     }
 
     #[test]
@@ -1012,7 +1038,10 @@ mod tests {
             metadata: TxMetadata { pot_id: None },
         };
         assert_eq!(
-            tx.transfer_target_flex("acc_cur", Some("acc_flex")),
+            tx.transfer_target_flex(
+                &MonzoAccountId::from("acc_cur"),
+                Some(&MonzoAccountId::from("acc_flex"))
+            ),
             Some(TransferTarget::Account("acc_flex".into()))
         );
     }
@@ -1031,7 +1060,10 @@ mod tests {
             metadata: TxMetadata { pot_id: None },
         };
         assert_eq!(
-            tx.transfer_target_flex("acc_flex", Some("acc_flex")),
+            tx.transfer_target_flex(
+                &MonzoAccountId::from("acc_flex"),
+                Some(&MonzoAccountId::from("acc_flex"))
+            ),
             Some(TransferTarget::FlexMirror)
         );
     }
@@ -1050,7 +1082,7 @@ mod tests {
             metadata: TxMetadata { pot_id: None },
         };
         assert_eq!(
-            tx.transfer_target_flex("acc_cur", None),
+            tx.transfer_target_flex(&MonzoAccountId::from("acc_cur"), None),
             Some(TransferTarget::FlexMirror)
         );
     }
@@ -1070,7 +1102,13 @@ mod tests {
             scheme: "mastercard".into(),
             metadata: TxMetadata { pot_id: None },
         };
-        assert_eq!(tx.transfer_target_flex("acc_flex", Some("acc_flex")), None);
+        assert_eq!(
+            tx.transfer_target_flex(
+                &MonzoAccountId::from("acc_flex"),
+                Some(&MonzoAccountId::from("acc_flex"))
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1089,7 +1127,10 @@ mod tests {
             },
         };
         assert_eq!(
-            tx.transfer_target_flex("acc_cur", Some("acc_flex")),
+            tx.transfer_target_flex(
+                &MonzoAccountId::from("acc_cur"),
+                Some(&MonzoAccountId::from("acc_flex"))
+            ),
             Some(TransferTarget::Pot("pot_abc".into()))
         );
     }
@@ -1110,6 +1151,9 @@ mod tests {
         let mut m = client(server.uri());
         m.set_access_token_for_test("at_x".into());
         let pots = m.list_pots("acc_1").await.unwrap();
-        assert_eq!(pots, vec![("pot_1".to_string(), "Savings".to_string())]);
+        assert_eq!(
+            pots,
+            vec![(MonzoPotId::from("pot_1"), "Savings".to_string())]
+        );
     }
 }

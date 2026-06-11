@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::actual::shim_protocol::ImportTxn;
+use crate::ids::ActualAccountId;
 use crate::pipeline::HeldClassification;
 
 /// Counts the dry-run report prints alongside the per-account row breakdown.
@@ -17,7 +18,7 @@ pub struct DryRunCounts {
 /// held classifications, and newly-cached pairs are exactly what a real run
 /// WOULD persist.
 pub fn dry_run(
-    grouped: &BTreeMap<String, Vec<ImportTxn>>,
+    grouped: &BTreeMap<ActualAccountId, Vec<ImportTxn>>,
     held_classifications: &[HeldClassification],
     newly_cached: &[(String, String)],
     counts: &DryRunCounts,

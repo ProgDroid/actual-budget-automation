@@ -7,6 +7,7 @@ use tracing::warn;
 use crate::actual::ActualClient;
 use crate::actual::shim_protocol::{Category, ImportTxn, Payee, ScheduleRow};
 use crate::banks::RawTransaction;
+use crate::ids::{ActualAccountId, ExternalTxId};
 use crate::matching::Schedule;
 use crate::state::{AccountLink, ClassifiedHold, State};
 
@@ -69,9 +70,9 @@ pub struct AssembleInputs<'a> {
     /// All non-scheduled candidates this run (used to resolve `external_id` -> tx).
     pub candidates: &'a [RawTransaction],
     /// FULL cache hits: (`external_id`, `payee_name`, `category_name`). Empty category = uncategorised.
-    pub cached: &'a [(String, String, String)],
+    pub cached: &'a [(ExternalTxId, String, String)],
     /// Claude matches confident in BOTH dimensions: (`external_id`, `payee_name`, `category_name`).
-    pub matched: &'a [(String, String, String)],
+    pub matched: &'a [(ExternalTxId, String, String)],
     /// Held classifications (>=1 uncertain dimension) to persist as pending reviews.
     pub held_classifications: &'a [HeldClassification],
     pub payees: &'a [Payee],
@@ -84,7 +85,7 @@ pub struct AssembleInputs<'a> {
 /// What assembly produced: import rows (keyed by Actual account id), the count of
 /// held items, and merchant->payee pairs newly folded into the cache.
 pub struct Assembled {
-    pub grouped: BTreeMap<String, Vec<ImportTxn>>,
+    pub grouped: BTreeMap<ActualAccountId, Vec<ImportTxn>>,
     pub held: usize,
     pub newly_cached: Vec<(String, String)>,
 }
@@ -100,7 +101,7 @@ pub async fn assemble(
     state: &mut State,
     actual: &ActualClient,
 ) -> Result<Assembled> {
-    let mut grouped: BTreeMap<String, Vec<ImportTxn>> = BTreeMap::new();
+    let mut grouped: BTreeMap<ActualAccountId, Vec<ImportTxn>> = BTreeMap::new();
     let mut held = 0usize;
     let mut newly_cached: Vec<(String, String)> = Vec::new();
 
@@ -336,8 +337,8 @@ pub async fn assemble(
                 amount: r.amount,
                 payee: pid,
                 category: cat_id,
-                imported_id: if r.external_id.is_empty() {
-                    format!("{}:{}", r.raw_merchant, r.date)
+                imported_id: if r.external_id.as_str().is_empty() {
+                    ExternalTxId::from(format!("{}:{}", r.raw_merchant, r.date))
                 } else {
                     r.external_id.clone()
                 },

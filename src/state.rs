@@ -6,6 +6,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{ActualAccountId, ExternalTxId, MonzoAccountId, MonzoPotId};
+
 /// Bump when the TOML schema changes shape incompatibly. `load` refuses files
 /// from a NEWER binary (rollback safety); older files are migrated forward.
 pub const CURRENT_STATE_VERSION: u32 = 1;
@@ -60,7 +62,7 @@ pub struct MonzoState {
     /// Legacy single Monzo account id. Retained ONLY so old state files still
     /// deserialise; migrated into `accounts` by `State::load`. Do not read directly.
     #[serde(default)]
-    pub account_id: String,
+    pub account_id: MonzoAccountId,
     /// Monzo→Actual account links. Empty until `aba accounts` populates it.
     #[serde(default)]
     pub accounts: Vec<AccountLink>,
@@ -73,13 +75,13 @@ pub struct MonzoState {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountLink {
     /// Monzo account id (`acc_…`) — used for fetching.
-    pub monzo_id: String,
+    pub monzo_id: MonzoAccountId,
     /// Monzo display name (suggest/review UX only).
     #[serde(default)]
     pub monzo_name: String,
-    /// Actual account UUID — the import target. Empty = unmapped.
-    #[serde(default)]
-    pub actual_id: String,
+    /// Actual account UUID — the import target. `None` = unmapped (on the wire: `""`).
+    #[serde(default, with = "crate::ids::opt_actual_empty")]
+    pub actual_id: Option<ActualAccountId>,
     /// Actual account name (suggest/review UX only).
     #[serde(default)]
     pub actual_name: String,
@@ -96,13 +98,13 @@ pub struct AccountLink {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PotLink {
     /// Monzo pot id (`pot_…`) — matches `metadata.pot_id` in the feed and `GET /pots[].id`.
-    pub monzo_pot_id: String,
+    pub monzo_pot_id: MonzoPotId,
     /// Monzo pot display name — suggest/review UX only.
     #[serde(default)]
     pub monzo_pot_name: String,
-    /// Actual account UUID — the transfer target. Empty = unmapped.
-    #[serde(default)]
-    pub actual_id: String,
+    /// Actual account UUID — the transfer target. `None` = unmapped (on the wire: `""`).
+    #[serde(default, with = "crate::ids::opt_actual_empty")]
+    pub actual_id: Option<ActualAccountId>,
     /// Actual account name — suggest/review UX only.
     #[serde(default)]
     pub actual_name: String,
@@ -136,10 +138,10 @@ pub struct TelegramState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
     #[serde(default)]
-    pub external_id: String,
+    pub external_id: ExternalTxId,
     /// Monzo account this held txn came from; routes the import once resolved.
     #[serde(default)]
-    pub source_monzo_id: String,
+    pub source_monzo_id: MonzoAccountId,
     pub raw_merchant: String,
     pub amount: i64,
     pub date: String,
@@ -193,9 +195,9 @@ impl PendingReview {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldTransfer {
     #[serde(default)]
-    pub external_id: String,
+    pub external_id: ExternalTxId,
     #[serde(default)]
-    pub source_monzo_id: String,
+    pub source_monzo_id: MonzoAccountId,
     #[serde(default)]
     pub date: String,
     #[serde(default)]
@@ -215,11 +217,14 @@ impl HeldTransfer {
     /// Reconstruct the typed target. Unknown `target_kind` → `None` (defensive).
     #[must_use]
     pub fn target(&self) -> Option<crate::banks::TransferTarget> {
+        // `target_id` is a trusted persisted string → unchecked `From` rewrap.
         match self.target_kind.as_str() {
-            "pot" => Some(crate::banks::TransferTarget::Pot(self.target_id.clone())),
-            "account" => Some(crate::banks::TransferTarget::Account(
+            "pot" => Some(crate::banks::TransferTarget::Pot(MonzoPotId::from(
                 self.target_id.clone(),
-            )),
+            ))),
+            "account" => Some(crate::banks::TransferTarget::Account(MonzoAccountId::from(
+                self.target_id.clone(),
+            ))),
             "flex_mirror" => Some(crate::banks::TransferTarget::FlexMirror),
             _ => None,
         }
@@ -229,8 +234,8 @@ impl HeldTransfer {
     #[must_use]
     pub fn from_row(tx: &crate::banks::RawTransaction) -> Option<Self> {
         let (target_kind, target_id) = match tx.transfer.as_ref()? {
-            crate::banks::TransferTarget::Pot(id) => ("pot", id.clone()),
-            crate::banks::TransferTarget::Account(id) => ("account", id.clone()),
+            crate::banks::TransferTarget::Pot(id) => ("pot", id.as_str().to_owned()),
+            crate::banks::TransferTarget::Account(id) => ("account", id.as_str().to_owned()),
             crate::banks::TransferTarget::FlexMirror => ("flex_mirror", String::new()),
         };
         Some(Self {
@@ -275,7 +280,7 @@ impl State {
     /// `actual_id` is left empty because the legacy value was the Monzo side
     /// only; the user supplies the Actual side via `aba accounts`.
     fn migrate_legacy_account(&mut self) {
-        if self.monzo.accounts.is_empty() && !self.monzo.account_id.is_empty() {
+        if self.monzo.accounts.is_empty() && !self.monzo.account_id.as_str().is_empty() {
             self.monzo.accounts.push(AccountLink {
                 monzo_id: std::mem::take(&mut self.monzo.account_id),
                 ..AccountLink::default()
@@ -375,7 +380,7 @@ impl State {
     pub fn monzo_clone(&self) -> MonzoState {
         MonzoState {
             refresh_token: self.monzo.refresh_token.clone(),
-            account_id: String::new(),
+            account_id: MonzoAccountId::default(),
             accounts: self.monzo.accounts.clone(),
             pots: self.monzo.pots.clone(),
         }
@@ -385,11 +390,11 @@ impl State {
     /// exists. Returns true if added.
     pub fn add_pending(
         &mut self,
-        external_id: &str,
+        external_id: &ExternalTxId,
         raw_merchant: &str,
         amount: i64,
         date: &str,
-        source_monzo_id: &str,
+        source_monzo_id: &MonzoAccountId,
     ) -> bool {
         self.add_pending_full(
             external_id,
@@ -406,24 +411,24 @@ impl State {
     #[allow(clippy::too_many_arguments)]
     pub fn add_pending_full(
         &mut self,
-        external_id: &str,
+        external_id: &ExternalTxId,
         raw_merchant: &str,
         amount: i64,
         date: &str,
         suggestion: Option<String>,
         confidence: Option<String>,
-        source_monzo_id: &str,
+        source_monzo_id: &MonzoAccountId,
     ) -> bool {
         if self
             .pending_reviews
             .iter()
-            .any(|p| p.external_id == external_id)
+            .any(|p| &p.external_id == external_id)
         {
             return false;
         }
         self.pending_reviews.push(PendingReview {
-            external_id: external_id.to_string(),
-            source_monzo_id: source_monzo_id.to_string(),
+            external_id: external_id.clone(),
+            source_monzo_id: source_monzo_id.clone(),
             raw_merchant: raw_merchant.to_string(),
             amount,
             date: date.to_string(),
@@ -445,7 +450,7 @@ impl State {
         if let Some(p) = self
             .pending_reviews
             .iter_mut()
-            .find(|p| p.external_id == external_id)
+            .find(|p| p.external_id.as_str() == external_id)
             && let Some(s) = p.suggestion.clone()
         {
             p.resolve_to = s;
@@ -459,7 +464,7 @@ impl State {
         if let Some(p) = self
             .pending_reviews
             .iter_mut()
-            .find(|p| p.external_id == external_id)
+            .find(|p| p.external_id.as_str() == external_id)
         {
             p.resolve_to = text.to_string();
             p.create_new = false;
@@ -473,7 +478,7 @@ impl State {
         if let Some(p) = self
             .pending_reviews
             .iter_mut()
-            .find(|p| p.external_id == external_id)
+            .find(|p| p.external_id.as_str() == external_id)
         {
             p.create_new = true;
             return true;
@@ -485,7 +490,7 @@ impl State {
     pub fn skip_pending(&mut self, external_id: &str) -> bool {
         let before = self.pending_reviews.len();
         self.pending_reviews
-            .retain(|p| p.external_id != external_id);
+            .retain(|p| p.external_id.as_str() != external_id);
         self.pending_reviews.len() != before
     }
 
@@ -496,7 +501,7 @@ impl State {
         if let Some(pr) = self
             .pending_reviews
             .iter_mut()
-            .find(|p| p.external_id == external_id)
+            .find(|p| p.external_id.as_str() == external_id)
             && let Some(s) = pr.category_suggestion.clone()
         {
             pr.resolve_category_to = s;
@@ -511,7 +516,7 @@ impl State {
         if let Some(pr) = self
             .pending_reviews
             .iter_mut()
-            .find(|p| p.external_id == external_id)
+            .find(|p| p.external_id.as_str() == external_id)
         {
             pr.resolve_category_to = name.to_string();
             pr.category_resolved = true;
@@ -526,7 +531,7 @@ impl State {
         if let Some(pr) = self
             .pending_reviews
             .iter_mut()
-            .find(|p| p.external_id == external_id)
+            .find(|p| p.external_id.as_str() == external_id)
         {
             pr.resolve_category_to = String::new();
             pr.category_resolved = true;
@@ -547,17 +552,17 @@ impl State {
     /// `external_id` already exists.
     pub fn add_pending_classified(
         &mut self,
-        external_id: &str,
+        external_id: &ExternalTxId,
         raw_merchant: &str,
         amount: i64,
         date: &str,
-        source_monzo_id: &str,
+        source_monzo_id: &MonzoAccountId,
         hold: ClassifiedHold,
     ) -> bool {
         if self
             .pending_reviews
             .iter()
-            .any(|p| p.external_id == external_id)
+            .any(|p| &p.external_id == external_id)
         {
             return false;
         }
@@ -567,8 +572,8 @@ impl State {
         let cat_resolved = hold.category_resolved.is_some();
         let resolve_category_to = hold.category_resolved.unwrap_or_default();
         self.pending_reviews.push(PendingReview {
-            external_id: external_id.to_string(),
-            source_monzo_id: source_monzo_id.to_string(),
+            external_id: external_id.clone(),
+            source_monzo_id: source_monzo_id.clone(),
             raw_merchant: raw_merchant.to_string(),
             amount,
             date: date.to_string(),
@@ -622,7 +627,7 @@ pub struct ClassifiedHold {
 /// A pending review the user has resolved, ready to import.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedReview {
-    pub external_id: String,
+    pub external_id: ExternalTxId,
     pub raw_merchant: String,
     pub amount: i64,
     pub date: String,
@@ -633,7 +638,7 @@ pub struct ResolvedReview {
     /// Final category name to use, or `None` for uncategorised.
     pub category_name: Option<String>,
     /// Monzo account the resolved txn came from; routes its import.
-    pub source_monzo_id: String,
+    pub source_monzo_id: MonzoAccountId,
 }
 
 #[cfg(test)]
@@ -657,14 +662,14 @@ mod tests {
         s.monzo.refresh_token = "rt_123".into();
         s.monzo.accounts.push(AccountLink {
             monzo_id: "acc_1".into(),
-            actual_id: "uuid-1".into(),
+            actual_id: Some(ActualAccountId::from("uuid-1")),
             ..AccountLink::default()
         });
         s.payee_cache
             .insert("TFL TRAVEL CH".into(), "Transport for London".into());
         s.pending_reviews.push(PendingReview {
             external_id: "tx_cafe_save".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "SQ *SOME CAFE".into(),
             amount: -450,
             date: "2026-05-30".into(),
@@ -689,7 +694,7 @@ mod tests {
         // resolved to existing payee
         s.pending_reviews.push(PendingReview {
             external_id: "tx_tfl".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "TFL TRAVEL CH".into(),
             amount: -275,
             date: "2026-05-30".into(),
@@ -706,7 +711,7 @@ mod tests {
         // create new under explicit name
         s.pending_reviews.push(PendingReview {
             external_id: "tx_cafe".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "SQ *SOME CAFE".into(),
             amount: -450,
             date: "2026-05-30".into(),
@@ -723,7 +728,7 @@ mod tests {
         // unresolved -> stays
         s.pending_reviews.push(PendingReview {
             external_id: "tx_amzn".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "AMZNMKTPLACE".into(),
             amount: -1999,
             date: "2026-05-31".into(),
@@ -760,8 +765,20 @@ mod tests {
     #[test]
     fn add_pending_dedupes_on_identity() {
         let mut s = State::default();
-        let added1 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31", "acc_1");
-        let added2 = s.add_pending("tx1", "AMZNMKTPLACE", -1999, "2026-05-31", "acc_1");
+        let added1 = s.add_pending(
+            &ExternalTxId::from("tx1"),
+            "AMZNMKTPLACE",
+            -1999,
+            "2026-05-31",
+            &MonzoAccountId::from("acc_1"),
+        );
+        let added2 = s.add_pending(
+            &ExternalTxId::from("tx1"),
+            "AMZNMKTPLACE",
+            -1999,
+            "2026-05-31",
+            &MonzoAccountId::from("acc_1"),
+        );
         assert!(added1);
         assert!(!added2);
         assert_eq!(s.pending_reviews.len(), 1);
@@ -775,7 +792,7 @@ mod tests {
         s.telegram.last_update_id = 42;
         s.pending_reviews.push(PendingReview {
             external_id: "tx1".into(),
-            source_monzo_id: String::new(),
+            source_monzo_id: MonzoAccountId::default(),
             raw_merchant: "TFL TRAVEL CH".into(),
             amount: -275,
             date: "2026-05-30".into(),
@@ -798,13 +815,13 @@ mod tests {
     fn add_pending_proposed_carries_suggestion() {
         let mut s = State::default();
         let added = s.add_pending_full(
-            "tx2",
+            &ExternalTxId::from("tx2"),
             "SQ *CAFE",
             -450,
             "2026-05-31",
             Some("Local Cafe".into()),
             Some("low".into()),
-            "",
+            &MonzoAccountId::default(),
         );
         assert!(added);
         let p = &s.pending_reviews[0];
@@ -839,11 +856,11 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), toml).unwrap();
         let s = State::load(tmp.path()).unwrap();
-        assert_eq!(s.monzo.account_id, "", "legacy field cleared");
+        assert_eq!(s.monzo.account_id.as_str(), "", "legacy field cleared");
         assert_eq!(s.monzo.accounts.len(), 1);
-        assert_eq!(s.monzo.accounts[0].monzo_id, "acc_legacy");
+        assert_eq!(s.monzo.accounts[0].monzo_id.as_str(), "acc_legacy");
         assert_eq!(
-            s.monzo.accounts[0].actual_id, "",
+            s.monzo.accounts[0].actual_id, None,
             "unmapped until `aba accounts`"
         );
     }
@@ -854,7 +871,7 @@ mod tests {
         s.monzo.accounts.push(AccountLink {
             monzo_id: "acc_1".into(),
             monzo_name: "Personal".into(),
-            actual_id: "uuid-1".into(),
+            actual_id: Some(ActualAccountId::from("uuid-1")),
             actual_name: "Monzo Personal".into(),
             is_flex: false,
         });
@@ -868,8 +885,16 @@ mod tests {
     #[test]
     fn add_pending_stores_source_monzo_id() {
         let mut s = State::default();
-        assert!(s.add_pending_full("ext1", "Cafe", -450, "2026-05-30", None, None, "acc_2"));
-        assert_eq!(s.pending_reviews[0].source_monzo_id, "acc_2");
+        assert!(s.add_pending_full(
+            &ExternalTxId::from("ext1"),
+            "Cafe",
+            -450,
+            "2026-05-30",
+            None,
+            None,
+            &MonzoAccountId::from("acc_2"),
+        ));
+        assert_eq!(s.pending_reviews[0].source_monzo_id.as_str(), "acc_2");
     }
 
     #[test]
@@ -978,7 +1003,7 @@ mod tests {
         let expected = PotLink {
             monzo_pot_id: "pot_123".into(),
             monzo_pot_name: "Savings".into(),
-            actual_id: "act-uuid".into(),
+            actual_id: Some(ActualAccountId::from("act-uuid")),
             actual_name: "Savings (Actual)".into(),
         };
         s.monzo.pots.push(expected.clone());
@@ -992,34 +1017,58 @@ mod tests {
     fn reply_mutators_apply() {
         let mut s = State::default();
         s.add_pending_full(
-            "a",
+            &ExternalTxId::from("a"),
             "AAA",
             -1,
             "2026-06-01",
             Some("Aldi".into()),
             Some("medium".into()),
-            "",
+            &MonzoAccountId::default(),
         );
-        s.add_pending_full("b", "BBB", -2, "2026-06-01", None, None, "");
         s.add_pending_full(
-            "c",
+            &ExternalTxId::from("b"),
+            "BBB",
+            -2,
+            "2026-06-01",
+            None,
+            None,
+            &MonzoAccountId::default(),
+        );
+        s.add_pending_full(
+            &ExternalTxId::from("c"),
             "CCC",
             -3,
             "2026-06-01",
             Some("Costa".into()),
             Some("low".into()),
-            "",
+            &MonzoAccountId::default(),
         );
-        s.add_pending_full("d", "DDD", -4, "2026-06-01", None, None, "");
+        s.add_pending_full(
+            &ExternalTxId::from("d"),
+            "DDD",
+            -4,
+            "2026-06-01",
+            None,
+            None,
+            &MonzoAccountId::default(),
+        );
         // dedicated no-suggestion entry: confirm must refuse to set resolve_to.
-        s.add_pending_full("e", "EEE", -5, "2026-06-01", None, None, "");
+        s.add_pending_full(
+            &ExternalTxId::from("e"),
+            "EEE",
+            -5,
+            "2026-06-01",
+            None,
+            None,
+            &MonzoAccountId::default(),
+        );
 
         // confirm on a None-suggestion entry is a no-op returning false.
         assert!(!s.confirm_pending("e"));
         assert!(
             s.pending_reviews
                 .iter()
-                .find(|p| p.external_id == "e")
+                .find(|p| p.external_id.as_str() == "e")
                 .unwrap()
                 .resolve_to
                 .is_empty()
@@ -1032,7 +1081,11 @@ mod tests {
         assert!(!s.confirm_pending("missing"));
         assert!(!s.skip_pending("does_not_exist")); // unknown id -> false
 
-        let by = |id: &str| s.pending_reviews.iter().find(|p| p.external_id == id);
+        let by = |id: &str| {
+            s.pending_reviews
+                .iter()
+                .find(|p| p.external_id.as_str() == id)
+        };
         assert_eq!(by("a").unwrap().resolve_to, "Aldi");
         assert_eq!(by("b").unwrap().resolve_to, "Boots");
         assert!(by("c").unwrap().create_new);
@@ -1084,7 +1137,7 @@ mod tests {
         s.monzo.accounts.push(AccountLink {
             monzo_id: "acc_flex".into(),
             monzo_name: "monzoflex_0000".into(),
-            actual_id: "act-flex".into(),
+            actual_id: Some(ActualAccountId::from("act-flex")),
             actual_name: "Flex".into(),
             is_flex: true,
         });
