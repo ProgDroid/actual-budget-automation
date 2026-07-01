@@ -1,8 +1,8 @@
 //! Claude payee matching.
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn request_has_cached_payee_and_category_blocks_and_schema() {
         let req = build_request(
-            "claude-sonnet-4-6",
+            "claude-sonnet-5",
             &["TFL TRAVEL CH".to_string()],
             &["Transport for London".to_string()],
             &["Transport".to_string(), "Groceries".to_string()],
@@ -310,18 +310,16 @@ mod tests {
         let sys = req["system"].as_array().unwrap();
         // system blocks: instructions + payees + categories
         assert_eq!(sys.len(), 3);
-        assert!(
-            sys[1]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Transport for London")
-        );
+        assert!(sys[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Transport for London"));
         assert!(sys[2]["text"].as_str().unwrap().contains("Groceries"));
         assert_eq!(sys[2]["cache_control"]["type"], "ephemeral");
-        let required =
-            req["tools"][0]["input_schema"]["properties"]["matches"]["items"]["required"]
-                .as_array()
-                .unwrap();
+        let required = req["tools"][0]["input_schema"]["properties"]["matches"]["items"]
+            ["required"]
+            .as_array()
+            .unwrap();
         assert!(required.iter().any(|v| v == "category"));
         assert!(required.iter().any(|v| v == "category_confidence"));
         assert!(required.iter().any(|v| v == "payee_confidence"));
@@ -347,7 +345,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = HttpClaude::new("test-key".into(), "claude-sonnet-4-6".into())
+        let client = HttpClaude::new("test-key".into(), "claude-sonnet-5".into())
             .with_base_url(server.uri());
         let out = client
             .classify(

@@ -2,10 +2,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
-pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
 pub const DATE_TOLERANCE_DAYS: i64 = 3;
 pub const PAYEE_THRESHOLD: f64 = 0.85;
 
@@ -158,7 +158,7 @@ mod tests {
             }
         };
         let c = Config::from_getter(get).unwrap();
-        assert_eq!(c.claude_model, "claude-sonnet-4-6");
+        assert_eq!(c.claude_model, "claude-sonnet-5");
         assert_eq!(c.actual_server_url, "http://actual:5006");
         assert_eq!(c.state_path.to_string_lossy(), "/data/aba.state.toml");
     }
