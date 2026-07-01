@@ -1,8 +1,8 @@
 //! Claude payee matching.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
@@ -310,16 +310,18 @@ mod tests {
         let sys = req["system"].as_array().unwrap();
         // system blocks: instructions + payees + categories
         assert_eq!(sys.len(), 3);
-        assert!(sys[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Transport for London"));
+        assert!(
+            sys[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Transport for London")
+        );
         assert!(sys[2]["text"].as_str().unwrap().contains("Groceries"));
         assert_eq!(sys[2]["cache_control"]["type"], "ephemeral");
-        let required = req["tools"][0]["input_schema"]["properties"]["matches"]["items"]
-            ["required"]
-            .as_array()
-            .unwrap();
+        let required =
+            req["tools"][0]["input_schema"]["properties"]["matches"]["items"]["required"]
+                .as_array()
+                .unwrap();
         assert!(required.iter().any(|v| v == "category"));
         assert!(required.iter().any(|v| v == "category_confidence"));
         assert!(required.iter().any(|v| v == "payee_confidence"));
