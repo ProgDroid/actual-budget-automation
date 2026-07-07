@@ -65,6 +65,17 @@ pub async fn poll(
             .iter()
             .find(|p| group_key(&p.raw_merchant) == r.entry_key)
             .is_some_and(crate::state::PendingReview::payee_settled);
+        // Resolve a picked category hash to a live category name before the
+        // member loop (which borrows `state` mutably). None => no live category
+        // matches (e.g. deleted since the prompt) => leave held for re-prompt.
+        let picked_category: Option<String> = match &r.action {
+            ReplyAction::PickCategory(hash) => state
+                .actual_category_names
+                .iter()
+                .find(|n| crate::telegram::fnv1a_hex(n) == *hash)
+                .cloned(),
+            _ => None,
+        };
 
         let mut any = false;
         // `members` is collected before any mutation, so skip_pending's retain() is safe.
@@ -75,9 +86,9 @@ pub async fn poll(
                 ReplyAction::Skip => state.skip_pending(ext),
                 ReplyAction::ConfirmCategory => state.confirm_category(ext),
                 ReplyAction::SkipCategory => state.skip_category(ext),
-                // Hash -> category-name resolution and state application land in a
-                // later task (this one only teaches the parser to decode `pc:`).
-                ReplyAction::PickCategory(_) => false,
+                ReplyAction::PickCategory(_) => picked_category
+                    .as_ref()
+                    .is_some_and(|name| state.remap_category(ext, name)),
                 ReplyAction::Remap(text) => {
                     if payee_settled {
                         state.remap_category(ext, text)
@@ -251,6 +262,86 @@ mod tests {
         assert_eq!(applied, 1);
         assert!(state.pending_reviews[0].category_resolved);
         assert_eq!(state.pending_reviews[0].resolve_category_to, "Groceries");
+    }
+
+    #[tokio::test]
+    async fn pick_category_resolves_hash_to_live_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        // Struct literal to avoid clippy::field_reassign_with_default.
+        let mut state = State {
+            actual_category_names: vec!["Dining".into(), "Groceries".into()],
+            ..Default::default()
+        };
+        state.pending_reviews.push(crate::state::PendingReview {
+            external_id: "tx1".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: "Local Cafe".into(), // payee settled
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Dining".into()),
+            category_confidence: Some("medium".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: Some(900),
+        });
+        let channel = FakeChannel::new(
+            vec![Reply {
+                entry_key: crate::telegram::group_key("SQ *CAFE"),
+                action: ReplyAction::PickCategory(crate::telegram::fnv1a_hex("Groceries")),
+            }],
+            55,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+        assert_eq!(applied, 1);
+        assert!(state.pending_reviews[0].category_resolved);
+        assert_eq!(state.pending_reviews[0].resolve_category_to, "Groceries");
+    }
+
+    #[tokio::test]
+    async fn pick_category_unknown_hash_stays_held() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        // Struct literal to avoid clippy::field_reassign_with_default.
+        let mut state = State {
+            actual_category_names: vec!["Dining".into()], // "Groceries" was deleted
+            ..Default::default()
+        };
+        state.pending_reviews.push(crate::state::PendingReview {
+            external_id: "tx1".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: "Local Cafe".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: Some(900),
+        });
+        let channel = FakeChannel::new(
+            vec![Reply {
+                entry_key: crate::telegram::group_key("SQ *CAFE"),
+                action: ReplyAction::PickCategory(crate::telegram::fnv1a_hex("Groceries")),
+            }],
+            55,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+        assert_eq!(applied, 0, "unresolvable pick applies nothing");
+        assert!(
+            !state.pending_reviews[0].category_resolved,
+            "stays held for re-prompt"
+        );
     }
 
     #[tokio::test]
