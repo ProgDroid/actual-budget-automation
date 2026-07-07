@@ -18,6 +18,9 @@ pub enum ReplyAction {
     ConfirmCategory,
     /// Skip the category (import uncategorised).
     SkipCategory,
+    /// Pick a category by its callback hash (`fnv1a_hex(category_name)`);
+    /// resolved to a live category name at reply-application time.
+    PickCategory(String),
     Remap(String),
 }
 
@@ -126,6 +129,28 @@ fn action_from_code(code: &str) -> Option<ReplyAction> {
     }
 }
 
+/// Decode a `callback_data` string into a `Reply`. Simple codes map to a
+/// zero-payload action keyed by the whole remainder; `pc` carries a second
+/// `:`-separated field: `pc:<group_key>:<cat_hash>`.
+fn reply_from_callback(data: &str) -> Option<Reply> {
+    let (code, key) = parse_callback(data)?;
+    if code == "pc" {
+        let (group, cat_hash) = key.split_once(':')?;
+        if group.is_empty() || cat_hash.is_empty() {
+            return None;
+        }
+        return Some(Reply {
+            entry_key: group.to_string(),
+            action: ReplyAction::PickCategory(cat_hash.to_string()),
+        });
+    }
+    let action = action_from_code(&code)?;
+    Some(Reply {
+        entry_key: key,
+        action,
+    })
+}
+
 /// Telegram rejects message text over 4096 characters with HTTP 400 — which
 /// would re-fail identically every run (same failure shape as the old
 /// Markdown bug). We cap BYTES at 4096: byte count >= char count in UTF-8,
@@ -181,13 +206,9 @@ pub fn parse_get_updates(
                     ack_callback_ids.push(id.to_string());
                 }
                 if let Some(data) = cq["data"].as_str()
-                    && let Some((code, key)) = parse_callback(data)
-                    && let Some(action) = action_from_code(&code)
+                    && let Some(reply) = reply_from_callback(data)
                 {
-                    replies.push(Reply {
-                        entry_key: key,
-                        action,
-                    });
+                    replies.push(reply);
                 }
                 continue;
             }
@@ -543,6 +564,28 @@ mod tests {
         assert!(parsed.replies.is_empty());
         assert_eq!(parsed.ack_callback_ids, vec!["cb_x".to_string()]);
         assert_eq!(parsed.new_offset, 6);
+    }
+
+    #[test]
+    fn parse_get_updates_decodes_pick_category() {
+        let group = group_key("SQ *CAFE");
+        let cat = fnv1a_hex("Groceries");
+        let data = format!("pc:{group}:{cat}");
+        let result = serde_json::json!([
+            { "update_id": 20, "callback_query": {
+                "id": "cbp", "from": { "id": 99 },
+                "message": { "chat": { "id": 99 } },
+                "data": data
+            }}
+        ]);
+        let parsed = parse_get_updates(&result, 99, &BTreeMap::new());
+        assert_eq!(parsed.ack_callback_ids, vec!["cbp".to_string()]);
+        assert_eq!(parsed.replies.len(), 1);
+        assert_eq!(parsed.replies[0].entry_key, group);
+        match &parsed.replies[0].action {
+            ReplyAction::PickCategory(h) => assert_eq!(h, &cat),
+            other => panic!("expected PickCategory, got {other:?}"),
+        }
     }
 
     #[test]

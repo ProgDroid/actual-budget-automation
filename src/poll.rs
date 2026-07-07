@@ -75,6 +75,9 @@ pub async fn poll(
                 ReplyAction::Skip => state.skip_pending(ext),
                 ReplyAction::ConfirmCategory => state.confirm_category(ext),
                 ReplyAction::SkipCategory => state.skip_category(ext),
+                // Hash -> category-name resolution and state application land in a
+                // later task (this one only teaches the parser to decode `pc:`).
+                ReplyAction::PickCategory(_) => false,
                 ReplyAction::Remap(text) => {
                     if payee_settled {
                         state.remap_category(ext, text)
