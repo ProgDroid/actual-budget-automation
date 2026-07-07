@@ -34,7 +34,7 @@ fn build_prompt(
     } else {
         String::new()
     };
-    let buttons = |specs: &[(&str, &str)]| -> Vec<(String, String)> {
+    let row = |specs: &[(&str, &str)]| -> Vec<(String, String)> {
         specs
             .iter()
             .map(|(label, action)| {
@@ -56,25 +56,25 @@ fn build_prompt(
                         "'{}'{} -> '{}'?  ({} confidence)\nReply with a different payee to remap.",
                         entry.raw_merchant, count, s, conf
                     ),
-                    buttons: buttons(&[
+                    buttons: vec![row(&[
                         ("✅ Confirm", "cf"),
                         ("🆕 Create new", "nw"),
                         ("❌ Skip", "sk"),
-                    ]),
+                    ])],
                 }
             }
             Some(s) => Prompt {
                 chat_text: format!(
                     "No existing payee '{s}'{count}. Create it?\nOr reply with a payee name."
                 ),
-                buttons: buttons(&[("🆕 Create", "nw"), ("❌ Skip", "sk")]),
+                buttons: vec![row(&[("🆕 Create", "nw"), ("❌ Skip", "sk")])],
             },
             None => Prompt {
                 chat_text: format!(
                     "New merchant '{}'{} — which payee?\nReply with a payee name, or:",
                     entry.raw_merchant, count
                 ),
-                buttons: buttons(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")]),
+                buttons: vec![row(&[("🆕 Create new", "nw"), ("❌ Skip", "sk")])],
             },
         };
     }
@@ -89,7 +89,7 @@ fn build_prompt(
                      Reply with a different category, or Skip to leave it uncategorised.",
                     entry.raw_merchant, count, s, conf
                 ),
-                buttons: buttons(&[("✅ Confirm", "cc"), ("❌ Skip", "xc")]),
+                buttons: vec![row(&[("✅ Confirm", "cc"), ("❌ Skip", "xc")])],
             }
         }
         // A category suggestion that isn't in the live category list can't be
@@ -102,7 +102,7 @@ fn build_prompt(
                 "Which category for '{}'{}?\nReply with a category name, or Skip to leave it uncategorised.",
                 entry.raw_merchant, count
             ),
-            buttons: buttons(&[("❌ Skip", "xc")]),
+            buttons: vec![row(&[("❌ Skip", "xc")])],
         },
     }
 }
@@ -290,9 +290,9 @@ mod tests {
             "must not use Markdown bold for payee: {}",
             p.chat_text
         );
-        assert_eq!(p.buttons.len(), 3);
+        assert_eq!(p.buttons[0].len(), 3);
         assert_eq!(
-            p.buttons[0].1,
+            p.buttons[0][0].1,
             format!("cf:{}", crate::telegram::group_key(&proposed.raw_merchant))
         );
 
@@ -314,9 +314,9 @@ mod tests {
             telegram_message_id: None,
         };
         let p2 = build_prompt(&unmatched, 1, &payees, &[]);
-        assert_eq!(p2.buttons.len(), 2);
+        assert_eq!(p2.buttons[0].len(), 2);
         assert_eq!(
-            p2.buttons[0].1,
+            p2.buttons[0][0].1,
             format!("nw:{}", crate::telegram::group_key(&unmatched.raw_merchant))
         );
 
@@ -339,13 +339,13 @@ mod tests {
         };
         let p3 = build_prompt(&failed, 1, &payees, &[]);
         assert!(p3.chat_text.contains("Sainsbury's"));
-        assert_eq!(p3.buttons.len(), 2);
+        assert_eq!(p3.buttons[0].len(), 2);
         assert_eq!(
-            p3.buttons[0].1,
+            p3.buttons[0][0].1,
             format!("nw:{}", crate::telegram::group_key(&failed.raw_merchant))
         ); // create
         assert_eq!(
-            p3.buttons[1].1,
+            p3.buttons[0][1].1,
             format!("sk:{}", crate::telegram::group_key(&failed.raw_merchant))
         ); // skip
     }
@@ -372,9 +372,9 @@ mod tests {
             telegram_message_id: None,
         };
         let p = build_prompt(&entry, 1, &payees, &[]);
-        assert_eq!(p.buttons.len(), 2, "create/skip buttons present");
+        assert_eq!(p.buttons[0].len(), 2, "create/skip buttons present");
         assert_eq!(
-            p.buttons[0].1,
+            p.buttons[0][0].1,
             format!("nw:{}", crate::telegram::group_key("SQ *CAFE"))
         );
     }
@@ -407,13 +407,13 @@ mod tests {
         );
         assert!(p.chat_text.contains("'Dining'"));
         // confirm-category + skip-category buttons
-        assert_eq!(p.buttons.len(), 2);
+        assert_eq!(p.buttons[0].len(), 2);
         assert_eq!(
-            p.buttons[0].1,
+            p.buttons[0][0].1,
             format!("cc:{}", crate::telegram::group_key(&entry.raw_merchant))
         );
         assert_eq!(
-            p.buttons[1].1,
+            p.buttons[0][1].1,
             format!("xc:{}", crate::telegram::group_key(&entry.raw_merchant))
         );
     }
@@ -440,9 +440,9 @@ mod tests {
         };
         let p = build_prompt(&entry, 1, &payees, &cats);
         // payee prompt first (unchanged flavor): confirm/create/skip
-        assert_eq!(p.buttons.len(), 3);
+        assert_eq!(p.buttons[0].len(), 3);
         assert_eq!(
-            p.buttons[0].1,
+            p.buttons[0][0].1,
             format!("cf:{}", crate::telegram::group_key(&entry.raw_merchant))
         );
     }

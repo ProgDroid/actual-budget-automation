@@ -33,7 +33,8 @@ pub struct Reply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     pub chat_text: String,
-    pub buttons: Vec<(String, String)>,
+    /// Inline-keyboard rows; each row is `(label, callback_data)` buttons.
+    pub buttons: Vec<Vec<(String, String)>>,
 }
 
 /// Result of parsing one `getUpdates` batch.
@@ -221,13 +222,20 @@ pub fn build_send_request(prompt: &Prompt, chat_id: i64) -> Value {
         "chat_id": chat_id,
         "text": truncate_for_telegram(&prompt.chat_text),
     });
-    if !prompt.buttons.is_empty() {
-        let row: Vec<Value> = prompt
+    if prompt.buttons.iter().any(|row| !row.is_empty()) {
+        let rows: Vec<Value> = prompt
             .buttons
             .iter()
-            .map(|(label, data)| json!({ "text": label, "callback_data": data }))
+            .filter(|row| !row.is_empty())
+            .map(|row| {
+                Value::Array(
+                    row.iter()
+                        .map(|(label, data)| json!({ "text": label, "callback_data": data }))
+                        .collect(),
+                )
+            })
             .collect();
-        body["reply_markup"] = json!({ "inline_keyboard": [row] });
+        body["reply_markup"] = json!({ "inline_keyboard": rows });
     }
     body
 }
@@ -471,10 +479,10 @@ mod tests {
     fn build_send_request_has_text_and_buttons() {
         let prompt = Prompt {
             chat_text: "hello".into(),
-            buttons: vec![
+            buttons: vec![vec![
                 ("✅ Confirm".into(), "cf:tx1".into()),
                 ("❌ Skip".into(), "sk:tx1".into()),
-            ],
+            ]],
         };
         let body = build_send_request(&prompt, 99);
         assert_eq!(body["chat_id"], 99);
@@ -487,6 +495,23 @@ mod tests {
             body.get("parse_mode").is_none(),
             "prompts must be plain text"
         );
+    }
+
+    #[test]
+    fn build_send_request_emits_one_json_array_per_row() {
+        let prompt = Prompt {
+            chat_text: "grid".into(),
+            buttons: vec![
+                vec![("A".into(), "pc:g:a".into())],
+                vec![("B".into(), "pc:g:b".into()), ("C".into(), "pc:g:c".into())],
+            ],
+        };
+        let body = build_send_request(&prompt, 99);
+        let kb = &body["reply_markup"]["inline_keyboard"];
+        assert_eq!(kb.as_array().unwrap().len(), 2, "two rows");
+        assert_eq!(kb[0].as_array().unwrap().len(), 1);
+        assert_eq!(kb[1].as_array().unwrap().len(), 2);
+        assert_eq!(kb[1][1]["callback_data"], "pc:g:c");
     }
 
     #[test]
