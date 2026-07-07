@@ -73,6 +73,19 @@ pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
     Some(s)
 }
 
+/// FNV-1a 64-bit hash of `s`, rendered as 16 lowercase hex chars. Deterministic
+/// and version-stable by construction (unlike `std::hash::DefaultHasher`).
+/// Used for both merchant group keys and category callback keys.
+#[must_use]
+pub fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("{hash:016x}")
+}
+
 /// Stable, bounded key identifying a merchant group, derived from the exact
 /// `raw_merchant`. Used as the Telegram `callback_data`/free-text correlation
 /// key so one prompt and one reply cover every held transaction of a merchant.
@@ -90,12 +103,7 @@ pub fn encode_callback(action: &str, entry_key: &str) -> Option<String> {
 /// or store the raw merchant alongside the key) only if collisions ever surface.
 #[must_use]
 pub fn group_key(raw_merchant: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for byte in raw_merchant.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-    }
-    format!("{hash:016x}")
+    fnv1a_hex(raw_merchant)
 }
 
 pub fn parse_callback(data: &str) -> Option<(String, String)> {
@@ -524,6 +532,16 @@ mod tests {
         assert_eq!(a.len(), 16, "16 hex chars");
         // `<action>:<group_key>` must fit Telegram's 64-byte callback cap.
         assert!(encode_callback("nw", &a).is_some());
+    }
+
+    #[test]
+    fn fnv1a_hex_matches_group_key_and_is_deterministic() {
+        // group_key must be exactly fnv1a_hex of the same input (no behavior change).
+        assert_eq!(group_key("TFL TRAVEL CH"), fnv1a_hex("TFL TRAVEL CH"));
+        // deterministic + 16 hex chars
+        assert_eq!(fnv1a_hex("Dining"), fnv1a_hex("Dining"));
+        assert_eq!(fnv1a_hex("Dining").len(), 16);
+        assert_ne!(fnv1a_hex("Dining"), fnv1a_hex("Groceries"));
     }
 
     #[test]
