@@ -43,6 +43,30 @@ fn build_prompt(
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
     };
+    // One row holding a single owned-label button; empty row if encode fails.
+    let one = |label: String, action: &str| -> Vec<(String, String)> {
+        encode_callback(action, key)
+            .map(|data| vec![(label, data)])
+            .unwrap_or_default()
+    };
+    // The full category grid, 2 buttons per row, each `pc:<key>:<cat_hash>`.
+    let category_grid = || -> Vec<Vec<(String, String)>> {
+        let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+        let mut cur: Vec<(String, String)> = Vec::new();
+        for name in category_names {
+            let cat_hash = super::fnv1a_hex(name);
+            if let Some(data) = encode_callback("pc", &format!("{key}:{cat_hash}")) {
+                cur.push((name.clone(), data));
+                if cur.len() == 2 {
+                    rows.push(std::mem::take(&mut cur));
+                }
+            }
+        }
+        if !cur.is_empty() {
+            rows.push(cur);
+        }
+        rows
+    };
 
     // Payee dimension is settled when create_new is set or resolve_to is non-empty.
     let payee_settled = entry.payee_settled();
@@ -80,30 +104,35 @@ fn build_prompt(
     }
 
     // --- category prompt (payee already settled) ---
+    let skip_row = one("❌ Skip (leave uncategorised)".to_string(), "xc");
     match &entry.category_suggestion {
         Some(s) if category_names.iter().any(|c| c == s) => {
             let conf = entry.category_confidence.as_deref().unwrap_or("medium");
+            let mut rows = vec![one(format!("✅ Confirm: {s}"), "cc")];
+            rows.extend(category_grid());
+            rows.push(skip_row);
             Prompt {
                 chat_text: format!(
                     "Category for '{}'{} -> '{}'?  ({} confidence)\n\
-                     Reply with a different category, or Skip to leave it uncategorised.",
+                     Tap a category below, or reply with a name.",
                     entry.raw_merchant, count, s, conf
                 ),
-                buttons: vec![row(&[("✅ Confirm", "cc"), ("❌ Skip", "xc")])],
+                buttons: rows,
             }
         }
-        // A category suggestion that isn't in the live category list can't be
-        // confirmed (no "create category" in Phase 2 — confirming a non-existent
-        // category would fail-loud at import), so fall through to the free-remap /
-        // Skip prompt, dropping the stale hint. Reachable if Claude returns an
-        // off-list category or the category was deleted after this entry was held.
-        Some(_) | None => Prompt {
-            chat_text: format!(
-                "Which category for '{}'{}?\nReply with a category name, or Skip to leave it uncategorised.",
-                entry.raw_merchant, count
-            ),
-            buttons: vec![row(&[("❌ Skip", "xc")])],
-        },
+        // A suggestion not in the live list can't be confirmed (no "create
+        // category" in Phase 2); drop the stale hint and show the grid.
+        Some(_) | None => {
+            let mut rows = category_grid();
+            rows.push(skip_row);
+            Prompt {
+                chat_text: format!(
+                    "Which category for '{}'{}?\nTap a category below, or reply with a name.",
+                    entry.raw_merchant, count
+                ),
+                buttons: rows,
+            }
+        }
     }
 }
 
@@ -399,23 +428,69 @@ mod tests {
             category_resolved: false, // category unsettled -> category prompt
             telegram_message_id: None,
         };
+        let key = crate::telegram::group_key(&entry.raw_merchant);
         let p = build_prompt(&entry, 1, &payees, &cats);
+        assert!(p.chat_text.to_lowercase().contains("category"));
         assert!(
-            p.chat_text.to_lowercase().contains("category"),
-            "category prompt: {}",
+            p.chat_text.contains("'Dining'"),
+            "suggestion named: {}",
             p.chat_text
         );
-        assert!(p.chat_text.contains("'Dining'"));
-        // confirm-category + skip-category buttons
-        assert_eq!(p.buttons[0].len(), 2);
-        assert_eq!(
-            p.buttons[0][0].1,
-            format!("cc:{}", crate::telegram::group_key(&entry.raw_merchant))
+
+        // First row: confirm-suggestion shortcut (cc). Last row: skip (xc).
+        assert_eq!(p.buttons.first().unwrap()[0].1, format!("cc:{key}"));
+        assert_eq!(p.buttons.last().unwrap()[0].1, format!("xc:{key}"));
+
+        // Every live category appears as a pc:<key>:<hash> button somewhere in the grid.
+        let all: Vec<&(String, String)> = p.buttons.iter().flatten().collect();
+        for name in &cats {
+            let want = format!("pc:{key}:{}", crate::telegram::fnv1a_hex(name));
+            assert!(
+                all.iter()
+                    .any(|(label, data)| label == name && *data == want),
+                "missing grid button for {name}: {all:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_prompt_category_no_suggestion_is_grid_plus_skip() {
+        let payees = vec!["Local Cafe".to_string()];
+        let cats = vec![
+            "Dining".to_string(),
+            "Groceries".to_string(),
+            "Bills".to_string(),
+        ];
+        let entry = PendingReview {
+            external_id: "tx9".into(),
+            source_monzo_id: MonzoAccountId::default(),
+            raw_merchant: "SQ *CAFE".into(),
+            amount: -450,
+            date: "2026-06-01".into(),
+            resolve_to: "Local Cafe".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: None, // no suggestion -> grid + skip only
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+        };
+        let key = crate::telegram::group_key(&entry.raw_merchant);
+        let p = build_prompt(&entry, 1, &payees, &cats);
+        // No confirm row: no button carries the cc action.
+        assert!(
+            !p.buttons
+                .iter()
+                .flatten()
+                .any(|(_, d)| d.starts_with("cc:")),
+            "no confirm shortcut without a suggestion"
         );
-        assert_eq!(
-            p.buttons[0][1].1,
-            format!("xc:{}", crate::telegram::group_key(&entry.raw_merchant))
-        );
+        // Skip is the last row.
+        assert_eq!(p.buttons.last().unwrap()[0].1, format!("xc:{key}"));
+        // 3 categories at 2/row -> 2 grid rows, + skip row = 3 rows.
+        assert_eq!(p.buttons.len(), 3, "grid rows: {:?}", p.buttons);
     }
 
     #[test]
