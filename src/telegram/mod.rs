@@ -589,6 +589,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_get_updates_rejects_malformed_pc_fields() {
+        // pc callbacks with an empty group, empty hash, or a missing second field
+        // must yield no reply — but the callback is still ACKed (spinner cleared).
+        for data in ["pc:grp:", "pc::hash", "pc:grp"] {
+            let result = serde_json::json!([
+                { "update_id": 30, "callback_query": {
+                    "id": "cbm", "from": { "id": 99 },
+                    "message": { "chat": { "id": 99 } },
+                    "data": data
+                }}
+            ]);
+            let parsed = parse_get_updates(&result, 99, &BTreeMap::new());
+            assert!(
+                parsed.replies.is_empty(),
+                "malformed pc must yield no reply: {data}"
+            );
+            assert_eq!(
+                parsed.ack_callback_ids,
+                vec!["cbm".to_string()],
+                "malformed pc must still be ACKed: {data}"
+            );
+        }
+    }
+
+    #[test]
     fn group_key_is_deterministic_and_fits_callback() {
         let a = group_key("TFL TRAVEL CH");
         assert_eq!(
