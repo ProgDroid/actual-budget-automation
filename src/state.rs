@@ -494,6 +494,7 @@ impl State {
             .pending_reviews
             .iter_mut()
             .find(|p| p.external_id.as_str() == external_id)
+            && !p.payee_settled()
             && let Some(s) = p.suggestion.clone()
         {
             p.resolve_to = s;
@@ -509,6 +510,9 @@ impl State {
             .iter_mut()
             .find(|p| p.external_id.as_str() == external_id)
         {
+            if p.payee_settled() {
+                return false;
+            }
             p.resolve_to = text.to_string();
             p.create_new = false;
             return true;
@@ -523,6 +527,9 @@ impl State {
             .iter_mut()
             .find(|p| p.external_id.as_str() == external_id)
         {
+            if p.payee_settled() {
+                return false; // never re-target an already-settled member
+            }
             p.create_new = true;
             return true;
         }
@@ -1334,5 +1341,35 @@ mod tests {
         assert_eq!(p.open_dimension(), Some(PromptDimension::Category));
         p.category_resolved = true; // both settled
         assert_eq!(p.open_dimension(), None);
+    }
+
+    #[test]
+    fn payee_mutators_skip_already_settled_members() {
+        let mut s = State::default();
+        // settled to an existing payee (resolve_to set)
+        s.pending_reviews.push(PendingReview {
+            external_id: "settled".into(),
+            source_monzo_id: MonzoAccountId::default(),
+            raw_merchant: "X".into(),
+            amount: -1,
+            date: "2026-06-01".into(),
+            resolve_to: "Santander Checking".into(),
+            create_new: false,
+            suggestion: Some("Something Else".into()),
+            confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: Some(135),
+            prompted_dimension: Some(PromptDimension::Payee),
+        });
+        // create/remap/confirm must all no-op on a settled member
+        assert!(!s.create_pending("settled"));
+        assert!(!s.remap_pending("settled", "Wrong"));
+        assert!(!s.confirm_pending("settled"));
+        let p = &s.pending_reviews[0];
+        assert!(!p.create_new, "create_new must stay false");
+        assert_eq!(p.resolve_to, "Santander Checking", "resolve_to untouched");
     }
 }
