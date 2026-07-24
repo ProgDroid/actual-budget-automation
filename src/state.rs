@@ -149,6 +149,16 @@ pub struct TelegramState {
     pub last_update_id: i64,
 }
 
+/// Which review dimension a Telegram prompt is currently asking about.
+/// Stored per group (shared across a merchant's members) so a run can tell an
+/// unanswered prompt from one that asks the wrong (already-answered) dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptDimension {
+    Payee,
+    Category,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
     #[serde(default)]
@@ -191,6 +201,10 @@ pub struct PendingReview {
     /// `Some` once a Telegram prompt has been sent (idempotency guard).
     #[serde(default)]
     pub telegram_message_id: Option<i64>,
+    /// Dimension the live prompt (`telegram_message_id`) is asking about. `None`
+    /// = never prompted (or a legacy entry) → the enforcer will (re)prompt.
+    #[serde(default)]
+    pub prompted_dimension: Option<PromptDimension>,
 }
 
 impl PendingReview {
@@ -199,6 +213,20 @@ impl PendingReview {
     #[must_use]
     pub const fn payee_settled(&self) -> bool {
         self.create_new || !self.resolve_to.is_empty()
+    }
+
+    /// The dimension still needing a decision (payee before category), or `None`
+    /// when both are settled (ready to import).
+    #[must_use]
+    #[allow(dead_code)] // Added in Task 1; used by later tasks
+    pub const fn open_dimension(&self) -> Option<PromptDimension> {
+        if !self.payee_settled() {
+            Some(PromptDimension::Payee)
+        } else if !self.category_resolved {
+            Some(PromptDimension::Category)
+        } else {
+            None
+        }
     }
 }
 
@@ -455,6 +483,7 @@ impl State {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         true
     }
@@ -600,6 +629,7 @@ impl State {
             resolve_category_to,
             category_resolved: cat_resolved,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         true
     }
@@ -696,6 +726,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         s.save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
@@ -721,6 +752,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         // create new under explicit name
         s.pending_reviews.push(PendingReview {
@@ -738,6 +770,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         // unresolved -> stays
         s.pending_reviews.push(PendingReview {
@@ -755,6 +788,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
 
         let resolved = s.take_resolved();
@@ -819,6 +853,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: Some(1001),
+            prompted_dimension: None,
         });
         s.save(&path).unwrap();
         let loaded = State::load(&path).unwrap();
@@ -930,6 +965,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         let taken = s.take_resolved();
         assert!(
@@ -969,6 +1005,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         assert!(s.skip_category("tx2"));
         let taken = s.take_resolved();
@@ -999,6 +1036,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
         assert!(s.remap_category("tx3", "Dining Out"));
         assert!(s.pending_reviews[0].category_resolved);
@@ -1248,5 +1286,53 @@ mod tests {
         State::default().save(&p).unwrap();
         let s = State::load(&p).unwrap();
         assert_eq!(s.version, CURRENT_STATE_VERSION);
+    }
+
+    #[test]
+    fn prompted_dimension_defaults_none_and_roundtrips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        // legacy file with NO prompted_dimension for the review -> loads as None
+        std::fs::write(
+            &path,
+            "version = 1\n\n[[pending_review]]\nexternal_id = \"tx1\"\nraw_merchant = \"X\"\namount = -1\ndate = \"2026-06-01\"\n",
+        )
+        .unwrap();
+        let mut s = State::load(&path).unwrap();
+        assert_eq!(s.pending_reviews[0].prompted_dimension, None);
+
+        s.pending_reviews[0].prompted_dimension = Some(PromptDimension::Category);
+        s.save(&path).unwrap();
+        let reloaded = State::load(&path).unwrap();
+        assert_eq!(
+            reloaded.pending_reviews[0].prompted_dimension,
+            Some(PromptDimension::Category)
+        );
+    }
+
+    #[test]
+    fn open_dimension_is_payee_then_category_then_none() {
+        let mut p = PendingReview {
+            external_id: "t".into(),
+            source_monzo_id: MonzoAccountId::default(),
+            raw_merchant: "X".into(),
+            amount: -1,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: None,
+            prompted_dimension: None,
+        };
+        assert_eq!(p.open_dimension(), Some(PromptDimension::Payee));
+        p.resolve_to = "Foo".into(); // payee settled
+        assert_eq!(p.open_dimension(), Some(PromptDimension::Category));
+        p.category_resolved = true; // both settled
+        assert_eq!(p.open_dimension(), None);
     }
 }

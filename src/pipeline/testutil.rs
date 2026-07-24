@@ -122,6 +122,7 @@ pub fn held(external_id: &str, raw_merchant: &str) -> PendingReview {
         resolve_category_to: String::new(),
         category_resolved: true,
         telegram_message_id: None,
+        prompted_dimension: None,
     }
 }
 

@@ -214,6 +214,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: Some(900),
+            prompted_dimension: None,
         });
 
         let channel = FakeChannel::new(
@@ -250,6 +251,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: Some(901),
+            prompted_dimension: None,
         });
         let channel = FakeChannel::new(
             vec![Reply {
@@ -289,6 +291,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: Some(900),
+            prompted_dimension: None,
         });
         let channel = FakeChannel::new(
             vec![Reply {
@@ -328,6 +331,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: Some(900),
+            prompted_dimension: None,
         });
         let channel = FakeChannel::new(
             vec![Reply {
@@ -424,6 +428,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
 
         for p in &mut state.pending_reviews {
@@ -510,6 +515,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false, // category open
             telegram_message_id: msg,
+            prompted_dimension: None,
         }
     }
 
@@ -584,6 +590,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
 
         let channel = FakeChannel::new(

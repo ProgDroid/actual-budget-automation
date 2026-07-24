@@ -1354,6 +1354,7 @@ mod tests {
                 resolve_category_to: String::new(),
                 category_resolved: true,
                 telegram_message_id: None,
+                prompted_dimension: None,
             }],
             ..State::default()
         };
@@ -1493,6 +1494,7 @@ mod tests {
                 resolve_category_to: String::new(),
                 category_resolved: true,
                 telegram_message_id: None,
+                prompted_dimension: None,
             }],
             ..State::default()
         };
@@ -1810,6 +1812,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         });
 
         let mut bank = FakeBank { txs: vec![] };
@@ -1967,7 +1970,10 @@ mod tests {
             "must not import while category unsettled"
         );
         assert_eq!(state.pending_reviews.len(), 1);
-        assert!(state.pending_reviews[0].category_suggestion.as_deref() == Some("Dining"));
+        assert_eq!(
+            state.pending_reviews[0].category_suggestion.as_deref(),
+            Some("Dining")
+        );
         // Bind the check inside the block so the MutexGuard drops at its last
         // use (before the assert and any later await), satisfying clippy's
         // significant_drop_tightening.

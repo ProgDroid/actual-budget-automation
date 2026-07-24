@@ -307,6 +307,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let p = build_prompt(&proposed, 1, &payees, &[]);
         assert!(
@@ -341,6 +342,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let p2 = build_prompt(&unmatched, 1, &payees, &[]);
         assert_eq!(p2.buttons[0].len(), 2);
@@ -365,6 +367,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let p3 = build_prompt(&failed, 1, &payees, &[]);
         assert!(p3.chat_text.contains("Sainsbury's"));
@@ -399,6 +402,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let p = build_prompt(&entry, 1, &payees, &[]);
         assert_eq!(p.buttons[0].len(), 2, "create/skip buttons present");
@@ -427,6 +431,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false, // category unsettled -> category prompt
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let key = crate::telegram::group_key(&entry.raw_merchant);
         let p = build_prompt(&entry, 1, &payees, &cats);
@@ -476,6 +481,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let key = crate::telegram::group_key(&entry.raw_merchant);
         let p = build_prompt(&entry, 1, &payees, &cats);
@@ -512,6 +518,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false,
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let p = build_prompt(&entry, 1, &payees, &cats);
         // payee prompt first (unchanged flavor): confirm/create/skip
@@ -540,6 +547,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: true,
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let multi = build_prompt(&entry, 3, &payees, &[]);
         assert!(
@@ -659,6 +667,7 @@ mod tests {
             resolve_category_to: String::new(),
             category_resolved: false, // category open
             telegram_message_id: None,
+            prompted_dimension: None,
         };
         let mut state = crate::state::State {
             pending_reviews: vec![cat_open("a", "AAA"), cat_open("b", "BBB")],
