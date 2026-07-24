@@ -182,6 +182,27 @@ fn group_question<'a>(members: impl Iterator<Item = &'a PendingReview>) -> Optio
     any_category.then_some(PromptDimension::Category)
 }
 
+/// One-line confirmation of what a fully-resolved group settled to, e.g.
+/// "✅ M&S → Groceries" (empty category target → "uncategorised"). Echoed when a
+/// resolved group's lingering keyboard is cleared. A resolved member always has
+/// its payee settled, so `resolve_to` (or, for a create-new with no typed name,
+/// the suggestion/raw merchant) is the payee.
+fn resolved_summary(pr: &PendingReview) -> String {
+    let payee = if pr.resolve_to.is_empty() {
+        pr.suggestion
+            .clone()
+            .unwrap_or_else(|| pr.raw_merchant.clone())
+    } else {
+        pr.resolve_to.clone()
+    };
+    let category = if pr.resolve_category_to.is_empty() {
+        "uncategorised"
+    } else {
+        pr.resolve_category_to.as_str()
+    };
+    format!("\u{2705} {payee} \u{2192} {category}")
+}
+
 /// Ensure every not-fully-resolved merchant group has a live Telegram prompt for
 /// its current open dimension. Sends at most one prompt per group per call
 /// (payee dimension before category). An unanswered prompt for the same
@@ -206,7 +227,30 @@ pub async fn ensure_prompts(
     for merchant in order {
         let members = buckets[&merchant].clone();
         let Some(q) = group_question(members.iter().map(|&i| &state.pending_reviews[i])) else {
-            continue; // fully resolved -> imported by take_resolved on the next run
+            // Fully resolved. The terminal prompt (the category keyboard) would
+            // otherwise linger in the chat and invite re-taps that re-resolve
+            // the same entry. Clear it once, echoing the resolved payee →
+            // category, and forget the message id so later ticks don't re-edit
+            // and stale taps become no-ops. Import happens next run via
+            // take_resolved (which has already removed it before run's own
+            // ensure_prompts call, so only poll reaches this branch).
+            if let Some(mid) = members
+                .iter()
+                .find_map(|&i| state.pending_reviews[i].telegram_message_id)
+            {
+                let text = resolved_summary(&state.pending_reviews[members[0]]);
+                if let Err(e) = channel.edit_message_text(mid, &text).await {
+                    warn!("telegram edit (clear resolved keyboard) failed: {e}");
+                }
+                for &i in &members {
+                    state.pending_reviews[i].telegram_message_id = None;
+                    state.pending_reviews[i].prompted_dimension = None;
+                }
+                if let Err(e) = state.save(state_path) {
+                    warn!("failed to persist cleared prompt id: {e}");
+                }
+            }
+            continue;
         };
         // Already a live prompt for this dimension? -> stay quiet.
         let has_live = members.iter().any(|&i| {
@@ -705,6 +749,49 @@ mod tests {
             state.pending_reviews[0].prompted_dimension,
             Some(crate::state::PromptDimension::Payee)
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_prompts_clears_keyboard_and_echoes_when_resolved() {
+        // Category just tapped: payee settled, category settled, still carrying
+        // the answered CATEGORY prompt id -> the group is fully resolved. The
+        // terminal keyboard must be cleared (edited) with an echo of the choice,
+        // and the message id forgotten so stale re-taps become no-ops.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut e = held("tx1", "M&S");
+        e.resolve_to = "M&S".into();
+        e.resolve_category_to = "Groceries".into();
+        e.category_resolved = true;
+        e.telegram_message_id = Some(201);
+        e.prompted_dimension = Some(crate::state::PromptDimension::Category);
+        let mut state = crate::state::State {
+            pending_reviews: vec![e],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+
+        ensure_prompts(
+            &mut state,
+            &channel,
+            &["M&S".to_string()],
+            &["Groceries".to_string()],
+            &path,
+        )
+        .await;
+
+        let edited = channel.edited.lock().unwrap();
+        assert_eq!(edited.len(), 1, "resolved keyboard edited exactly once");
+        assert_eq!(edited[0].0, 201);
+        assert_eq!(edited[0].1, "\u{2705} M&S \u{2192} Groceries");
+        drop(edited);
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            0,
+            "nothing re-prompted on full resolution"
+        );
+        assert_eq!(state.pending_reviews[0].telegram_message_id, None);
+        assert_eq!(state.pending_reviews[0].prompted_dimension, None);
     }
 
     #[tokio::test]

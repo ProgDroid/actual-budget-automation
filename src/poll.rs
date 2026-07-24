@@ -137,6 +137,149 @@ mod tests {
         .unwrap()
     }
 
+    fn payee_held(ext: &str, merchant: &str, msg_id: i64) -> crate::state::PendingReview {
+        crate::state::PendingReview {
+            external_id: ext.into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: merchant.into(),
+            amount: -100,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some(format!("{merchant} Payee")),
+            confidence: Some("medium".into()),
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: String::new(),
+            category_resolved: true, // category settled -> only payee dimension open
+            telegram_message_id: Some(msg_id),
+            prompted_dimension: Some(crate::state::PromptDimension::Payee),
+        }
+    }
+
+    fn create_new_ready(ext: &str, merchant: &str, msg_id: i64) -> crate::state::PendingReview {
+        crate::state::PendingReview {
+            external_id: ext.into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: merchant.into(),
+            amount: -100,
+            date: "2026-06-01".into(),
+            resolve_to: String::new(),
+            create_new: false,
+            suggestion: Some(merchant.into()), // create-new payee name
+            confidence: Some("medium".into()),
+            category_suggestion: None,
+            category_confidence: None,
+            resolve_category_to: "Groceries".into(),
+            category_resolved: true, // category already settled -> a create tap fully resolves
+            telegram_message_id: Some(msg_id),
+            prompted_dimension: Some(crate::state::PromptDimension::Payee),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_clears_keyboard_for_every_group_resolved_in_one_batch() {
+        // Bug: multiple "Create new" taps in one poll batch each resolve+import,
+        // but only groups that CHAINED to a category prompt got their keyboard
+        // cleared; fully-resolved groups left a dangling button. Both must clear.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        let mut state = State::default();
+        state
+            .pending_reviews
+            .push(create_new_ready("txG", "GGG", 401));
+        state
+            .pending_reviews
+            .push(create_new_ready("txH", "HHH", 402));
+
+        let channel = FakeChannel::new(
+            vec![
+                Reply {
+                    entry_key: crate::telegram::group_key("GGG"),
+                    action: ReplyAction::CreateNew,
+                },
+                Reply {
+                    entry_key: crate::telegram::group_key("HHH"),
+                    action: ReplyAction::CreateNew,
+                },
+            ],
+            88,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+        assert_eq!(applied, 2, "both create taps applied");
+
+        // Both keyboards cleared (edited), echoing the resolved payee -> category.
+        let edited = channel.edited.lock().unwrap();
+        let ids: Vec<i64> = edited.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.contains(&401) && ids.contains(&402),
+            "both cleared: {ids:?}"
+        );
+        assert!(
+            edited
+                .iter()
+                .any(|(_, t)| t == "\u{2705} GGG \u{2192} Groceries"),
+            "echoes GGG: {edited:?}"
+        );
+        drop(edited);
+        // Message ids forgotten so stale re-taps are inert.
+        for m in ["GGG", "HHH"] {
+            let pr = state
+                .pending_reviews
+                .iter()
+                .find(|p| p.raw_merchant == m)
+                .unwrap();
+            assert_eq!(pr.telegram_message_id, None, "{m} id cleared");
+            assert!(pr.create_new, "{m} still resolved (awaiting import)");
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_applies_every_reply_in_a_multi_reply_batch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let cfg = cfg_with_state(&path);
+        let mut state = State::default();
+        // Three distinct merchant groups, each with a live payee prompt.
+        state.pending_reviews.push(payee_held("txA", "AAA", 301));
+        state.pending_reviews.push(payee_held("txB", "BBB", 302));
+        state.pending_reviews.push(payee_held("txC", "CCC", 303));
+
+        // User tapped Confirm on all three before this single poll ran.
+        let channel = FakeChannel::new(
+            vec![
+                Reply {
+                    entry_key: crate::telegram::group_key("AAA"),
+                    action: ReplyAction::Confirm,
+                },
+                Reply {
+                    entry_key: crate::telegram::group_key("BBB"),
+                    action: ReplyAction::Confirm,
+                },
+                Reply {
+                    entry_key: crate::telegram::group_key("CCC"),
+                    action: ReplyAction::Confirm,
+                },
+            ],
+            77,
+        );
+        let applied = poll(&cfg, &mut state, &channel).await.unwrap();
+        assert_eq!(applied, 3, "all three groups applied in one batch");
+        for m in ["AAA", "BBB", "CCC"] {
+            let pr = state
+                .pending_reviews
+                .iter()
+                .find(|p| p.raw_merchant == m)
+                .unwrap_or_else(|| panic!("{m} missing"));
+            assert_eq!(
+                pr.resolve_to,
+                format!("{m} Payee"),
+                "{m} payee should be settled"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn category_confirm_settles_category_dimension() {
         let dir = tempdir().unwrap();
