@@ -2160,4 +2160,158 @@ mod tests {
                 .all(|p| p.suggestion.as_deref() == Some("Nonexistent Payee"))
         );
     }
+
+    // ---- Task 6: stranded-review heal + two-dimension end-to-end ----
+
+    #[tokio::test]
+    async fn legacy_stranded_review_is_reprompted_on_next_run() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim);
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        state.monzo.accounts.push(crate::state::AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: Some(ActualAccountId::from("acc")),
+            ..Default::default()
+        });
+        // Stranded: payee settled to an existing payee, category open, stale id,
+        // NO prompted_dimension (pre-upgrade) -> must get a fresh category prompt.
+        state.pending_reviews.push(PendingReview {
+            external_id: "tx_stuck".into(),
+            source_monzo_id: "acc_1".into(),
+            raw_merchant: "Miruna Tecusanu".into(),
+            amount: 12450,
+            date: "2026-06-21".into(),
+            resolve_to: "Local Cafe".into(),
+            create_new: false,
+            suggestion: None,
+            confidence: None,
+            category_suggestion: Some("Dining".into()),
+            category_confidence: Some("medium".into()),
+            resolve_category_to: String::new(),
+            category_resolved: false,
+            telegram_message_id: Some(145),
+            prompted_dimension: None,
+        });
+
+        let mut bank = FakeBank { txs: vec![] };
+        let claude = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "stranded entry re-prompted"
+        );
+        assert!(
+            channel.sent.lock().unwrap()[0]
+                .chat_text
+                .to_lowercase()
+                .contains("category")
+        );
+        assert_eq!(
+            state.pending_reviews[0].prompted_dimension,
+            Some(crate::state::PromptDimension::Category)
+        );
+    }
+
+    #[tokio::test]
+    async fn two_dimension_review_resolves_across_runs_and_imports() {
+        let shim = tempfile::tempdir().unwrap();
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("s.toml");
+        let imports_log = shim.path().join("imports.log");
+        let cfg = cfg_at(&state_path);
+        let actual = fake_actual(&shim); // payees [Local Cafe]; cats [Groceries, Dining]
+        let notifier = NullNotifier;
+        let channel = FakeChannel::new(vec![], 0);
+
+        let mut state = State::default();
+        state.monzo.accounts.push(crate::state::AccountLink {
+            monzo_id: "acc_1".into(),
+            actual_id: Some(ActualAccountId::from("acc")),
+            ..Default::default()
+        });
+        // Claude: payee Local Cafe HIGH (exists) -> pre-settled; category Dining LOW
+        // (exists) -> uncertain -> held on the category dimension only.
+        let mut bank = FakeBank {
+            txs: vec![tx("tx_cafe", "SQ *CAFE", -450)],
+        };
+        let claude = FakeClaude {
+            out: vec![cls(
+                "SQ *CAFE",
+                Some("Local Cafe"),
+                Confidence::High,
+                Some("Dining"),
+                Confidence::Low,
+            )],
+        };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank,
+            &actual,
+            &claude,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        // Held on category; one category prompt sent; nothing imported yet.
+        assert!(!imports_log.exists());
+        assert_eq!(state.pending_reviews.len(), 1);
+        assert_eq!(
+            state.pending_reviews[0].prompted_dimension,
+            Some(crate::state::PromptDimension::Category)
+        );
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+
+        // User confirms the category (what poll would do), then a run imports it.
+        assert!(state.confirm_category("tx_cafe"));
+        let mut bank2 = FakeBank { txs: vec![] };
+        let claude2 = FakeClaude { out: vec![] };
+        run(
+            &cfg,
+            false,
+            &mut state,
+            &mut bank2,
+            &actual,
+            &claude2,
+            &notifier,
+            Some(&channel as &dyn ConfirmChannel),
+            Confidence::High,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&imports_log).unwrap();
+        assert!(
+            logged.contains("tx_cafe"),
+            "resolved two-dimension review imported"
+        );
+        assert!(
+            state.pending_reviews.is_empty(),
+            "review cleared after import"
+        );
+    }
 }
