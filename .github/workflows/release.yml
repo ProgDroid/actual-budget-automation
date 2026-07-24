@@ -32,7 +32,10 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - run: npm audit --omit=dev --audit-level=high
+        # audit-ci fails on HIGH+CRITICAL (parity with the old
+        # `npm audit --audit-level=high`) except advisories allowlisted with a
+        # documented rationale in actual-shim/audit-ci.jsonc.
+      - run: npx --yes audit-ci@^7 --config audit-ci.jsonc
         working-directory: actual-shim
 
   image:

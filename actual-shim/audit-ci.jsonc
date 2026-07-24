@@ -1,0 +1,18 @@
+{
+  // CI dependency-audit gate for the Actual shim. Fails on HIGH+CRITICAL
+  // advisories (parity with the previous `npm audit --audit-level=high`),
+  // EXCEPT the explicitly-accepted advisories listed below.
+  "high": true,
+  "allowlist": [
+    // adm-zip <0.6.0 — "Crafted ZIP triggers 4GB memory allocation" (DoS).
+    // No released @actual-app/api fixes this yet: every 26.x bundles
+    // @actual-app/core, which requires adm-zip <0.6.0 (npm's only "fix" is a
+    // breaking downgrade to 26.3.0). adm-zip is on the shim's hot path
+    // (api.downloadBudget unzips the budget every run), so force-overriding it
+    // risks a total outage we cannot validate offline. The DoS vector is
+    // unreachable here: the shim only unzips the user's OWN budget from their
+    // OWN Actual server — never an attacker-supplied ZIP. Revisit and remove
+    // this entry once Actual ships an @actual-app/api release on adm-zip >=0.6.0.
+    "GHSA-xcpc-8h2w-3j85"
+  ]
+}
