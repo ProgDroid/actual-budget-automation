@@ -162,36 +162,15 @@ pub async fn rehold_failed_remaps(
                 }
                 pr.suggestion = Some(std::mem::take(&mut pr.resolve_to));
                 pr.telegram_message_id = None;
+                pr.prompted_dimension = None;
             }
         }
     }
 }
 
-/// Send one Telegram prompt per merchant group (exact `raw_merchant`). A reply
-/// to that prompt resolves every held transaction of the merchant. A new
-/// transaction joining a merchant that already has a live prompt adopts its
-/// `message_id` instead of triggering a second prompt ("adopt, don't resend").
-pub async fn send_group_prompts(
-    state: &mut State,
-    channel: &dyn ConfirmChannel,
-    payee_names: &[String],
-    category_names: &[String],
-    state_path: &std::path::Path,
-) {
-    send_group_prompts_inner(
-        state,
-        channel,
-        payee_names,
-        category_names,
-        state_path,
-        None,
-    )
-    .await;
-}
-
 /// Poll-side variant: send category prompts ONLY for the given `raw_merchant`s
 /// (the groups poll just settled this tick), using the cached Actual catalogs.
-/// Same per-merchant send/adopt/persist semantics as [`send_group_prompts`].
+/// Same per-merchant send/adopt/persist semantics as [`send_group_prompts_inner`].
 pub async fn send_chained_category_prompts(
     state: &mut State,
     channel: &dyn ConfirmChannel,
@@ -283,7 +262,6 @@ async fn send_group_prompts_inner(
 
 /// The group's current open question: payee if any member's payee is unsettled,
 /// else category if any member's category is open, else `None` (fully resolved).
-#[allow(dead_code)] // Called by ensure_prompts, not yet wired into run/poll
 fn group_question<'a>(members: impl Iterator<Item = &'a PendingReview>) -> Option<PromptDimension> {
     let mut any_category = false;
     for m in members {
@@ -302,7 +280,6 @@ fn group_question<'a>(members: impl Iterator<Item = &'a PendingReview>) -> Optio
 /// dimension is never re-sent (no-spam). Buckets by exact `raw_merchant`; a
 /// reply fans out to the whole group via `group_key`. Called by both `run`
 /// (after import) and `poll` (after applying replies).
-#[allow(dead_code)] // Not yet wired into run/poll (later task)
 pub async fn ensure_prompts(
     state: &mut State,
     channel: &dyn ConfirmChannel,
@@ -655,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_collapses_same_merchant_into_one_prompt() {
+    async fn ensure_collapses_same_merchant_into_one_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.toml");
         let mut state = crate::state::State {
@@ -668,7 +645,7 @@ mod tests {
         };
         let channel = FakeChannel::new(vec![], 0);
         let payees = vec!["Transport for London".to_string()];
-        send_group_prompts(&mut state, &channel, &payees, &[], &path).await;
+        ensure_prompts(&mut state, &channel, &payees, &[], &path).await;
         assert_eq!(
             channel.sent.lock().unwrap().len(),
             1,
@@ -684,6 +661,13 @@ mod tests {
             "all members share one message_id: {ids:?}"
         );
         assert!(
+            state
+                .pending_reviews
+                .iter()
+                .all(|p| p.prompted_dimension == Some(PromptDimension::Payee)),
+            "all members marked prompted for the payee dimension"
+        );
+        assert!(
             channel.sent.lock().unwrap()[0]
                 .chat_text
                 .contains("(3 txns)")
@@ -691,7 +675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_distinct_merchants_sends_two_prompts() {
+    async fn ensure_distinct_merchants_sends_two_prompts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.toml");
         let mut state = crate::state::State {
@@ -700,7 +684,7 @@ mod tests {
         };
         let channel = FakeChannel::new(vec![], 0);
         let payees = vec!["Transport for London".to_string()];
-        send_group_prompts(&mut state, &channel, &payees, &[], &path).await;
+        ensure_prompts(&mut state, &channel, &payees, &[], &path).await;
         let sent = channel.sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
         for p in sent.iter() {
@@ -710,31 +694,6 @@ mod tests {
                 p.chat_text
             );
         }
-    }
-
-    #[tokio::test]
-    async fn send_adopts_existing_prompt_without_resending() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.toml");
-        let mut a = held("tx1", "TFL TRAVEL CH");
-        a.telegram_message_id = Some(777);
-        let mut state = crate::state::State {
-            pending_reviews: vec![a, held("tx2", "TFL TRAVEL CH")],
-            ..Default::default()
-        };
-        let channel = FakeChannel::new(vec![], 0);
-        let payees = vec!["Transport for London".to_string()];
-        send_group_prompts(&mut state, &channel, &payees, &[], &path).await;
-        assert_eq!(
-            channel.sent.lock().unwrap().len(),
-            0,
-            "no resend for an outstanding group"
-        );
-        assert_eq!(
-            state.pending_reviews[1].telegram_message_id,
-            Some(777),
-            "new member adopts the id"
-        );
     }
 
     #[tokio::test]

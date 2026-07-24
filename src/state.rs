@@ -218,7 +218,6 @@ impl PendingReview {
     /// The dimension still needing a decision (payee before category), or `None`
     /// when both are settled (ready to import).
     #[must_use]
-    #[allow(dead_code)] // Consumed by ensure_prompts/group_question, not yet wired into run/poll
     pub const fn open_dimension(&self) -> Option<PromptDimension> {
         if !self.payee_settled() {
             Some(PromptDimension::Payee)

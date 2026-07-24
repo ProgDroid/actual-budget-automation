@@ -20,7 +20,7 @@ use crate::state::State;
 #[cfg(test)]
 use crate::state::{AccountLink, PendingReview, PotLink};
 use crate::telegram::ConfirmChannel;
-use crate::telegram::prompts::{rehold_failed_remaps, send_group_prompts};
+use crate::telegram::prompts::{ensure_prompts, rehold_failed_remaps};
 
 mod auth;
 #[cfg(feature = "auth-flow")]
@@ -250,7 +250,7 @@ pub async fn run(
 
     // Send one prompt per merchant group for everything still held.
     if let Some(ch) = channel {
-        send_group_prompts(state, ch, &payee_names, &category_names, &cfg.state_path).await;
+        ensure_prompts(state, ch, &payee_names, &category_names, &cfg.state_path).await;
     }
 
     state.save(&cfg.state_path)?;
