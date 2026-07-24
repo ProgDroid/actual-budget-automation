@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::config::PAYEE_THRESHOLD;
 use crate::matching::best_payee_match;
-use crate::state::{PendingReview, State};
+use crate::state::{PendingReview, PromptDimension, State};
 
 use super::{ConfirmChannel, Prompt, encode_callback, group_key};
 
@@ -274,6 +274,97 @@ async fn send_group_prompts_inner(
                 }
                 if let Err(e) = state.save(state_path) {
                     warn!("failed to persist telegram_message_id (may re-prompt next run): {e}");
+                }
+            }
+            Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
+        }
+    }
+}
+
+/// The group's current open question: payee if any member's payee is unsettled,
+/// else category if any member's category is open, else `None` (fully resolved).
+#[allow(dead_code)] // Called by ensure_prompts, not yet wired into run/poll
+fn group_question<'a>(members: impl Iterator<Item = &'a PendingReview>) -> Option<PromptDimension> {
+    let mut any_category = false;
+    for m in members {
+        match m.open_dimension() {
+            Some(PromptDimension::Payee) => return Some(PromptDimension::Payee),
+            Some(PromptDimension::Category) => any_category = true,
+            None => {}
+        }
+    }
+    any_category.then_some(PromptDimension::Category)
+}
+
+/// Ensure every not-fully-resolved merchant group has a live Telegram prompt for
+/// its current open dimension. Sends at most one prompt per group per call
+/// (payee dimension before category). An unanswered prompt for the same
+/// dimension is never re-sent (no-spam). Buckets by exact `raw_merchant`; a
+/// reply fans out to the whole group via `group_key`. Called by both `run`
+/// (after import) and `poll` (after applying replies).
+#[allow(dead_code)] // Not yet wired into run/poll (later task)
+pub async fn ensure_prompts(
+    state: &mut State,
+    channel: &dyn ConfirmChannel,
+    payee_names: &[String],
+    category_names: &[String],
+    state_path: &std::path::Path,
+) {
+    let mut order: Vec<String> = Vec::new();
+    let mut buckets: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, p) in state.pending_reviews.iter().enumerate() {
+        if !buckets.contains_key(&p.raw_merchant) {
+            order.push(p.raw_merchant.clone());
+        }
+        buckets.entry(p.raw_merchant.clone()).or_default().push(i);
+    }
+    for merchant in order {
+        let members = buckets[&merchant].clone();
+        let Some(q) = group_question(members.iter().map(|&i| &state.pending_reviews[i])) else {
+            continue; // fully resolved -> imported by take_resolved on the next run
+        };
+        // Already a live prompt for this dimension? -> stay quiet.
+        let has_live = members.iter().any(|&i| {
+            let p = &state.pending_reviews[i];
+            p.telegram_message_id.is_some() && p.prompted_dimension == Some(q)
+        });
+        if has_live {
+            continue;
+        }
+        // A superseded prompt id (built for the other dimension) to tidy, if any.
+        let stale_id = members
+            .iter()
+            .find_map(|&i| state.pending_reviews[i].telegram_message_id);
+        // Rep whose OWN open dimension == q so build_prompt renders the right
+        // flavor; defensive fallback to the first member.
+        let rep = members
+            .iter()
+            .copied()
+            .find(|&i| state.pending_reviews[i].open_dimension() == Some(q))
+            .unwrap_or(members[0]);
+        if let Some(old) = stale_id {
+            let text = match q {
+                PromptDimension::Category => "\u{2705} Payee set \u{2014} now categorising\u{2026}",
+                PromptDimension::Payee => "\u{21aa}\u{fe0f} Re-asking below.",
+            };
+            if let Err(e) = channel.edit_message_text(old, text).await {
+                warn!("telegram edit_message_text failed (stale keyboard left in chat): {e}");
+            }
+        }
+        let prompt = build_prompt(
+            &state.pending_reviews[rep],
+            members.len(),
+            payee_names,
+            category_names,
+        );
+        match channel.send_prompt(&prompt).await {
+            Ok(message_id) => {
+                for &i in &members {
+                    state.pending_reviews[i].telegram_message_id = Some(message_id);
+                    state.pending_reviews[i].prompted_dimension = Some(q);
+                }
+                if let Err(e) = state.save(state_path) {
+                    warn!("failed to persist prompt id (may re-prompt next run): {e}");
                 }
             }
             Err(e) => warn!("telegram send_prompt failed (will retry next run): {e}"),
@@ -695,5 +786,132 @@ mod tests {
             b.telegram_message_id.is_none(),
             "BBB excluded from the restrict set"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_prompts_sends_once_then_stays_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut state = crate::state::State {
+            pending_reviews: vec![held("tx1", "TFL TRAVEL CH")],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+        let payees = vec!["Transport for London".to_string()];
+
+        ensure_prompts(&mut state, &channel, &payees, &[], &path).await;
+        assert_eq!(channel.sent.lock().unwrap().len(), 1, "prompted once");
+        assert_eq!(
+            state.pending_reviews[0].prompted_dimension,
+            Some(crate::state::PromptDimension::Payee)
+        );
+        assert!(state.pending_reviews[0].telegram_message_id.is_some());
+
+        // second pass: same open dimension already has a live prompt -> no resend
+        ensure_prompts(&mut state, &channel, &payees, &[], &path).await;
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "no re-prompt (no-spam)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_prompts_advances_payee_to_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        // payee just settled, category open, still carrying the answered PAYEE prompt id
+        let mut e = held("tx1", "SQ *CAFE");
+        e.resolve_to = "Local Cafe".into();
+        e.category_suggestion = Some("Dining".into());
+        e.category_confidence = Some("medium".into());
+        e.category_resolved = false;
+        e.telegram_message_id = Some(900);
+        e.prompted_dimension = Some(crate::state::PromptDimension::Payee);
+        let mut state = crate::state::State {
+            pending_reviews: vec![e],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+        let cats = vec!["Dining".to_string()];
+
+        ensure_prompts(
+            &mut state,
+            &channel,
+            &["Local Cafe".to_string()],
+            &cats,
+            &path,
+        )
+        .await;
+        // superseded payee keyboard tidied, fresh category prompt sent
+        assert_eq!(channel.edited.lock().unwrap()[0].0, 900);
+        assert_eq!(channel.sent.lock().unwrap().len(), 1);
+        assert!(
+            channel.sent.lock().unwrap()[0]
+                .chat_text
+                .to_lowercase()
+                .contains("category")
+        );
+        assert_eq!(
+            state.pending_reviews[0].prompted_dimension,
+            Some(crate::state::PromptDimension::Category)
+        );
+        assert_ne!(
+            state.pending_reviews[0].telegram_message_id,
+            Some(900),
+            "adopted new id"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_prompts_heals_legacy_entry_with_stale_id_and_none_dimension() {
+        // Reproduces the stranded state: payee-open member with a stale message_id
+        // and prompted_dimension = None (a pre-upgrade entry).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut e = held("tx1", "Google");
+        e.suggestion = None; // "New merchant — which payee?" flavor
+        e.telegram_message_id = Some(141);
+        e.prompted_dimension = None;
+        let mut state = crate::state::State {
+            pending_reviews: vec![e],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+
+        ensure_prompts(&mut state, &channel, &[], &[], &path).await;
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "legacy entry re-prompted"
+        );
+        assert_eq!(
+            state.pending_reviews[0].prompted_dimension,
+            Some(crate::state::PromptDimension::Payee)
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_prompts_mixed_group_is_payee_phase_first() {
+        // One member payee-settled+category-open, one payee-open: group question = payee.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.toml");
+        let mut settled = held("txA", "MR FERNANDO");
+        settled.resolve_to = "Santander Checking".into();
+        settled.category_resolved = false;
+        settled.telegram_message_id = Some(135);
+        settled.prompted_dimension = Some(crate::state::PromptDimension::Payee);
+        let open = held("txB", "MR FERNANDO"); // payee-open
+        let mut state = crate::state::State {
+            pending_reviews: vec![settled, open],
+            ..Default::default()
+        };
+        let channel = FakeChannel::new(vec![], 0);
+        let payees = vec!["Santander Checking".to_string()];
+
+        ensure_prompts(&mut state, &channel, &payees, &[], &path).await;
+        // group question is Payee (payee-open member exists); a live Payee prompt
+        // already exists (id 135) -> no new send this pass.
+        assert_eq!(channel.sent.lock().unwrap().len(), 0);
     }
 }
