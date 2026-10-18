@@ -2,3 +2,5 @@
 /actual-shim/node_modules
 *.state.toml
 .actual-data/
+# serena was removed from the Claude Code setup on 2026-10-18
+.serena/
